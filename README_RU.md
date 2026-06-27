@@ -20,6 +20,7 @@ active = mn.filter("active").eq(True)
 rows   = mn.sort_by("age")                        # → [row, row, ...]
 keys   = mn.sort_by("age", returns="parent_keys") # → [key, key, ...]
 ages   = mn.sort_by("age", returns="values")      # → [18, 25, 30, ...]
+mn.sort_by("age", inplace=True)                   # изменяет порядок mn на месте, возвращает None
 groups = mn.group_by("age")                       # → {value: ModDict, ...}
 slim   = mn.select(["age", "score"])              # → новый ModDict
 rows   = mn.select(["age", "score"], returns="values")  # → [{"age":..}, ..]
@@ -41,6 +42,16 @@ mn["al"]["age"] = 32          # та же строка — mn["alice"]["age"] ==
 mn["al"] = {"age": 33}        # замена строки через алиас
 del mn["al"]                  # удаляет и алиас, и оригинал
 print(mn.aliases())           # {"al": "alice"}
+
+# Построение из списка строк
+mn3 = md.ModDict.from_rows(users, key="id")      # {r["id"]: r for r in users}
+
+# Глубокое копирование (в 7.8× быстрее deepcopy)
+backup = mn.copy()
+
+# Доступ по индексу в порядке вставки
+mn.at(0)    # первое значение
+mn.at(-1)   # последнее значение
 
 # Бинарная сериализация (полный набор типов Python — date, bytes, Decimal, Path, …)
 data = mn.serialize()
@@ -87,6 +98,8 @@ del mn[key]
 mn[key]                                  # полная строка — O(1), возвращает ссылку на dict
 mn[key]["field"]                         # поле через Python chaining
 mn.get(key, default)
+mn.pop(key)                              # удалить и вернуть значение
+mn.pop(key, default)                     # вернуть default если ключ не найден
 
 # Принадлежность / размер
 key in mn
@@ -97,9 +110,14 @@ for key in mn: ...
 mn.keys() / mn.values() / mn.items()
 
 # Фильтрация (индекс строится автоматически, далее переиспользуется)
-mn.filter("age").gte(18)                         # → ModDict
-mn.filter("age").between(30, 40)
-mn.filter("active").eq(True)
+mn.filter("age").eq(18)                          # age == 18
+mn.filter("age").ne(18)                          # age != 18
+mn.filter("age").lt(18)                          # age <  18
+mn.filter("age").lte(18)                         # age <= 18
+mn.filter("age").gt(18)                          # age >  18
+mn.filter("age").gte(18)                         # age >= 18
+mn.filter("age").between(18, 30)                 # 18 <= age <= 30
+mn.filter("city").in_(["NY", "LA"])              # city в списке
 mn.filter("orders.?.status").eq("shipped")       # wildcard-путь
 
 # Сортировка / проекция / группировка — поддержка путей через точку
@@ -121,6 +139,17 @@ del mn[alias]                            # удаляет и алиас, и ор
 # Обновление из другой коллекции
 mn.update(other)                                      # массовая вставка
 mn.update(other, from_path, to_path, conflict="keep_right")
+
+# Глубокое копирование (в 7.8× быстрее copy.deepcopy)
+mn.copy()                                        # → новый ModDict, строки скопированы глубоко
+
+# Доступ по индексу в порядке вставки (O(1), поддержка отрицательных индексов)
+mn.at(0)                                         # значение первого вставленного ключа
+mn.at(-1)                                        # значение последнего вставленного ключа
+
+# Построение из списка словарей
+md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}
+md.ModDict.from_row(row)                         # нормализует Mapping → обычный dict
 
 # Сериализация
 mn.serialize() / mn.deserialize(data)

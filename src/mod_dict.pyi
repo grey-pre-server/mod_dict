@@ -255,6 +255,42 @@ class ModDict:
         """
         ...
 
+    @classmethod
+    def from_rows(cls, rows: list[dict], key: Any) -> ModDict:
+        """
+        Build a ModDict from a list of row dicts using one field as the outer key.
+
+        Typically used to index SQL result sets or any list of records by primary key.
+
+        Args:
+            rows: Iterable of dicts (or Mapping-like objects).
+            key:  Field name whose value becomes the outer key.
+
+        Example::
+
+            rows = [
+                {"id": 1, "name": "alice", "age": 30},
+                {"id": 2, "name": "bob",   "age": 25},
+            ]
+            mn = ModDict.from_rows(rows, key="id")
+            mn[1]["name"]   # "alice"
+        """
+        ...
+
+    @classmethod
+    def from_row(cls, row: Any) -> dict:
+        """
+        Convert a single Mapping-like row to a plain Python dict.
+
+        If *row* is already a dict it is returned as-is (same object).
+        Useful when you receive cursor rows or ORM objects that quack like dicts.
+
+        Example::
+
+            d = ModDict.from_row(cursor.fetchone())
+        """
+        ...
+
     # ──────────────────────────────────────────────────
     # Dict protocol
     # ──────────────────────────────────────────────────
@@ -542,7 +578,8 @@ class ModDict:
         field: str,
         reverse: bool = False,
         returns: Literal["rows", "parent_keys", "values"] = "rows",
-    ) -> list[Any]:
+        inplace: bool = False,
+    ) -> list[Any] | None:
         """
         Return a sorted list by the given numeric field.
 
@@ -552,17 +589,23 @@ class ModDict:
         Args:
             field:   Field name or dot-notation path.
             reverse: If True, sort descending.
-            returns: What each list element contains:
+            returns: What each list element contains (ignored when inplace=True):
 
                      - ``"rows"``        — the full row dict *(default)*
                      - ``"parent_keys"`` — the outer key (string)
                      - ``"values"``      — the sorted field value (int/float)
+
+            inplace: If True, reorder the ModDict's insertion-order vector in-place
+                     and return ``None``. After this, ``mn.at(0)`` returns the
+                     smallest element, iteration follows sorted order, etc.
+                     Cannot be combined with ``returns`` — raises ``ValueError``.
 
         Examples::
 
             rows  = mn.sort_by("score", reverse=True)           # [{"score":9.5,...}, ...]
             keys  = mn.sort_by("age", returns="parent_keys")    # ["alice", "bob", ...]
             ages  = mn.sort_by("age", returns="values")         # [17, 25, 30, ...]
+            mn.sort_by("age", inplace=True)                     # reorders mn itself
         """
         ...
 
@@ -639,6 +682,64 @@ class ModDict:
             data = mn.serialize()
             with open("cache.bin", "wb") as f:
                 f.write(data)
+        """
+        ...
+
+    def aliases(self) -> dict[Any, Any]:
+        """
+        Return a mapping of all active aliases to their original keys.
+
+        Alias entries are hidden from ``keys()``, ``iter``, and ``len()`` —
+        this method is the only way to enumerate them.
+
+        Example::
+
+            mn.alias("alice", "al")
+            mn.aliases()  # {"al": "alice"}
+        """
+        ...
+
+    def pop(self, key: Any, *default: Any) -> Any:
+        """
+        Remove *key* and return its value.
+
+        If *key* is not found and *default* is given, return *default*.
+        If *key* is not found and no default is given, raise ``KeyError``.
+
+        Example::
+
+            val = mn.pop("alice")           # removes "alice", returns its row
+            val = mn.pop("missing", None)   # → None (no KeyError)
+        """
+        ...
+
+    def copy(self) -> ModDict:
+        """
+        Return a deep copy of this ModDict.
+
+        All row dicts are recursively copied — mutations on the copy do not
+        affect the original and vice versa. Aliases are not copied.
+
+        Example::
+
+            c = mn.copy()
+            c["alice"]["age"] = 99   # original unchanged
+        """
+        ...
+
+    def at(self, i: int) -> Any:
+        """
+        Return the value at insertion-order position *i*.
+
+        Supports negative indices (``-1`` = last inserted).
+        Raises ``IndexError`` if out of range.
+
+        Example::
+
+            mn["a"] = {"x": 1}
+            mn["b"] = {"x": 2}
+            mn.at(0)   # {"x": 1}
+            mn.at(-1)  # {"x": 2}
         """
         ...
 

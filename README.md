@@ -42,6 +42,16 @@ mn["al"] = {"age": 33}        # replaces row via alias
 del mn["al"]                  # removes both alias and original
 print(mn.aliases())           # {"al": "alice"}
 
+# Build from a list of rows
+mn3 = md.ModDict.from_rows(users, key="id")      # {r["id"]: r for r in users}
+
+# Deep copy (7.8× faster than deepcopy)
+backup = mn.copy()
+
+# Index access by insertion order
+mn.at(0)    # first value
+mn.at(-1)   # last value
+
 # Binary serialization (full Python type set — date, bytes, Decimal, Path, …)
 data = mn.serialize()
 mn2  = md.ModDict(); mn2.deserialize(data)
@@ -86,6 +96,8 @@ del mn[key]
 mn[key]                                  # full row — O(1), returns stored dict ref
 mn[key]["field"]                         # field via Python chaining
 mn.get(key, default)
+mn.pop(key)                              # remove and return value
+mn.pop(key, default)                     # return default if not found
 
 # Membership / size
 key in mn
@@ -96,15 +108,22 @@ for key in mn: ...
 mn.keys() / mn.values() / mn.items()
 
 # Filter (auto-builds index on first call, reused after)
-mn.filter("age").gte(18)                         # → ModDict
-mn.filter("age").between(30, 40)
-mn.filter("active").eq(True)
+mn.filter("age").eq(18)                          # age == 18
+mn.filter("age").ne(18)                          # age != 18
+mn.filter("age").lt(18)                          # age <  18
+mn.filter("age").lte(18)                         # age <= 18
+mn.filter("age").gt(18)                          # age >  18
+mn.filter("age").gte(18)                         # age >= 18
+mn.filter("age").between(18, 30)                 # 18 <= age <= 30
+mn.filter("city").in_(["NY", "LA"])              # city in [...]
 mn.filter("orders.?.status").eq("shipped")       # wildcard path
 
 # Sort / select / group — support dot-notation paths
 mn.sort_by("age", reverse=False, returns="rows")        # default → [row, ...]
 mn.sort_by("age", returns="parent_keys")                # → [key, ...]
+mn.sort_by("age", inplace=True)                         # reorders mn in-place, returns None
 mn.sort_by("meta.details.rank", returns="values")       # → [val, ...]
+
 
 mn.select(["age", "name"])                              # → new ModDict
 mn.select(["age", "meta.level"], returns="values")      # → [{"age":..}, ...]
@@ -120,6 +139,17 @@ del mn[alias]                            # removes alias and original
 # Update from another collection
 mn.update(other)                                      # bulk insert
 mn.update(other, from_path, to_path, conflict="keep_right")
+
+# Deep copy (7.8× faster than copy.deepcopy)
+mn.copy()                                        # → new ModDict, rows deep-copied
+
+# Index access by insertion order (O(1), supports negative indices)
+mn.at(0)                                         # first inserted key's value
+mn.at(-1)                                        # last inserted key's value
+
+# Build from a list of dicts
+md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}
+md.ModDict.from_row(row)                         # normalize Mapping → plain dict
 
 # Serialize
 mn.serialize() / mn.deserialize(data)
