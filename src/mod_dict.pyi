@@ -1,0 +1,726 @@
+"""
+mod_dict — Nested dictionary with indexed field queries and merge operations.
+
+A C++ backed dictionary for structured (JSON-like) data. Designed for
+field-level access, indexed filters, multi-row merge operations, and
+compact binary serialization.
+
+Typical use cases:
+  - In-memory processing of JSON/API responses
+  - ETL pipelines with nested update operations
+  - Fast group-by / filter / sort on structured records
+  - Merging datasets by key or field value
+
+Quick start::
+
+    import mod_dict as md
+
+    mn = md.ModDict()
+    mn["alice"] = {"age": 30, "score": 9.5, "geo": {"city": "Moscow"}}
+    mn["bob"]   = {"age": 25, "score": 7.2, "geo": {"city": "Berlin"}}
+
+    # Filter with chaining
+    adults = mn.filter("age").gte(18)
+    top    = mn.filter("score").between(8.0, 10.0)
+
+    # Merge nested field
+    updates = md.ModDict()
+    updates["alice"] = {"score": 10.0}
+    mn.merge(updates, "*", "*", conflict="keep_right")
+
+    # Index for repeated queries
+    mn.create_index("age")
+    by_city = mn.group_by("geo.city")
+"""
+from __future__ import annotations
+from typing import Any, Iterator, Literal, Sequence, overload
+
+
+class FilterBuilder:
+    """
+    Intermediate object returned by ``ModDict.filter(field)``.
+
+    Provides chainable comparison methods that execute the actual filter
+    and return a new ``ModDict`` view sharing the same underlying store.
+
+    All methods return a ``ModDict`` — results can be further filtered,
+    sorted, or passed to other operations::
+
+        mn.filter("age").gte(18).filter("active").eq(True)
+
+    Path syntax for nested fields::
+
+        mn.filter("meta.score").gte(8.0)          # dot-notation
+        mn.filter("orders.?.status").eq("shipped") # ? = any one key level
+    """
+
+    def eq(self, value: Any) -> ModDict:
+        """
+        Return rows where field **equals** value.
+
+        Works for all types: str, int, float, bool, date, datetime, etc.
+
+        Example::
+
+            active_users = mn.filter("active").eq(True)
+            shipped      = mn.filter("status").eq("shipped")
+            level_3      = mn.filter("meta.level").eq(3)
+        """
+        ...
+
+    def ne(self, value: Any) -> ModDict:
+        """
+        Return rows where field **does not equal** value.
+
+        Example::
+
+            not_cancelled = mn.filter("status").ne("cancelled")
+        """
+        ...
+
+    def lt(self, value: Any) -> ModDict:
+        """
+        Return rows where field is **less than** value.
+
+        Supported for numeric types (int, float). Uses sorted index
+        when available for O(log n) performance.
+
+        Example::
+
+            juniors = mn.filter("age").lt(25)
+        """
+        ...
+
+    def lte(self, value: Any) -> ModDict:
+        """
+        Return rows where field is **less than or equal** to value.
+
+        Example::
+
+            mn.filter("score").lte(5.0)
+        """
+        ...
+
+    def gt(self, value: Any) -> ModDict:
+        """
+        Return rows where field is **greater than** value.
+
+        Example::
+
+            seniors    = mn.filter("age").gt(60)
+            high_score = mn.filter("meta.score").gt(9.0)
+        """
+        ...
+
+    def gte(self, value: Any) -> ModDict:
+        """
+        Return rows where field is **greater than or equal** to value.
+
+        Example::
+
+            adults = mn.filter("age").gte(18)
+        """
+        ...
+
+    def between(self, lo: Any, hi: Any) -> ModDict:
+        """
+        Return rows where ``lo <= field <= hi`` (inclusive on both ends).
+
+        Equivalent to ``.gte(lo)`` chained with ``.lte(hi)``, but expressed
+        as a single readable call.
+
+        Example::
+
+            working_age = mn.filter("age").between(18, 65)
+            mid_score   = mn.filter("score").between(6.0, 9.0)
+        """
+        ...
+
+    def in_(self, values: Sequence[Any]) -> ModDict:
+        """
+        Return rows where field matches **any** value in the sequence.
+
+        Performs one ``eq`` lookup per value and unions the results.
+        An index on the field makes each lookup O(1).
+
+        Example::
+
+            gold_silver = mn.filter("meta.badge").in_(["gold", "silver"])
+            ages        = mn.filter("age").in_([25, 30, 35, 40])
+        """
+        ...
+
+
+class ModDict:
+    """
+    High-performance nested dictionary with indexed queries and merge operations.
+
+    **Storage model**
+
+    Rows are stored as ``PyObject*`` references — the same dict the caller passed in,
+    with ``Py_INCREF``. No deep copy. Field access via Python chaining::
+
+        mn["alice"]["age"]          # returns stored PyObject*, O(1)
+        mn["alice"]["geo"]["city"]  # any depth, same cost
+
+    Zero-copy sharing across asyncio coroutines — no GC pressure on reads.
+
+    **When to use ModDict vs plain dict**
+
+    Prefer ModDict when you need:
+    - Repeated ``filter`` / ``group_by`` / ``sort_by`` on large datasets (index pays off)
+    - ``merge`` that updates specific nested fields across thousands of rows
+    - Serialization with full Python type set (date, bytes, Decimal, Path, …)
+    - In-process cache shared across asyncio coroutines (zero-copy refs)
+
+    Prefer plain dict when:
+    - Data is flat with no repeated field queries
+    - Dataset is small (< 1 000 rows)
+
+    **Path notation**
+
+    Nested paths use dot-notation throughout the API::
+
+        "meta.score"           # two levels deep
+        "geo.coords.lat"       # three levels deep
+        "orders.?.status"      # ? matches any single intermediate key
+
+    **Index**
+
+    Create an index before repeated ``filter``, ``group_by``, or field-based
+    ``merge`` calls. Without an index these operations still work but scan
+    all rows::
+
+        mn.create_index("age")              # simple field
+        mn.create_index("orders.?.status")  # wildcard path
+
+    **Quick example**::
+
+        import mod_dict as md
+
+        mn = md.ModDict()
+        mn["u1"] = {"age": 30, "name": "Alice", "meta": {"level": 5}}
+        mn["u2"] = {"age": 25, "name": "Bob",   "meta": {"level": 2}}
+        mn["u3"] = {"age": 40, "name": "Carol",  "meta": {"level": 8}}
+
+        mn.create_index("age")
+
+        adults   = mn.filter("age").gte(18)          # all 3
+        top      = mn.filter("meta.level").gte(5)    # u1, u3
+        by_level = mn.group_by("meta.level")         # {5: ..., 2: ..., 8: ...}
+        sorted_  = mn.sort_by("age")                 # [("u2", ...), ("u1", ...), ("u3", ...)]
+    """
+
+    # ──────────────────────────────────────────────────
+    # Constructors
+    # ──────────────────────────────────────────────────
+
+    def __init__(self) -> None:
+        """Create an empty ModDict.
+
+        Example::
+
+            mn = md.ModDict()
+            mn["alice"] = {"age": 30, "score": 9.5}
+        """
+        ...
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ModDict:
+        """
+        Create a ModDict from a plain Python dict.
+
+        Top-level values that are dicts become rows (nested storage).
+        Other values are stored as flat scalars.
+
+        Example::
+
+            mn = ModDict.from_dict({
+                "alice": {"age": 30, "score": 9.5},
+                "bob":   {"age": 25, "score": 7.2},
+            })
+        """
+        ...
+
+    @classmethod
+    def from_json(cls, json_str: str) -> ModDict:
+        """
+        Create a ModDict from a JSON string.
+
+        Equivalent to ``ModDict.from_dict(json.loads(json_str))``.
+
+        Example::
+
+            mn = ModDict.from_json('{"alice": {"age": 30}}')
+        """
+        ...
+
+    # ──────────────────────────────────────────────────
+    # Dict protocol
+    # ──────────────────────────────────────────────────
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        """Insert or update a record.
+
+        Assigns a full row (dict) or scalar::
+
+            mn["alice"] = {"age": 30, "meta": {"level": 5}}  # row
+            mn["count"] = 42                                   # scalar
+
+        To update a specific field, chain access on the returned row::
+
+            mn["alice"]["age"] = 99
+            mn["alice"]["geo"]["city"] = "Paris"
+        """
+        ...
+
+    def __getitem__(self, key: Any) -> Any:
+        """Return the stored row dict or scalar. Raises ``KeyError`` if not found.
+
+        Returns the stored ``PyObject*`` directly — no copy, O(1)::
+
+            row = mn["alice"]           # the original dict passed to __setitem__
+            age = mn["alice"]["age"]    # chain into Python dict as usual
+        """
+        ...
+
+    def __delitem__(self, key: Any) -> None:
+        """Remove a record by key. Raises ``KeyError`` if not found."""
+        ...
+
+    def __contains__(self, key: Any) -> bool:
+        """Return True if key exists::
+
+            if "alice" in mn: ...
+        """
+        ...
+
+    def __len__(self) -> int:
+        """Return the number of records (rows + scalars)."""
+        ...
+
+    def __iter__(self) -> Iterator[Any]:
+        """Iterate over keys (same order as insertion)."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        """
+        Return the record for *key*, or *default* if not found.
+
+        Example::
+
+            row = mn.get("alice", {})
+        """
+        ...
+
+    def keys(self) -> list[Any]:
+        """Return list of all keys."""
+        ...
+
+    def values(self) -> list[Any]:
+        """Return list of all values (rows reconstructed as dicts)."""
+        ...
+
+    def items(self) -> list[tuple[Any, Any]]:
+        """Return list of ``(key, value)`` pairs."""
+        ...
+
+    # ──────────────────────────────────────────────────
+    # Merge
+    # ──────────────────────────────────────────────────
+
+    def update(
+        self,
+        target: ModDict | dict,
+        from_path: str | tuple[str, ...] | None = None,
+        to_path: str | tuple[str, ...] | None = None,
+        conflict: str = "keep_right",
+    ) -> int | None:
+        """
+        Update *self* with data from *target* in-place.
+
+        **Three calling modes:**
+
+        ``mn.update(other)``
+            Plain bulk insert — inserts or overwrites every key from *other*,
+            exactly like ``dict.update()``. Returns ``None``.
+
+        ``mn.update(other, to_path=...)``
+            Path-based update where *from_path* defaults to *to_path*.
+            Useful when both collections share the same field layout.
+            Returns the number of matched rows.
+
+        ``mn.update(other, from_path, to_path)``
+            Full control: *from_path* navigates *self* to find the join key,
+            *to_path* navigates *target* to find the matching value.
+            Returns the number of matched rows.
+
+        **Path tokens**
+
+        +---------------------+-----------------------------------------------+
+        | Token               | Meaning                                       |
+        +=====================+===============================================+
+        | ``"*"``             | Match by outer key                            |
+        +---------------------+-----------------------------------------------+
+        | ``"field"``         | Match by field value                          |
+        +---------------------+-----------------------------------------------+
+        | ``"*.field.sub"``   | Outer key match, copy only that nested field  |
+        +---------------------+-----------------------------------------------+
+        | ``"?.field"``       | ``?`` — wildcard for one nesting level        |
+        +---------------------+-----------------------------------------------+
+
+        **Conflict resolution** (path mode only)
+
+        +---------------+---------------------------------------------------+
+        | Value         | Behaviour on field conflict                       |
+        +===============+===================================================+
+        | ``keep_right``| Overwrite with incoming value **(default)**       |
+        +---------------+---------------------------------------------------+
+        | ``keep_left`` | Keep existing value                               |
+        +---------------+---------------------------------------------------+
+        | ``merge``     | Deep-merge nested dicts                           |
+        +---------------+---------------------------------------------------+
+        | ``concat``    | Concatenate lists                                 |
+        +---------------+---------------------------------------------------+
+
+        Examples::
+
+            # Bulk insert — plain dict.update() behaviour
+            mn.update({"alice": {"age": 31}})
+            mn.update(other_moddict)
+
+            # Match by outer key, copy all fields (from_path defaults to to_path)
+            mn.update(other, to_path="*")
+
+            # Match by outer key, full explicit form
+            mn.update(other, from_path="*", to_path="*")
+
+            # Match self[?] with other[?].geo  (from_path defaults to to_path="?.geo")
+            mn.update(other, to_path="?.geo")
+
+            # Match self["user_id"] field with other["id"] field
+            mn.update(other, from_path="user_id", to_path="id")
+
+            # Copy only geo.lat where outer keys match
+            mn.update(other, to_path="*.geo.lat")
+
+            # Self outer key matched against target field "ref_id"
+            mn.update(ref_data, from_path="*", to_path="ref_id")
+        """
+        ...
+
+    # ──────────────────────────────────────────────────
+    # Filter (chaining API)
+    # ──────────────────────────────────────────────────
+
+    @overload
+    def filter(self, field: str) -> FilterBuilder: ...
+    @overload
+    def filter(self, field: tuple[str, ...]) -> FilterBuilder: ...
+    def filter(self, field: str | tuple[str, ...]) -> FilterBuilder:
+        """
+        Return a ``FilterBuilder`` for the given field path.
+
+        The actual filter is executed when you call a comparison method
+        on the returned builder (``.eq()``, ``.gte()``, etc.).
+
+        The result is a **view** — it shares the underlying store with the
+        original ModDict. Modifying the original after filtering may affect
+        the view.
+
+        **Path syntax**
+
+        Simple field (any nesting level via dot-notation)::
+
+            mn.filter("age").gte(18)
+            mn.filter("meta.score").between(7.0, 10.0)
+            mn.filter("geo.coords.lat").lt(0)
+
+        Wildcard path (``?`` matches any single intermediate key)::
+
+            # {user: {orders: {<order_id>: {status: ...}}}}
+            mn.filter("orders.?.status").eq("shipped")
+            mn.filter("orders.?.amount").gte(100)
+
+        **Performance**
+
+        - With ``create_index("field")``: EQ is O(1), range is O(log n + k)
+        - Without index: auto-builds index on first call, O(n) build + O(1) lookup
+        - Wildcard paths: auto-builds wildcard index on first call
+
+        Examples::
+
+            mn.create_index("age")
+
+            adults   = mn.filter("age").gte(18)
+            teens    = mn.filter("age").between(13, 17)
+            specific = mn.filter("age").in_([25, 30, 35])
+            active   = mn.filter("active").eq(True)
+
+            # Chaining filters
+            result = mn.filter("age").gte(18).filter("active").eq(True)
+
+            # Wildcard path
+            mn.filter("orders.?.status").eq("shipped")
+        """
+        ...
+
+    # ──────────────────────────────────────────────────
+    # Index management
+    # ──────────────────────────────────────────────────
+
+    @overload
+    def create_index(self, field: str) -> None: ...
+    @overload
+    def create_index(self, field: tuple[str, ...]) -> None: ...
+    def create_index(self, field: str | tuple[str, ...]) -> None:
+        """
+        Build a field index for fast filter / group_by / sort_by / merge.
+
+        Call once before repeated queries on the same field. The index is
+        maintained automatically on subsequent inserts and deletes.
+
+        An index stores two structures:
+        - Hash index: ``field_value_hash → [outer_keys]`` for O(1) EQ lookup
+        - Sorted index: ordered list of numeric values for O(log n) range queries
+
+        **Simple field**::
+
+            mn.create_index("age")
+            mn.create_index("meta.level")   # nested field via dot-notation
+
+        **Wildcard path** (dynamic intermediate keys)::
+
+            # {user: {orders: {<dynamic_order_id>: {status: ...}}}}
+            mn.create_index("orders.?.status")
+
+        Note: calling ``create_index`` on an already-indexed field is a no-op.
+        """
+        ...
+
+    @overload
+    def drop_index(self, field: str) -> None: ...
+    @overload
+    def drop_index(self, field: tuple[str, ...]) -> None: ...
+    def drop_index(self, field: str | tuple[str, ...]) -> None:
+        """
+        Remove a previously created field index.
+
+        Frees memory. After dropping, queries on this field fall back to
+        linear scan (or auto-rebuild index on first ``filter`` call).
+
+        Example::
+
+            mn.drop_index("age")
+            mn.drop_index("orders.?.status")
+        """
+        ...
+
+    @overload
+    def has_index(self, field: str) -> bool: ...
+    @overload
+    def has_index(self, field: tuple[str, ...]) -> bool: ...
+    def has_index(self, field: str | tuple[str, ...]) -> bool:
+        """
+        Return ``True`` if an index exists for this field.
+
+        Example::
+
+            if not mn.has_index("age"):
+                mn.create_index("age")
+        """
+        ...
+
+    # ──────────────────────────────────────────────────
+    # Query helpers
+    # ──────────────────────────────────────────────────
+
+    def sort_by(
+        self,
+        field: str,
+        reverse: bool = False,
+        returns: Literal["rows", "parent_keys", "values"] = "rows",
+    ) -> list[Any]:
+        """
+        Return a sorted list by the given numeric field.
+
+        Supports dot-notation paths: ``sort_by("meta.details.rank")``.
+        Uses the sorted index if available (O(n) copy), otherwise builds it first.
+
+        Args:
+            field:   Field name or dot-notation path.
+            reverse: If True, sort descending.
+            returns: What each list element contains:
+
+                     - ``"rows"``        — the full row dict *(default)*
+                     - ``"parent_keys"`` — the outer key (string)
+                     - ``"values"``      — the sorted field value (int/float)
+
+        Examples::
+
+            rows  = mn.sort_by("score", reverse=True)           # [{"score":9.5,...}, ...]
+            keys  = mn.sort_by("age", returns="parent_keys")    # ["alice", "bob", ...]
+            ages  = mn.sort_by("age", returns="values")         # [17, 25, 30, ...]
+        """
+        ...
+
+    def select(
+        self,
+        fields: list[str],
+        returns: Literal["rows", "values"] = "rows",
+    ) -> ModDict | list[Any]:
+        """
+        Project rows to the specified fields.
+
+        Supports dot-notation paths; the full path string is used as the key
+        in the result row (e.g. ``"meta.level"`` → ``row["meta.level"]``).
+
+        Args:
+            fields:  List of field names or dot-notation paths.
+            returns: ``"rows"`` — new ModDict *(default)*;
+                     ``"values"`` — plain list of projected row dicts.
+
+        Examples::
+
+            slim = mn.select(["name", "age", "meta.level"])
+            rows = mn.select(["name", "score"], returns="values")
+            # → [{"name": "alice", "score": 9.5}, ...]
+        """
+        ...
+
+    def group_by(self, field: str) -> dict[Any, ModDict]:
+        """
+        Group rows by field value.
+
+        Returns a plain Python dict mapping each distinct field value
+        to a ModDict view containing the rows with that value.
+
+        Uses the field index if available (fast path), otherwise
+        scans all rows.
+
+        Args:
+            field: Field name or dot-notation path.
+
+        Returns:
+            ``{field_value: ModDict}``
+
+        Example::
+
+            groups = mn.group_by("meta.level")
+            for level, rows in groups.items():
+                print(f"Level {level}: {len(rows)} users")
+
+            # Group by nested field
+            by_region = mn.group_by("meta.details.region")
+        """
+        ...
+
+    # ──────────────────────────────────────────────────
+    # Serialization
+    # ──────────────────────────────────────────────────
+
+    def serialize(self) -> bytes:
+        """
+        Serialize the entire ModDict to a compact binary format.
+
+        The format preserves all supported types including datetime, date,
+        time, bytes, pathlib paths, set, frozenset, and Decimal.
+
+        ``PYOBJECT`` values (arbitrary Python objects) are **not** serializable
+        and will raise ``TypeError``.
+
+        Returns:
+            Bytes object. Can be stored to disk or transferred over network.
+
+        Example::
+
+            data = mn.serialize()
+            with open("cache.bin", "wb") as f:
+                f.write(data)
+        """
+        ...
+
+    def alias(self, key: Any, alias: Any) -> None:
+        """Create a transparent alias for an existing key.
+
+        Both the original key and the alias point to the same row dict.
+        Mutations via either key update the same object and keep indices in sync.
+        Deletion is symmetric: deleting either the alias or the original key
+        removes both from the ModDict.
+
+        Args:
+            key:   Existing key in the ModDict.
+            alias: New key to register as an alias. Must not already exist.
+
+        Example::
+
+            mn["alice"] = {"age": 30}
+            mn.alias("alice", "al")
+            mn["al"]["age"] = 31   # same row — mn["alice"]["age"] == 31
+        """
+        ...
+
+    def reindex(self, key: Any) -> None:
+        """Rebuild field indices for one row after a deep nested write.
+
+        `mn[k]["age"] = 99` and `mn[k].update({...})` update the index
+        automatically via RowProxy. For deeper writes that bypass RowProxy::
+
+            mn[k]["meta"]["details"]["rank"] = 99  # RowProxy only sees "meta"
+            mn.reindex(k)                           # explicitly resync indices
+
+        Calling this when no indices exist is a no-op.
+        """
+        ...
+
+    def deserialize(self, data: bytes) -> None:
+        """
+        Deserialize bytes produced by ``serialize()`` into this ModDict.
+
+        Clears any existing data before loading.
+
+        Args:
+            data: Bytes produced by ``ModDict.serialize()``.
+
+        Example::
+
+            mn2 = ModDict()
+            with open("cache.bin", "rb") as f:
+                mn2.deserialize(f.read())
+        """
+        ...
+
+
+class ShapelyWKB:
+    """
+    Wrapper to explicitly tag raw WKB bytes as a Shapely geometry.
+
+    Use when you want to store geometry data without having Shapely
+    installed on the writing side. On the reading side, if Shapely
+    is available, the value is reconstructed as a ``shapely`` geometry
+    object automatically.
+
+    Example::
+
+        import mod_dict as md
+
+        wkb_bytes = b"\\x01\\x01..."  # raw WKB
+        mn["point"] = {"geom": md.ShapelyWKB(wkb_bytes)}
+    """
+    def __init__(self, data: bytes) -> None: ...
+
+
+class GeoAlchemyWKB:
+    """
+    Wrapper to explicitly tag raw WKB bytes as a GeoAlchemy2 geometry.
+
+    Analogous to ``ShapelyWKB`` but reconstructs as ``geoalchemy2.WKBElement``
+    when GeoAlchemy2 is available on the reading side.
+
+    Example::
+
+        mn["row"] = {"geom": md.GeoAlchemyWKB(wkb_bytes)}
+    """
+    def __init__(self, data: bytes) -> None: ...

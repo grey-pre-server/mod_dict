@@ -1,0 +1,687 @@
+#include "../core/mod_dict.h"
+#include "../core/field_index.h"
+#include "converter_registry.h"
+#include "error_handling.h"
+#include <string>
+#include <vector>
+#include <cstring>
+#ifdef _WIN32
+#  define portable_strdup _strdup
+#else
+#  define portable_strdup strdup
+#endif
+
+extern PyTypeObject ModDict_Type;
+
+struct ModDictObject {
+    PyObject_HEAD
+    ModDict* internal;
+    bool owns_internal;
+    PyObject* parent_ref;
+};
+
+/* helpers */
+static ModDict* pyobj_to_moddict_temp(PyObject* obj) {
+    PyObject* src = nullptr;
+    bool src_owned = false;
+    if (PyDict_Check(obj)) {
+        src = obj;
+    } else if (PyUnicode_Check(obj)) {
+        PyObject* json_mod = PyImport_ImportModule("json");
+        if (!json_mod) return nullptr;
+        src = PyObject_CallMethod(json_mod, "loads", "O", obj);
+        Py_DECREF(json_mod);
+        if (!src) return nullptr;
+        if (!PyDict_Check(src)) { PyErr_SetString(PyExc_TypeError,"JSON must be a dict"); Py_DECREF(src); return nullptr; }
+        src_owned = true;
+    } else { PyErr_SetString(PyExc_TypeError,"target must be ModDict, dict, or JSON string"); return nullptr; }
+    ModDict* tmp = new ModDict();
+    PyObject *k,*v; Py_ssize_t pos=0;
+    while (PyDict_Next(src,&pos,&k,&v)) {
+        ModValue mk = ModValue::from_pyobject(k);
+        if (PyDict_Check(v)) tmp->insert_row(mk,v);
+        else { ModValue mv=ModValue::from_pyobject(v); tmp->insert(mk,mv); }
+    }
+    if (src_owned) Py_DECREF(src);
+    return tmp;
+}
+
+PyObject* ModDict_wrap(ModDict* internal) {
+    if (!internal) Py_RETURN_NONE;
+    if (internal->py_wrapper) { Py_INCREF(internal->py_wrapper); return (PyObject*)internal->py_wrapper; }
+    ModDictObject* w = PyObject_New(ModDictObject,&ModDict_Type);
+    if (!w) return nullptr;
+    w->internal=internal; w->owns_internal=false; w->parent_ref=nullptr;
+    internal->py_wrapper=w;
+    return (PyObject*)w;
+}
+
+/* new/dealloc/init */
+static PyObject* ModDict_new(PyTypeObject* type,PyObject*,PyObject*) {
+    ModDictObject* s=(ModDictObject*)type->tp_alloc(type,0);
+    MOD_DICT_CHECK_ALLOC(s);
+    s->internal=new ModDict(); MOD_DICT_CHECK_ALLOC(s->internal);
+    s->internal->py_wrapper=s; s->owns_internal=true; s->parent_ref=nullptr;
+    return (PyObject*)s;
+}
+static void ModDict_dealloc(ModDictObject* s) {
+    if (s->internal) { s->internal->py_wrapper=nullptr; if(s->owns_internal) delete s->internal; }
+    Py_XDECREF(s->parent_ref);
+    Py_TYPE(s)->tp_free((PyObject*)s);
+}
+static int ModDict_init(ModDictObject* s,PyObject* args,PyObject* kwargs) {
+    PyObject* ini=nullptr;
+    static char* kw[]={(char*)"data",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kwargs,"|O",kw,&ini)) return -1;
+    if (ini&&PyDict_Check(ini)) {
+        PyObject *k,*v; Py_ssize_t pos=0;
+        while (PyDict_Next(ini,&pos,&k,&v)) {
+            ModValue mk=ModValue::from_pyobject(k);
+            if(PyDict_Check(v)) s->internal->insert_row(mk,v);
+            else { ModValue mv=ModValue::from_pyobject(v); s->internal->insert(mk,mv); }
+        }
+    }
+    return 0;
+}
+
+// ── RowProxy ─────────────────────────────────────────────────────────────────
+// Returned by ModDict.__getitem__ for rows when field indices exist.
+// Forwards all dict operations; intercepts __setitem__ / __delitem__ / update
+// so that in-place field writes (mn[k]["age"] = 99) keep FieldIndex consistent.
+
+struct RowProxyObject {
+    PyObject_HEAD
+    PyObject*      row;
+    ModDictObject* owner;
+    uint64_t       outer_hash;
+};
+
+// ── forward-declare callbacks so RowProxy_Type can reference them ─────────────
+static void       RowProxy_dealloc (RowProxyObject*);
+static PyObject*  RowProxy_getitem (RowProxyObject*, PyObject*);
+static int        RowProxy_setitem (RowProxyObject*, PyObject*, PyObject*);
+static int        RowProxy_contains(RowProxyObject*, PyObject*);
+static PyObject*  RowProxy_iter    (RowProxyObject*);
+static Py_ssize_t RowProxy_len     (RowProxyObject*);
+static PyObject*  RowProxy_repr    (RowProxyObject*);
+static PyObject*  RowProxy_richcmp (RowProxyObject*, PyObject*, int);
+static PyObject*  RowProxy_getattro(RowProxyObject*, PyObject*);
+static PyObject*  RowProxy_update  (RowProxyObject*, PyObject*, PyObject*);
+
+static PyMethodDef RowProxy_methods[] = {
+    {"update",(PyCFunction)(PyCFunctionWithKeywords)RowProxy_update,METH_VARARGS|METH_KEYWORDS,""},
+    {NULL,NULL,0,NULL}};
+static PyMappingMethods  RowProxy_mapping  = {(lenfunc)RowProxy_len,(binaryfunc)RowProxy_getitem,(objobjargproc)RowProxy_setitem};
+static PySequenceMethods RowProxy_sequence = {.sq_contains=(objobjproc)RowProxy_contains};
+
+PyTypeObject RowProxy_Type = {
+    .tp_name        = "mod_dict.RowProxy",
+    .tp_basicsize   = sizeof(RowProxyObject),
+    .tp_dealloc     = (destructor)RowProxy_dealloc,
+    .tp_repr        = (reprfunc)RowProxy_repr,
+    .tp_as_sequence = &RowProxy_sequence,
+    .tp_as_mapping  = &RowProxy_mapping,
+    .tp_getattro    = (getattrofunc)RowProxy_getattro,
+    .tp_flags       = Py_TPFLAGS_DEFAULT,
+    .tp_richcompare = (richcmpfunc)RowProxy_richcmp,
+    .tp_iter        = (getiterfunc)RowProxy_iter,
+    .tp_methods     = RowProxy_methods,
+};
+
+// ── RowProxy implementations ──────────────────────────────────────────────────
+static PyObject* RowProxy_create(ModDictObject* owner, PyObject* row, uint64_t oh) {
+    RowProxyObject* p = PyObject_New(RowProxyObject, &RowProxy_Type);
+    if (!p) return nullptr;
+    Py_INCREF(row); Py_INCREF(owner);
+    p->row = row; p->owner = owner; p->outer_hash = oh;
+    return (PyObject*)p;
+}
+static void RowProxy_dealloc(RowProxyObject* s) {
+    Py_XDECREF(s->row); Py_XDECREF(s->owner);
+    Py_TYPE(s)->tp_free((PyObject*)s);
+}
+static PyObject* RowProxy_getitem(RowProxyObject* s, PyObject* key) {
+    return PyObject_GetItem(s->row, key);
+}
+static int RowProxy_setitem(RowProxyObject* s, PyObject* key, PyObject* value) {
+    int r = value ? PyObject_SetItem(s->row, key, value)
+                  : PyObject_DelItem(s->row, key);
+    if (r == 0 && s->owner->internal)
+        s->owner->internal->reindex_row(s->outer_hash);
+    return r;
+}
+static PyObject* RowProxy_update(RowProxyObject* s, PyObject* args, PyObject* kwargs) {
+    PyObject* fn = PyObject_GetAttrString(s->row, "update");
+    if (!fn) return nullptr;
+    PyObject* res = PyObject_Call(fn, args, kwargs);
+    Py_DECREF(fn);
+    if (res && s->owner->internal)
+        s->owner->internal->reindex_row(s->outer_hash);
+    return res;
+}
+static int        RowProxy_contains(RowProxyObject* s, PyObject* k) { return PySequence_Contains(s->row, k); }
+static PyObject*  RowProxy_iter    (RowProxyObject* s) { return PyObject_GetIter(s->row); }
+static Py_ssize_t RowProxy_len     (RowProxyObject* s) { return PyObject_Length(s->row); }
+static PyObject*  RowProxy_repr    (RowProxyObject* s) { return PyObject_Repr(s->row); }
+static PyObject*  RowProxy_richcmp (RowProxyObject* s, PyObject* other, int op) {
+    PyObject* r = (Py_TYPE(other)==&RowProxy_Type) ? ((RowProxyObject*)other)->row : other;
+    return PyObject_RichCompare(s->row, r, op);
+}
+static PyObject*  RowProxy_getattro(RowProxyObject* s, PyObject* name) {
+    PyObject* attr = PyObject_GenericGetAttr((PyObject*)s, name);
+    if (attr) return attr;
+    PyErr_Clear();
+    return PyObject_GetAttr(s->row, name);
+}
+
+/* getitem/setitem/contains/len */
+static PyObject* ModDict_getitem(ModDictObject* s,PyObject* key) {
+    uint64_t oh=content_hash_pyobj(key);
+    auto* e=s->internal->outer.find(oh);
+    if(!e){PyErr_SetObject(PyExc_KeyError,key);return nullptr;}
+    // alias: resolve val_py and effective hash from original
+    if(e->is_alias){
+        OuterEntry* orig=s->internal->outer.find(e->orig_hash);
+        if(!orig||!orig->val_py){PyErr_SetObject(PyExc_KeyError,key);return nullptr;}
+        if(orig->is_row && !s->internal->indices.by_field.empty())
+            return RowProxy_create(s, orig->val_py, e->orig_hash);
+        Py_INCREF(orig->val_py); return orig->val_py;
+    }
+    if(!e->val_py) Py_RETURN_NONE;
+    if(e->is_row && !s->internal->indices.by_field.empty())
+        return RowProxy_create(s, e->val_py, oh);
+    Py_INCREF(e->val_py); return e->val_py;
+}
+static int ModDict_setitem(ModDictObject* s,PyObject* key,PyObject* value) {
+    ModValue mk=ModValue::from_pyobject(key);
+    if (!value) {  // del mn[key]
+        if (!s->internal->remove(mk)) { PyErr_SetObject(PyExc_KeyError,key); return -1; }
+        return 0;
+    }
+    if(PyDict_Check(value)) s->internal->insert_row(mk,value);
+    else { ModValue mv=ModValue::from_pyobject(value); s->internal->insert(mk,mv); }
+    return 0;
+}
+static int ModDict_contains(ModDictObject* s,PyObject* key) {
+    return s->internal->outer.find(content_hash_pyobj(key)) ? 1 : 0;
+}
+static Py_ssize_t ModDict_len(ModDictObject* s){return (Py_ssize_t)s->internal->len();}
+
+static PyObject* ModDict_repr(ModDictObject* s){
+    PyObject* d=s->internal->to_python_dict(); if(!d) return nullptr;
+    PyObject* r=PyObject_Repr(d); Py_DECREF(d); return r;
+}
+static PyObject* ModDict_get(ModDictObject* s,PyObject* args){
+    PyObject* key; PyObject* def=Py_None;
+    if(!PyArg_ParseTuple(args,"O|O",&key,&def)) return nullptr;
+    uint64_t oh=content_hash_pyobj(key);
+    auto* e=s->internal->outer.find(oh);
+    if(!e){Py_INCREF(def);return def;}
+    if(!e->val_py) Py_RETURN_NONE;
+    if(e->is_row && !s->internal->indices.by_field.empty())
+        return RowProxy_create(s, e->val_py, oh);
+    Py_INCREF(e->val_py); return e->val_py;
+}
+
+/* merge path parser */
+static std::vector<const char*> parse_merge_path(PyObject* obj,std::vector<std::string>& st){
+    auto tr=[](const std::string& s)->std::string{
+        if(s=="*") return "__scan_key__"; if(s=="?") return "__pass_key__"; return s;};
+    size_t base=st.size();
+    if(PyUnicode_Check(obj)){
+        std::string raw=PyUnicode_AsUTF8(obj);
+        if(raw.find('.')!=std::string::npos){size_t pos=0;while(true){size_t d=raw.find('.',pos);st.push_back(tr(raw.substr(pos,d==std::string::npos?d:d-pos)));if(d==std::string::npos)break;pos=d+1;}}
+        else st.push_back(tr(raw));
+    } else if(PyTuple_Check(obj)||PyList_Check(obj)){
+        Py_ssize_t n=PySequence_Size(obj);
+        for(Py_ssize_t i=0;i<n;i++){PyObject* it=PySequence_GetItem(obj,i);st.push_back(tr(PyUnicode_AsUTF8(it)));Py_DECREF(it);}
+    }
+    std::vector<const char*> r; for(size_t i=base;i<st.size();i++) r.push_back(st[i].c_str()); return r;
+}
+static PyObject* ModDict_update(ModDictObject* s,PyObject* args,PyObject* kwargs){
+    PyObject *to; PyObject *os=nullptr,*ot=nullptr; const char* cs="keep_right";
+    static const char* kw[]={"target","from_path","to_path","conflict",NULL};
+    if(!PyArg_ParseTupleAndKeywords(args,kwargs,"O|OOs",(char**)kw,&to,&os,&ot,&cs)) return nullptr;
+
+    // Simple mode: mn.update(d) — plain key/value bulk insert, like dict.update()
+    if(!os && !ot){
+        ModDict* tmp=nullptr; ModDict* src=nullptr;
+        if(PyObject_TypeCheck(to,&ModDict_Type)) src=((ModDictObject*)to)->internal;
+        else { tmp=pyobj_to_moddict_temp(to); if(!tmp) return nullptr; src=tmp; }
+        for(auto& e : src->outer.occupied()){
+            if(!e.value.key_py) continue;
+            ModValue mk=ModValue::from_pyobject(e.value.key_py);
+            if(e.value.is_row && e.value.val_py) s->internal->insert_row(mk,e.value.val_py);
+            else if(e.value.val_py){ ModValue mv=ModValue::from_pyobject(e.value.val_py); s->internal->insert(mk,mv); }
+        }
+        delete tmp;
+        Py_RETURN_NONE;
+    }
+
+    // Path mode: mn.update(other, to_path=...) — from_path defaults to to_path
+    // mn.update(other, '?', '?.geo')  →  match self[?] with other[?].geo
+    if(!os) os=ot;  // from_path defaults to to_path
+    std::vector<std::string> ss,ts;
+    auto ons=parse_merge_path(os,ss), ont=parse_merge_path(ot,ts);
+    if(ons.empty()) MOD_DICT_RAISE(PyExc_TypeError,"from_path must be str or tuple");
+    if(ont.empty()) MOD_DICT_RAISE(PyExc_TypeError,"to_path must be str or tuple");
+    MergeConflict c;
+    if(!strcmp(cs,"keep_left")) c=MergeConflict::KEEP_LEFT;
+    else if(!strcmp(cs,"keep_right")) c=MergeConflict::KEEP_RIGHT;
+    else if(!strcmp(cs,"merge")) c=MergeConflict::MERGE;
+    else if(!strcmp(cs,"concat")) c=MergeConflict::CONCAT;
+    else MOD_DICT_RAISE(PyExc_ValueError,"conflict must be keep_left/keep_right/merge/concat");
+    ModDict* tgt=nullptr; ModDict* tmp=nullptr;
+    if(PyObject_TypeCheck(to,&ModDict_Type)) tgt=((ModDictObject*)to)->internal;
+    else { tmp=pyobj_to_moddict_temp(to); if(!tmp) return nullptr; tgt=tmp; }
+    int n=s->internal->merges(tgt,ons,ont,c); delete tmp;
+    if(n<0) return nullptr; return PyLong_FromLong(n);
+}
+
+/* field/pattern parser */
+static bool parse_field_or_pattern(PyObject* arg,std::string& simple,std::vector<std::string>& pattern,bool& wc){
+    if(PyUnicode_Check(arg)){
+        std::string raw=PyUnicode_AsUTF8(arg);
+        if(raw.find('.')!=std::string::npos){
+            size_t pos=0; while(true){size_t d=raw.find('.',pos);std::string seg=raw.substr(pos,d==std::string::npos?d:d-pos);pattern.push_back(seg=="?"?"__pass_key__":seg);if(d==std::string::npos)break;pos=d+1;}
+            wc=true;
+        } else { simple=raw; wc=false; }
+        return true;
+    }
+    if(PyTuple_Check(arg)||PyList_Check(arg)){
+        Py_ssize_t n=PySequence_Size(arg);
+        for(Py_ssize_t i=0;i<n;i++){PyObject* it=PySequence_GetItem(arg,i);if(!PyUnicode_Check(it)){Py_DECREF(it);return false;}std::string seg=PyUnicode_AsUTF8(it);Py_DECREF(it);pattern.push_back(seg=="?"?"__pass_key__":seg);}
+        wc=true; return true;
+    }
+    return false;
+}
+
+static PyObject* apply_filter(ModDictObject* owner,const std::string& simple,const std::vector<std::string>& pattern,bool wc,FilterOp op,PyObject* val_obj){
+    ModValue fv=ModValue::from_pyobject(val_obj);
+    ModDict* result=wc?owner->internal->filter(pattern,op,fv):owner->internal->filter(simple,op,fv);
+    MOD_DICT_CHECK_ALLOC(result);
+    ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
+    if(!w){delete result;return nullptr;}
+    w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)owner; Py_INCREF(owner);
+    result->py_wrapper=w; return (PyObject*)w;
+}
+static FilterOp parse_op(const char* s){
+    if(!strcmp(s,"==")) return FilterOp::EQ; if(!strcmp(s,"!=")) return FilterOp::NE;
+    if(!strcmp(s,"<"))  return FilterOp::LT; if(!strcmp(s,"<=")) return FilterOp::LE;
+    if(!strcmp(s,">"))  return FilterOp::GT; if(!strcmp(s,">=")) return FilterOp::GE;
+    return (FilterOp)-1;
+}
+
+/* FilterBuilder */
+struct FilterBuilderObject{PyObject_HEAD ModDictObject* owner;char* field;std::vector<std::string>* pattern;};
+static void FilterBuilder_dealloc(FilterBuilderObject* s){Py_XDECREF(s->owner);free(s->field);delete s->pattern;Py_TYPE(s)->tp_free(s);}
+static PyObject* fb_op(FilterBuilderObject* s,PyObject* args,FilterOp op){
+    PyObject* v; if(!PyArg_ParseTuple(args,"O",&v)) return nullptr;
+    std::string simple(s->field); bool wc=(s->pattern!=nullptr);
+    std::vector<std::string> empty; const std::vector<std::string>& pat=wc?*s->pattern:empty;
+    return apply_filter(s->owner,simple,pat,wc,op,v);
+}
+static PyObject* FB_eq(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::EQ);}
+static PyObject* FB_ne(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::NE);}
+static PyObject* FB_lt(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::LT);}
+static PyObject* FB_lte(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::LE);}
+static PyObject* FB_gt(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::GT);}
+static PyObject* FB_gte(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::GE);}
+static PyObject* FB_between(FilterBuilderObject* s,PyObject* args){
+    PyObject *lo,*hi; if(!PyArg_ParseTuple(args,"OO",&lo,&hi)) return nullptr;
+    std::string simple(s->field); bool wc=(s->pattern!=nullptr); std::vector<std::string> empty;
+    const std::vector<std::string>& pat=wc?*s->pattern:empty;
+    PyObject* r1=apply_filter(s->owner,simple,pat,wc,FilterOp::GE,lo); if(!r1) return nullptr;
+    PyObject* r2=apply_filter((ModDictObject*)r1,simple,pat,wc,FilterOp::LE,hi); Py_DECREF(r1); return r2;
+}
+static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args){
+    PyObject* seq; if(!PyArg_ParseTuple(args,"O",&seq)) return nullptr;
+    if(!PySequence_Check(seq)) MOD_DICT_RAISE(PyExc_TypeError,"in_: argument must be a sequence");
+    std::string simple(s->field); bool wc=(s->pattern!=nullptr); std::vector<std::string> empty;
+    const std::vector<std::string>& pat=wc?*s->pattern:empty;
+    ModDict* merged=new ModDict();
+    Py_ssize_t n=PySequence_Size(seq);
+    for(Py_ssize_t i=0;i<n;i++){
+        PyObject* item=PySequence_GetItem(seq,i); if(!item){delete merged;return nullptr;}
+        ModValue mv=ModValue::from_pyobject(item); Py_DECREF(item);
+        ModDict* part=wc?s->owner->internal->filter(pat,FilterOp::EQ,mv):s->owner->internal->filter(simple,FilterOp::EQ,mv);
+        if(!part){delete merged;return nullptr;}
+        for(auto& e:part->outer.occupied()) if(!merged->outer.find(e.key)){Py_XINCREF(e.value.key_py);Py_XINCREF(e.value.val_py);merged->outer.insert(e.key,{e.value.key_py,e.value.val_py,e.value.is_row});}
+        delete part;
+    }
+    ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type); if(!w){delete merged;return nullptr;}
+    w->internal=merged;w->owns_internal=true;w->parent_ref=(PyObject*)s->owner;Py_INCREF(s->owner);merged->py_wrapper=w;
+    return (PyObject*)w;
+}
+static PyMethodDef FB_methods[]={
+    {"eq",(PyCFunction)FB_eq,METH_VARARGS,""}, {"ne",(PyCFunction)FB_ne,METH_VARARGS,""},
+    {"lt",(PyCFunction)FB_lt,METH_VARARGS,""}, {"lte",(PyCFunction)FB_lte,METH_VARARGS,""},
+    {"gt",(PyCFunction)FB_gt,METH_VARARGS,""}, {"gte",(PyCFunction)FB_gte,METH_VARARGS,""},
+    {"between",(PyCFunction)FB_between,METH_VARARGS,""}, {"in_",(PyCFunction)FB_in_,METH_VARARGS,""},
+    {NULL,NULL,0,NULL}};
+PyTypeObject FilterBuilder_Type={
+    .tp_name="mod_dict.FilterBuilder",.tp_basicsize=sizeof(FilterBuilderObject),
+    .tp_dealloc=(destructor)FilterBuilder_dealloc,.tp_flags=Py_TPFLAGS_DEFAULT,
+    .tp_doc="FilterBuilder",.tp_methods=FB_methods};
+
+static PyObject* FilterBuilder_new_obj(ModDictObject* owner,PyObject* fo){
+    std::string simple; std::vector<std::string>* pat=nullptr; bool wc;
+    {std::vector<std::string> tmp; if(!parse_field_or_pattern(fo,simple,tmp,wc)){PyErr_SetString(PyExc_TypeError,"filter: field must be str or tuple");return nullptr;}if(wc)pat=new std::vector<std::string>(std::move(tmp));}
+    FilterBuilderObject* fb=(FilterBuilderObject*)FilterBuilder_Type.tp_alloc(&FilterBuilder_Type,0);
+    if(!fb){delete pat;return nullptr;}
+    fb->owner=owner;Py_INCREF(owner);fb->field=portable_strdup(simple.c_str());fb->pattern=pat;
+    return (PyObject*)fb;
+}
+
+static PyObject* ModDict_filter(ModDictObject* s,PyObject* args){
+    PyObject* fo; if(!PyArg_ParseTuple(args,"O",&fo)) return nullptr;
+    return FilterBuilder_new_obj(s,fo);
+}
+static PyObject* ModDict_filter_legacy(ModDictObject* s,PyObject* args,PyObject* kw){
+    PyObject *on,*val; const char* op_s; static const char* kwl[]={"on","op","value",NULL};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"OsO",(char**)kwl,&on,&op_s,&val)) return nullptr;
+    std::string simple; std::vector<std::string> pattern; bool wc;
+    if(!parse_field_or_pattern(on,simple,pattern,wc)) MOD_DICT_RAISE(PyExc_TypeError,"on must be str or tuple");
+    FilterOp op=parse_op(op_s); if((int)op==-1) MOD_DICT_RAISE(PyExc_ValueError,"op must be ==,!=,<,<=,>,>=");
+    return apply_filter(s,simple,pattern,wc,op,val);
+}
+
+/* Iterator */
+struct ModDictIterObject{PyObject_HEAD ModDict* dict;size_t position;};
+static PyObject* ModDictIter_new(PyTypeObject* type,PyObject* args,PyObject*){
+    PyObject* do_; if(!PyArg_ParseTuple(args,"O!",&ModDict_Type,&do_)) return nullptr;
+    ModDictIterObject* it=PyObject_New(ModDictIterObject,type); if(!it) return nullptr;
+    it->dict=((ModDictObject*)do_)->internal; Py_INCREF(do_);
+    it->position=0; while(it->position<it->dict->outer.capacity()&&!it->dict->outer.begin()[it->position].occupied) it->position++;
+    return (PyObject*)it;
+}
+static void ModDictIter_dealloc(ModDictIterObject* s){Py_TYPE(s)->tp_free((PyObject*)s);}
+static PyObject* ModDictIter_next(ModDictIterObject* s){
+    while(s->position<s->dict->outer.capacity()){
+        auto* e=s->dict->outer.begin()+s->position; s->position++;
+        if(e->occupied && !e->value.is_alias){PyObject* k=e->value.key_py?e->value.key_py:Py_None;Py_INCREF(k);return k;}
+    }
+    PyErr_SetNone(PyExc_StopIteration); return nullptr;
+}
+PyTypeObject ModDictIter_Type={
+    .tp_name="mod_dict.ModDictIter",.tp_basicsize=sizeof(ModDictIterObject),
+    .tp_dealloc=(destructor)ModDictIter_dealloc,.tp_flags=Py_TPFLAGS_DEFAULT,
+    .tp_iter=PyObject_SelfIter,.tp_iternext=(iternextfunc)ModDictIter_next,.tp_new=ModDictIter_new};
+static PyObject* ModDict_iter(ModDictObject* s){
+    ModDictIterObject* it=PyObject_New(ModDictIterObject,&ModDictIter_Type);
+    if(!it){PyErr_NoMemory();return nullptr;}
+    it->dict=s->internal; Py_INCREF(s);
+    it->position=0; while(it->position<it->dict->outer.capacity()&&!it->dict->outer.begin()[it->position].occupied) it->position++;
+    return (PyObject*)it;
+}
+
+static PyObject* ModDict_keys(ModDictObject* s,PyObject*){
+    PyObject* list=PyList_New(s->internal->len()); if(!list) return nullptr;
+    Py_ssize_t idx=0;
+    for(auto& e:s->internal->outer.occupied()){
+        if(e.value.is_alias) continue;
+        PyObject* k=e.value.key_py?e.value.key_py:Py_None;Py_INCREF(k);PyList_SET_ITEM(list,idx++,k);
+    }
+    return list;
+}
+static PyObject* ModDict_values(ModDictObject* s,PyObject*){
+    PyObject* list=PyList_New(s->internal->len()); if(!list) return nullptr;
+    Py_ssize_t idx=0;
+    for(auto& e:s->internal->outer.occupied()){
+        if(e.value.is_alias) continue;
+        PyObject* v=e.value.is_row?s->internal->get_row(e.key):(e.value.val_py?(Py_INCREF(e.value.val_py),e.value.val_py):(Py_INCREF(Py_None),Py_None));
+        PyList_SET_ITEM(list,idx++,v);
+    }
+    return list;
+}
+static PyObject* ModDict_items(ModDictObject* s,PyObject*){
+    PyObject* list=PyList_New(s->internal->len()); if(!list) return nullptr;
+    Py_ssize_t idx=0;
+    for(auto& e:s->internal->outer.occupied()){
+        if(e.value.is_alias) continue;
+        PyObject* k=e.value.key_py?e.value.key_py:Py_None; Py_INCREF(k);
+        PyObject* v=e.value.is_row?s->internal->get_row(e.key):(e.value.val_py?(Py_INCREF(e.value.val_py),e.value.val_py):(Py_INCREF(Py_None),Py_None));
+        PyObject* pair=PyTuple_Pack(2,k,v); Py_DECREF(k); Py_DECREF(v);
+        PyList_SET_ITEM(list,idx++,pair);
+    }
+    return list;
+}
+static PyObject* ModDict_aliases(ModDictObject* s,PyObject*){
+    PyObject* d=PyDict_New(); if(!d) return nullptr;
+    for(auto& e:s->internal->outer.occupied()){
+        if(!e.value.is_alias) continue;
+        OuterEntry* orig=s->internal->outer.find(e.value.orig_hash);
+        PyObject* orig_key=orig&&orig->key_py?orig->key_py:Py_None;
+        PyDict_SetItem(d,e.value.key_py?e.value.key_py:Py_None,orig_key);
+    }
+    return d;
+}
+
+/* Serialization */
+static PyObject* ModDict_serialize(ModDictObject* s,PyObject*){
+    std::vector<uint8_t> data=s->internal->serialize(); if(PyErr_Occurred()) return nullptr;
+    return PyBytes_FromStringAndSize((const char*)data.data(),(Py_ssize_t)data.size());
+}
+static PyObject* ModDict_deserialize(ModDictObject* s,PyObject* args){
+    const char* data; Py_ssize_t len;
+    if(!PyArg_ParseTuple(args,"y#",&data,&len)) return nullptr;
+    s->internal->deserialize((const uint8_t*)data,(size_t)len);
+    if(PyErr_Occurred()) return nullptr;
+    Py_INCREF(s); return (PyObject*)s;
+}
+
+/* Index */
+static PyObject* ModDict_create_index(ModDictObject* s,PyObject* args){
+    PyObject* a; if(!PyArg_ParseTuple(args,"O",&a)) return nullptr;
+    std::string simple; std::vector<std::string> pat; bool wc;
+    if(!parse_field_or_pattern(a,simple,pat,wc)){PyErr_SetString(PyExc_TypeError,"create_index: str or tuple required");return nullptr;}
+    if(wc) s->internal->create_index(pat); else s->internal->create_index(simple);
+    Py_RETURN_NONE;
+}
+static PyObject* ModDict_drop_index(ModDictObject* s,PyObject* args){
+    PyObject* a; if(!PyArg_ParseTuple(args,"O",&a)) return nullptr;
+    std::string simple; std::vector<std::string> pat; bool wc;
+    if(!parse_field_or_pattern(a,simple,pat,wc)){PyErr_SetString(PyExc_TypeError,"drop_index: str or tuple required");return nullptr;}
+    if(wc) s->internal->drop_index(pat); else s->internal->drop_index(simple);
+    Py_RETURN_NONE;
+}
+static PyObject* ModDict_has_index(ModDictObject* s,PyObject* args){
+    PyObject* a; if(!PyArg_ParseTuple(args,"O",&a)) return nullptr;
+    std::string simple; std::vector<std::string> pat; bool wc;
+    if(!parse_field_or_pattern(a,simple,pat,wc)){PyErr_SetString(PyExc_TypeError,"has_index: str or tuple required");return nullptr;}
+    return PyBool_FromLong(wc?s->internal->has_index(pat):s->internal->has_index(simple));
+}
+
+/* from_dict/from_json */
+static PyObject* ModDict_from_dict(PyObject* cls,PyObject* arg){
+    if(!PyDict_Check(arg)){PyErr_SetString(PyExc_TypeError,"argument must be a dict");return nullptr;}
+    ModDictObject* s=(ModDictObject*)((PyTypeObject*)cls)->tp_alloc((PyTypeObject*)cls,0);
+    if(!s) return nullptr;
+    s->internal=new ModDict(); s->owns_internal=true; s->internal->py_wrapper=s; s->parent_ref=nullptr;
+    PyObject *k,*v; Py_ssize_t pos=0;
+    while(PyDict_Next(arg,&pos,&k,&v)){ModValue mk=ModValue::from_pyobject(k);if(PyDict_Check(v))s->internal->insert_row(mk,v);else{ModValue mv=ModValue::from_pyobject(v);s->internal->insert(mk,mv);}}
+    return (PyObject*)s;
+}
+static PyObject* ModDict_from_json(PyObject* cls,PyObject* arg){
+    if(!PyUnicode_Check(arg)){PyErr_SetString(PyExc_TypeError,"argument must be a JSON string");return nullptr;}
+    PyObject* jm=PyImport_ImportModule("json"); if(!jm) return nullptr;
+    PyObject* parsed=PyObject_CallMethod(jm,"loads","O",arg); Py_DECREF(jm);
+    if(!parsed) return nullptr;
+    if(!PyDict_Check(parsed)){PyErr_SetString(PyExc_TypeError,"JSON must be an object");Py_DECREF(parsed);return nullptr;}
+    ModDictObject* s=(ModDictObject*)((PyTypeObject*)cls)->tp_alloc((PyTypeObject*)cls,0);
+    if(!s){Py_DECREF(parsed);return nullptr;}
+    s->internal=new ModDict(); s->owns_internal=true; s->internal->py_wrapper=s; s->parent_ref=nullptr;
+    PyObject *k,*v; Py_ssize_t pos=0;
+    while(PyDict_Next(parsed,&pos,&k,&v)){ModValue mk=ModValue::from_pyobject(k);if(PyDict_Check(v))s->internal->insert_row(mk,v);else{ModValue mv=ModValue::from_pyobject(v);s->internal->insert(mk,mv);}}
+    Py_DECREF(parsed); return (PyObject*)s;
+}
+
+/* group_by/select/sort_by */
+static PyObject* ModDict_group_by(ModDictObject* s,PyObject* args){
+    const char* field; if(!PyArg_ParseTuple(args,"s",&field)) return nullptr;
+    auto groups=s->internal->group_by(std::string(field)); if(PyErr_Occurred()) return nullptr;
+    PyObject* result=PyDict_New(); if(!result) return nullptr;
+    for(auto& [fv,gd]:groups){
+        PyObject* key=fv.to_pyobject(); if(!key){Py_DECREF(result);return nullptr;}
+        ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
+        if(!w){Py_DECREF(key);Py_DECREF(result);return nullptr;}
+        w->internal=gd;w->owns_internal=true;w->parent_ref=(PyObject*)s;Py_INCREF(s);gd->py_wrapper=w;
+        PyDict_SetItem(result,key,(PyObject*)w);Py_DECREF(key);Py_DECREF((PyObject*)w);
+    }
+    return result;
+}
+// Resolve dot-notation path inside a Python dict row. Borrowed ref.
+static PyObject* resolve_field_path(PyObject* row, const std::string& field) {
+    PyObject* cur = row;
+    size_t pos = 0;
+    while (true) {
+        size_t d = field.find('.', pos);
+        std::string seg = field.substr(pos, d == std::string::npos ? d : d - pos);
+        if (!cur || !PyDict_Check(cur)) return nullptr;
+        cur = PyDict_GetItemString(cur, seg.c_str());
+        if (d == std::string::npos) break;
+        pos = d + 1;
+    }
+    return cur;
+}
+
+static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
+    PyObject* fo; const char* ret="rows";
+    static const char* kwl[]={"fields","returns",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|s",const_cast<char**>(kwl),&fo,&ret)) return nullptr;
+    if(!PyList_Check(fo)) MOD_DICT_RAISE(PyExc_TypeError,"fields must be a list of strings");
+    std::vector<std::string> fields; Py_ssize_t n=PyList_Size(fo); fields.reserve((size_t)n);
+    for(Py_ssize_t i=0;i<n;i++){PyObject* it=PyList_GET_ITEM(fo,i);if(!PyUnicode_Check(it))MOD_DICT_RAISE(PyExc_TypeError,"fields must be a list of strings");fields.emplace_back(PyUnicode_AsUTF8(it));}
+    ModDict* result=s->internal->select(fields); MOD_DICT_CHECK_ALLOC(result);
+    if(strcmp(ret,"values")==0){
+        // return list of projected row dicts in insertion order
+        PyObject* lst=PyList_New(0);
+        for(auto& e : result->outer.occupied()){
+            if(e.value.val_py){ Py_INCREF(e.value.val_py); PyList_Append(lst,e.value.val_py); Py_DECREF(e.value.val_py); }
+        }
+        delete result; return lst;
+    }
+    return ModDict_wrap(result);
+}
+static PyObject* ModDict_sort_by(ModDictObject* s,PyObject* args,PyObject* kw){
+    const char* field=nullptr; int rev=0; const char* ret="rows";
+    static const char* kwl[]={"field","reverse","returns",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"s|ps",const_cast<char**>(kwl),&field,&rev,&ret)) return nullptr;
+    auto sorted=s->internal->sort_by(std::string(field),(bool)rev); if(PyErr_Occurred()) return nullptr;
+    bool want_keys  = strcmp(ret,"parent_keys")==0;
+    bool want_vals  = strcmp(ret,"values")==0;
+    PyObject* list=PyList_New((Py_ssize_t)sorted.size()); if(!list) return nullptr;
+    for(size_t i=0;i<sorted.size();i++){
+        PyObject* key=sorted[i];
+        if(want_keys){
+            PyList_SET_ITEM(list,(Py_ssize_t)i,key);
+        } else {
+            uint64_t oh=content_hash_pyobj(key);
+            auto* e=s->internal->outer.find(oh);
+            if(want_vals){
+                // return the sorted field value, not the row
+                PyObject* fv=nullptr;
+                if(e && e->val_py && e->is_row){
+                    fv=resolve_field_path(e->val_py, std::string(field));
+                }
+                if(fv){Py_INCREF(fv);}else{fv=Py_None;Py_INCREF(fv);}
+                Py_DECREF(key);
+                PyList_SET_ITEM(list,(Py_ssize_t)i,fv);
+            } else {
+                // "rows" — return row (with RowProxy if index active)
+                PyObject* val=(e && e->val_py)?(Py_INCREF(e->val_py),e->val_py):(Py_INCREF(Py_None),Py_None);
+                Py_DECREF(key);
+                PyList_SET_ITEM(list,(Py_ssize_t)i,val);
+            }
+        }
+    }
+    return list;
+}
+
+
+static PyObject* ModDict_reindex(ModDictObject* s, PyObject* args) {
+    PyObject* key;
+    if (!PyArg_ParseTuple(args,"O",&key)) return nullptr;
+    s->internal->reindex_row(content_hash_pyobj(key));
+    Py_RETURN_NONE;
+}
+
+static PyObject* ModDict_alias(ModDictObject* s, PyObject* args) {
+    PyObject* key_obj; PyObject* alias_obj;
+    if (!PyArg_ParseTuple(args, "OO", &key_obj, &alias_obj)) return nullptr;
+
+    uint64_t orig_hash = content_hash_pyobj(key_obj);
+    OuterEntry* orig = s->internal->outer.find(orig_hash);
+    if (!orig) {
+        PyErr_SetObject(PyExc_KeyError, key_obj);
+        return nullptr;
+    }
+
+    uint64_t alias_hash = content_hash_pyobj(alias_obj);
+    OuterEntry* existing = s->internal->outer.find(alias_hash);
+    if (existing) {
+        PyErr_SetString(PyExc_KeyError, "alias key already exists");
+        return nullptr;
+    }
+
+    if (orig->alias_hash) {
+        PyErr_SetString(PyExc_KeyError, "key already has an alias");
+        return nullptr;
+    }
+
+    Py_INCREF(alias_obj);
+    // val_py NOT stored in alias — always resolved via orig_hash at access time
+    OuterEntry ae;
+    ae.key_py    = alias_obj;
+    ae.val_py    = nullptr;
+    ae.is_row    = orig->is_row;
+    ae.is_alias  = true;
+    ae.orig_hash = orig_hash;
+    s->internal->outer.insert(alias_hash, ae);
+
+    // let original know its alias hash for cascade-delete
+    orig = s->internal->outer.find(orig_hash);  // re-fetch after possible rehash
+    if (orig) orig->alias_hash = alias_hash;
+
+    Py_RETURN_NONE;
+}
+
+/* method table */
+static PyMethodDef ModDict_methods[]={
+    {"get",(PyCFunction)ModDict_get,METH_VARARGS,"Get value by key with default"},
+{"keys",(PyCFunction)ModDict_keys,METH_NOARGS,"keys()->list"},
+    {"values",(PyCFunction)ModDict_values,METH_NOARGS,"values()->list"},
+    {"items",(PyCFunction)ModDict_items,METH_NOARGS,"items()->list"},
+    {"update",(PyCFunction)ModDict_update,METH_VARARGS|METH_KEYWORDS,"update(target,from_path=None,to_path=None,conflict='keep_right')->int|None"},
+    {"filter",(PyCFunction)ModDict_filter,METH_VARARGS,"filter(field)->FilterBuilder"},
+    {"_filter",(PyCFunction)ModDict_filter_legacy,METH_VARARGS|METH_KEYWORDS,"_filter(on,op,value)->ModDict"},
+    {"create_index",(PyCFunction)ModDict_create_index,METH_VARARGS,"create_index(field)->None"},
+    {"drop_index",(PyCFunction)ModDict_drop_index,METH_VARARGS,"drop_index(field)->None"},
+    {"has_index",(PyCFunction)ModDict_has_index,METH_VARARGS,"has_index(field)->bool"},
+    {"sort_by",(PyCFunction)ModDict_sort_by,METH_VARARGS|METH_KEYWORDS,"sort_by(field,reverse=False,returns='rows')->list"},
+    {"select",(PyCFunction)ModDict_select,METH_VARARGS|METH_KEYWORDS,"select(fields,returns='rows')->ModDict|list"},
+    {"group_by",(PyCFunction)ModDict_group_by,METH_VARARGS,"group_by(field)->dict"},
+    {"from_dict",(PyCFunction)ModDict_from_dict,METH_O|METH_CLASS,"from_dict(d)->ModDict"},
+    {"from_json",(PyCFunction)ModDict_from_json,METH_O|METH_CLASS,"from_json(s)->ModDict"},
+    {"serialize",(PyCFunction)ModDict_serialize,METH_NOARGS,"serialize()->bytes"},
+    {"deserialize",(PyCFunction)ModDict_deserialize,METH_VARARGS,"deserialize(data)->None"},
+    {"reindex",(PyCFunction)ModDict_reindex,METH_VARARGS,"reindex(key)->None — rebuild field indices for one row after deep nested write"},
+    {"alias",(PyCFunction)ModDict_alias,METH_VARARGS,"alias(key,alias)->None — create transparent alias for an existing key"},
+    {"aliases",(PyCFunction)ModDict_aliases,METH_NOARGS,"aliases()->dict — {alias_key: original_key} mapping"},
+    {NULL,NULL,0,NULL}};
+
+static PyMappingMethods ModDict_mapping={
+    .mp_length=(lenfunc)ModDict_len,
+    .mp_subscript=(binaryfunc)ModDict_getitem,
+    .mp_ass_subscript=(objobjargproc)ModDict_setitem};
+static PySequenceMethods ModDict_sequence={.sq_contains=(objobjproc)ModDict_contains};
+
+PyTypeObject ModDict_Type={
+    .tp_name="mod_dict.ModDict",.tp_basicsize=sizeof(ModDictObject),
+    .tp_dealloc=(destructor)ModDict_dealloc,.tp_repr=(reprfunc)ModDict_repr,
+    .tp_as_sequence=&ModDict_sequence,.tp_as_mapping=&ModDict_mapping,
+    .tp_str=(reprfunc)ModDict_repr,
+    .tp_flags=Py_TPFLAGS_DEFAULT|Py_TPFLAGS_BASETYPE,
+    .tp_doc="ModDict — nested dictionary with indexed field queries (C++ backed).",
+    .tp_iter=(getiterfunc)ModDict_iter,.tp_methods=ModDict_methods,
+    .tp_init=(initproc)ModDict_init,.tp_new=ModDict_new};

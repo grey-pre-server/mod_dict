@@ -1,0 +1,15 @@
+cmake-build-debug/
+cmake-build-release/
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+_skbuild/
+__pycache__/
+*.pyc
+.idea/
+*.whl
+wheelhouse/
+library.cpp
+library.h
