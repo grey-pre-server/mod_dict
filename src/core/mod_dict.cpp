@@ -106,8 +106,8 @@ bool ModDict::insert(const ModValue& key, const ModValue& value) {
     OuterEntry* existing = outer.find(h);
 
     // transparent alias redirect
-    if (existing && existing->is_alias) {
-        h = existing->orig_hash;
+    if (const uint64_t* orig = alias_to_orig.find(h)) {
+        h = *orig;
         existing = outer.find(h);
     }
 
@@ -125,6 +125,7 @@ bool ModDict::insert(const ModValue& key, const ModValue& value) {
     } else {
         Py_INCREF(k); Py_INCREF(v);
         outer.insert(h, {k, v, false});
+        order.push_back(h);
     }
     return is_new;
 }
@@ -134,9 +135,9 @@ void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj) {
     OuterEntry* existing = outer.find(oh);
 
     // transparent alias redirect — preserve the original's key_py
-    bool via_alias = existing && existing->is_alias;
-    if (via_alias) {
-        oh = existing->orig_hash;
+    bool via_alias = false;
+    if (const uint64_t* orig = alias_to_orig.find(oh)) {
+        oh = *orig; via_alias = true;
         existing = outer.find(oh);
     }
 
@@ -160,6 +161,7 @@ void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj) {
         PyObject* k = outer_key.obj ? outer_key.obj : Py_None;
         Py_INCREF(k);
         outer.insert(oh, {k, row_v, true});
+        order.push_back(oh);
     }
 
     for (auto& fi : indices.by_field.occupied())
@@ -170,6 +172,26 @@ void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj) {
 
 bool ModDict::contains(const ModValue& key) const {
     return outer.find(key.hash_val) != nullptr;
+}
+
+ModDict* ModDict::deep_copy() const {
+    ModDict* c = new ModDict();
+    if (!c) return nullptr;
+    for (uint64_t oh : order) {
+        const OuterEntry* e = outer.find(oh);
+        if (!e) continue;
+        ModValue mk = ModValue::from_pyobject(e->key_py ? e->key_py : Py_None);
+        if (e->is_row && e->val_py) {
+            PyObject* row_copy = deep_copy_pyobj(e->val_py);
+            if (!row_copy) { delete c; return nullptr; }
+            c->insert_row(mk, row_copy);
+            Py_DECREF(row_copy);
+        } else {
+            ModValue mv = ModValue::from_pyobject(e->val_py ? e->val_py : Py_None);
+            c->insert(mk, mv);
+        }
+    }
+    return c;
 }
 
 PyObject* ModDict::get_row(uint64_t oh) const {
@@ -214,7 +236,7 @@ PyObject* ModDict::get_subrow(uint64_t oh, const std::string& prefix) const {
 void ModDict::reindex_row(uint64_t oh) {
     // if accessed via alias, reindex the original key so the index stays correct
     OuterEntry* e = outer.find(oh);
-    if (e && e->is_alias) oh = e->orig_hash;
+    if (const uint64_t* orig = alias_to_orig.find(oh)) oh = *orig;
     for (auto& fi : indices.by_field.occupied()) {
         fi.value->remove_outer_key(oh);
         fi.value->on_insert_row(oh, this);
@@ -228,23 +250,30 @@ bool ModDict::remove(const ModValue& key) {
     OuterEntry* e = outer.find(h);
     if (!e) return false;
 
-    if (e->is_alias) {
-        // deleting alias = deleting the original (symmetric)
-        uint64_t orig_h = e->orig_hash;
-        Py_XDECREF(e->key_py);
-        e->key_py = nullptr;
+    auto erase_order = [&](uint64_t oh) {
+        auto it = std::find(order.begin(), order.end(), oh);
+        if (it != order.end()) order.erase(it);
+    };
+
+    // Is h an alias?
+    if (const uint64_t* orig_p = alias_to_orig.find(h)) {
+        uint64_t orig_h = *orig_p;
+        // remove alias entry
+        Py_XDECREF(e->key_py); e->key_py = nullptr;
         outer.erase(h);
+        alias_to_orig.erase(h);
+        orig_to_alias.erase(orig_h);
+        // remove original (symmetric)
         OuterEntry* orig = outer.find(orig_h);
         if (orig) {
             if (orig->is_row)
                 for (auto& fi : indices.by_field.occupied())
                     fi.value->on_remove_row(orig_h, this);
-            Py_XDECREF(orig->key_py);
-            Py_XDECREF(orig->val_py);
-            orig->key_py = nullptr;
-            orig->val_py = nullptr;
+            Py_XDECREF(orig->key_py); Py_XDECREF(orig->val_py);
+            orig->key_py = nullptr; orig->val_py = nullptr;
             outer.erase(orig_h);
         }
+        erase_order(orig_h);
         return true;
     }
 
@@ -252,18 +281,20 @@ bool ModDict::remove(const ModValue& key) {
         for (auto& fi : indices.by_field.occupied())
             fi.value->on_remove_row(h, this);
 
-    // if original has an alias, remove it too
-    if (e->alias_hash) {
-        OuterEntry* ae = outer.find(e->alias_hash);
-        if (ae) { Py_XDECREF(ae->key_py); ae->key_py = nullptr; ae->val_py = nullptr; }
-        outer.erase(e->alias_hash);
+    // if original has an alias, cascade-delete it
+    if (const uint64_t* alias_p = orig_to_alias.find(h)) {
+        uint64_t alias_h = *alias_p;
+        OuterEntry* ae = outer.find(alias_h);
+        if (ae) { Py_XDECREF(ae->key_py); ae->key_py = nullptr; }
+        outer.erase(alias_h);
+        alias_to_orig.erase(alias_h);
+        orig_to_alias.erase(h);
     }
 
-    Py_XDECREF(e->key_py);
-    Py_XDECREF(e->val_py);
-    e->key_py = nullptr;
-    e->val_py = nullptr;
+    Py_XDECREF(e->key_py); Py_XDECREF(e->val_py);
+    e->key_py = nullptr; e->val_py = nullptr;
     outer.erase(h);
+    erase_order(h);
     return true;
 }
 
@@ -289,6 +320,7 @@ static void filter_add_row(ModDict* result, const ModDict* src, uint64_t oh) {
     Py_XINCREF(oe->key_py);
     Py_XINCREF(oe->val_py);
     result->outer.insert(oh, {oe->key_py, oe->val_py, true});
+    result->order.push_back(oh);
 }
 
 ModDict* ModDict::filter(const std::string& field, FilterOp op, const ModValue& value) const {
@@ -389,12 +421,16 @@ ModDict* ModDict::select(const std::vector<std::string>& fields) const {
 
     ModDict* result = new ModDict();
 
-    for (auto& e : outer.occupied()) {
-        if (!e.value.is_row || !e.value.val_py) {
-            if (!e.value.is_row && e.value.val_py) {
-                Py_XINCREF(e.value.key_py);
-                Py_XINCREF(e.value.val_py);
-                result->outer.insert(e.key, {e.value.key_py, e.value.val_py, false});
+    for (uint64_t oh : order) {
+        const OuterEntry* ep = outer.find(oh);
+        if (!ep) continue;
+        const OuterEntry& e = *ep;
+        if (!e.is_row || !e.val_py) {
+            if (!e.is_row && e.val_py) {
+                Py_XINCREF(e.key_py);
+                Py_XINCREF(e.val_py);
+                result->outer.insert(oh, {e.key_py, e.val_py, false});
+                result->order.push_back(oh);
             }
             continue;
         }
@@ -404,12 +440,13 @@ ModDict* ModDict::select(const std::vector<std::string>& fields) const {
         for (size_t i = 0; i < fields.size(); i++) {
             std::vector<const char*> segs;
             for (const auto& s : paths[i]) segs.push_back(s.c_str());
-            PyObject* fv = get_nested_segs(e.value.val_py, segs);
+            PyObject* fv = get_nested_segs(e.val_py, segs);
             if (fv) { PyDict_SetItemString(new_row, fields[i].c_str(), fv); has_any = true; }
         }
         if (has_any) {
-            Py_XINCREF(e.value.key_py);
-            result->outer.insert(e.key, {e.value.key_py, new_row, true});
+            Py_XINCREF(e.key_py);
+            result->outer.insert(oh, {e.key_py, new_row, true});
+            result->order.push_back(oh);
         } else {
             Py_DECREF(new_row);
         }
@@ -490,6 +527,7 @@ ModDict::GroupResult ModDict::group_by(const std::string& field) const {
             Py_XINCREF(oe->key_py);
             Py_XINCREF(oe->val_py);
             group->outer.insert(kh, {oe->key_py, oe->val_py, true});
+            group->order.push_back(kh);
         }
         result.push_back({std::move(fv), group});
     }
@@ -963,10 +1001,12 @@ void ModDict::deserialize(const uint8_t* data, size_t len) {
 #define CHECK_LIMIT(n, lim, msg) if ((n) > (lim)) { \
     PyErr_SetString(PyExc_ValueError, "ModDict.deserialize: " msg); return; }
 
+    order.clear();
     if (!check(4)) goto truncated;
     {
         uint32_t n_outer = read_u32(ptr);
         CHECK_LIMIT(n_outer, MAX_ENTRIES, "too many entries");
+        order.reserve(n_outer);
         outer.reserve(n_outer);
 
         for (uint32_t i = 0; i < n_outer; i++) {
@@ -984,6 +1024,7 @@ void ModDict::deserialize(const uint8_t* data, size_t len) {
             PyObject* v = val_mv.obj;
             Py_INCREF(k); Py_INCREF(v);
             outer.insert(oh, {k, v, is_row});
+            order.push_back(oh);
         }
     }
 

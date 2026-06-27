@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <algorithm>
 
 enum class MergeConflict { KEEP_LEFT, KEEP_RIGHT, MERGE, CONCAT };
 enum class FilterOp      { EQ, NE, LT, LE, GT, GE };
@@ -27,17 +28,19 @@ enum class FilterOp      { EQ, NE, LT, LE, GT, GE };
 // OuterEntry would double-Py_DECREF after the copy.
 // ──────────────────────────────────────────────────────────────────────────────
 struct OuterEntry {
-    PyObject* key_py   = nullptr;
-    PyObject* val_py   = nullptr;
-    bool      is_row   = false;
-    bool      is_alias = false;
-    uint64_t  orig_hash  = 0;  // set on alias entry: points to original
-    uint64_t  alias_hash = 0;  // set on original entry: points to its alias (0 = none)
+    PyObject* key_py = nullptr;
+    PyObject* val_py = nullptr;  // nullptr = alias entry (val always >= Py_None for real entries)
+    bool      is_row = false;
 };
 
 class ModDict {
 public:
     FlatHashMap<uint64_t, OuterEntry> outer;
+    std::vector<uint64_t> order;  // outer hashes in insertion order, no aliases
+
+    // Alias side-tables (keep main outer entries small)
+    FlatHashMap<uint64_t, uint64_t> alias_to_orig;  // alias_hash → orig_hash
+    FlatHashMap<uint64_t, uint64_t> orig_to_alias;  // orig_hash  → alias_hash
 
     struct {
         FlatHashMap<std::string, class FieldIndex*> by_field;
@@ -62,13 +65,21 @@ public:
     // ──────────────────────────────────────────────────
     // Read
     // ──────────────────────────────────────────────────
-    bool   contains(const ModValue& key) const;
-    size_t len() const {
-        size_t n = 0;
-        for (auto& e : outer.occupied()) if (!e.value.is_alias) ++n;
-        return n;
+    bool     contains(const ModValue& key) const;
+    ModDict* deep_copy() const;
+
+    size_t len()   const { return order.size(); }
+    bool   empty() const { return order.empty(); }
+
+    // Access by insertion-order index (negative = from end). Returns nullptr if out of range.
+    // Returns borrowed key_py and val_py via out params; returns false if OOB.
+    bool at(Py_ssize_t i, uint64_t& out_hash) const {
+        Py_ssize_t n = (Py_ssize_t)order.size();
+        if (i < 0) i += n;
+        if (i < 0 || i >= n) return false;
+        out_hash = order[(size_t)i];
+        return true;
     }
-    bool   empty() const { return len() == 0; }
 
     // Full row → Py_INCREF'd dict, O(1).
     PyObject* get_row(uint64_t outer_hash) const;
