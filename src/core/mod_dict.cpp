@@ -370,23 +370,33 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
         for (uint64_t oh : idx->find_range(op, value)) filter_add_row(result, this, oh);
     } else {
         // Linear scan with wildcard match
-        for (auto& e : outer.occupied()) {
-            if (!e.value.is_row || !e.value.val_py) continue;
-            // Try each matching value in this row
+        // Check if first segment is an anchor (outer key)
+        bool anchored = (!pattern.empty() && pattern[0] != "__pass_key__");
+        uint64_t anchor_hash = 0;
+        const OuterEntry* anchor_entry = nullptr;
+        if (anchored) {
+            PyObject* tmp = PyUnicode_FromStringAndSize(pattern[0].c_str(), pattern[0].size());
+            if (tmp) { anchor_hash = content_hash_pyobj(tmp); Py_DECREF(tmp); }
+            anchor_entry = outer.find(anchor_hash);
+            if (!anchor_entry || !anchor_entry->val_py || !anchor_entry->is_row)
+                anchored = false;
+        }
+
+        auto scan_row = [&](PyObject* val_py, uint64_t oh, size_t start_depth) {
             bool matched = false;
             std::function<void(PyObject*, size_t)> scan = [&](PyObject* cur, size_t depth) {
                 if (matched || depth >= pattern.size()) return;
                 if (depth == pattern.size() - 1) {
                     if (!PyDict_Check(cur)) return;
-                    PyObject* fv_obj = nullptr;
                     if (pattern[depth] == "__pass_key__") {
+                        // Terminal ? checks the KEY itself
                         PyObject* k2, *v2; Py_ssize_t pos2 = 0;
                         while (PyDict_Next(cur, &pos2, &k2, &v2) && !matched) {
-                            ModValue fv = ModValue::from_pyobject(v2);
+                            ModValue fv = ModValue::from_pyobject(k2);
                             if (compare_values(fv, op, value)) matched = true;
                         }
                     } else {
-                        fv_obj = PyDict_GetItemString(cur, pattern[depth].c_str());
+                        PyObject* fv_obj = PyDict_GetItemString(cur, pattern[depth].c_str());
                         if (fv_obj) {
                             ModValue fv = ModValue::from_pyobject(fv_obj);
                             if (compare_values(fv, op, value)) matched = true;
@@ -404,8 +414,17 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
                     if (next) scan(next, depth + 1);
                 }
             };
-            scan(e.value.val_py, 0);
-            if (matched) filter_add_row(result, this, e.key);
+            scan(val_py, start_depth);
+            if (matched) filter_add_row(result, this, oh);
+        };
+
+        if (anchored) {
+            scan_row(anchor_entry->val_py, anchor_hash, 1);
+        } else {
+            for (auto& e : outer.occupied()) {
+                if (!e.value.is_row || !e.value.val_py) continue;
+                scan_row(e.value.val_py, e.key, 0);
+            }
         }
     }
     return result;
@@ -458,6 +477,22 @@ ModDict* ModDict::select(const std::vector<std::string>& fields) const {
 
 ModDict::SortResult ModDict::sort_by(const std::string& field, bool reverse) const {
     SortResult result;
+    // Anchored paths (first segment = outer key) not supported — ambiguous level
+    {
+        auto segs = split_path(field);
+        if (segs.size() > 1 && segs[0] != "__pass_key__") {
+            PyObject* tmp = PyUnicode_FromStringAndSize(segs[0].c_str(), segs[0].size());
+            if (tmp) {
+                uint64_t h = content_hash_pyobj(tmp); Py_DECREF(tmp);
+                if (outer.find(h)) {
+                    PyErr_SetString(PyExc_ValueError,
+                        "sort_by: anchored paths (first segment = outer key) are not supported. "
+                        "Extract the sub-collection first: md.ModDict(mn[key]).sort_by(...)");
+                    return result;
+                }
+            }
+        }
+    }
     auto* idx_ptr = indices.by_field.find(field);
     if (!idx_ptr) {
         auto segs = split_path(field);
@@ -488,6 +523,19 @@ ModDict::SortResult ModDict::sort_by(const std::string& field, bool reverse) con
 ModDict::GroupResult ModDict::group_by(const std::string& field) const {
     GroupResult result;
     auto segs = split_path(field);
+    // Anchored paths (first segment = outer key) not supported
+    if (segs.size() > 1 && segs[0] != "__pass_key__") {
+        PyObject* tmp = PyUnicode_FromStringAndSize(segs[0].c_str(), segs[0].size());
+        if (tmp) {
+            uint64_t h = content_hash_pyobj(tmp); Py_DECREF(tmp);
+            if (outer.find(h)) {
+                PyErr_SetString(PyExc_ValueError,
+                    "group_by: anchored paths (first segment = outer key) are not supported. "
+                    "Extract the sub-collection first: md.ModDict(mn[key]).group_by(...)");
+                return result;
+            }
+        }
+    }
     std::vector<const char*> seg_ptrs; for (const auto& seg : segs) seg_ptrs.push_back(seg.c_str());
     bool is_path = segs.size() > 1;
 
@@ -706,15 +754,35 @@ int ModDict::merges(ModDict* target,
     std::string merge_tgt_fname;
     bool src_is_key = strcmp(on_source[0], "__scan_key__") == 0 ||
                       strcmp(on_source[0], "__pass_key__") == 0;
-    bool tgt_is_key = strcmp(on_target[0], "__scan_key__") == 0;
+    bool tgt_is_key = strcmp(on_target[0], "__scan_key__") == 0 ||
+                      strcmp(on_target[0], "__pass_key__") == 0;
+
+    bool tgt_pass = strcmp(on_target[0], "__pass_key__") == 0;
 
     if (src_is_key && tgt_is_key) {
-        for (auto& e : outer.occupied()) {
-            if (!e.value.is_row) continue;
-            uint64_t oh = e.key;
-            if (!target->outer.find(oh)) continue;
-            apply_row(oh, oh);
-            merged++;
+        if (tgt_pass) {
+            // ? on target side: also insert keys from target not present in self
+            for (auto& te : target->outer.occupied()) {
+                if (!te.value.is_row || !te.value.val_py) continue;
+                uint64_t oh = te.key;
+                if (!outer.find(oh)) {
+                    // insert new key from target
+                    Py_XINCREF(te.value.key_py); Py_XINCREF(te.value.val_py);
+                    insert_row(ModValue::from_pyobject(te.value.key_py), te.value.val_py);
+                    merged++;
+                } else {
+                    apply_row(oh, oh);
+                    merged++;
+                }
+            }
+        } else {
+            for (auto& e : outer.occupied()) {
+                if (!e.value.is_row) continue;
+                uint64_t oh = e.key;
+                if (!target->outer.find(oh)) continue;
+                apply_row(oh, oh);
+                merged++;
+            }
         }
     } else if (src_is_key && !tgt_is_key) {
         std::string tgt_fname(on_target[0]);

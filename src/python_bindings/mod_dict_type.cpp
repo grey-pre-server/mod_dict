@@ -73,12 +73,40 @@ static int ModDict_init(ModDictObject* s,PyObject* args,PyObject* kwargs) {
     PyObject* ini=nullptr;
     static char* kw[]={(char*)"data",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kwargs,"|O",kw,&ini)) return -1;
-    if (ini&&PyDict_Check(ini)) {
-        PyObject *k,*v; Py_ssize_t pos=0;
-        while (PyDict_Next(ini,&pos,&k,&v)) {
-            ModValue mk=ModValue::from_pyobject(k);
-            if(PyDict_Check(v)) s->internal->insert_row(mk,v);
-            else { ModValue mv=ModValue::from_pyobject(v); s->internal->insert(mk,mv); }
+    if (ini) {
+        if (PyObject_TypeCheck(ini, &ModDict_Type)) {
+            // copy from another ModDict
+            ModDict* src = ((ModDictObject*)ini)->internal;
+            for (auto& e : src->outer.occupied()) {
+                if (!e.value.key_py) continue;
+                ModValue mk = ModValue::from_pyobject(e.value.key_py);
+                if (e.value.is_row && e.value.val_py) s->internal->insert_row(mk, e.value.val_py);
+                else if (e.value.val_py) { ModValue mv = ModValue::from_pyobject(e.value.val_py); s->internal->insert(mk, mv); }
+            }
+        } else if (PyDict_Check(ini)) {
+            PyObject *k,*v; Py_ssize_t pos=0;
+            while (PyDict_Next(ini,&pos,&k,&v)) {
+                ModValue mk=ModValue::from_pyobject(k);
+                if(PyDict_Check(v)) s->internal->insert_row(mk,v);
+                else { ModValue mv=ModValue::from_pyobject(v); s->internal->insert(mk,mv); }
+            }
+        } else if (PyMapping_Check(ini)) {
+            // any Mapping: use .items()
+            PyObject* items = PyMapping_Items(ini);
+            if (!items) return -1;
+            Py_ssize_t n = PyList_GET_SIZE(items);
+            for (Py_ssize_t i = 0; i < n; i++) {
+                PyObject* pair = PyList_GET_ITEM(items, i);
+                PyObject* k = PyTuple_GET_ITEM(pair, 0);
+                PyObject* v = PyTuple_GET_ITEM(pair, 1);
+                ModValue mk = ModValue::from_pyobject(k);
+                if (PyDict_Check(v)) s->internal->insert_row(mk, v);
+                else { ModValue mv = ModValue::from_pyobject(v); s->internal->insert(mk, mv); }
+            }
+            Py_DECREF(items);
+        } else {
+            PyErr_SetString(PyExc_TypeError, "ModDict() argument must be a dict, ModDict, or Mapping");
+            return -1;
         }
     }
     return 0;
@@ -284,7 +312,7 @@ static PyObject* ModDict_update(ModDictObject* s,PyObject* args,PyObject* kwargs
 static bool parse_field_or_pattern(PyObject* arg,std::string& simple,std::vector<std::string>& pattern,bool& wc){
     if(PyUnicode_Check(arg)){
         std::string raw=PyUnicode_AsUTF8(arg);
-        if(raw.find('.')!=std::string::npos){
+        if(raw.find('.')!=std::string::npos || raw=="?"){
             size_t pos=0; while(true){size_t d=raw.find('.',pos);std::string seg=raw.substr(pos,d==std::string::npos?d:d-pos);pattern.push_back(seg=="?"?"__pass_key__":seg);if(d==std::string::npos)break;pos=d+1;}
             wc=true;
         } else { simple=raw; wc=false; }
@@ -317,30 +345,152 @@ static FilterOp parse_op(const char* s){
 /* FilterBuilder */
 struct FilterBuilderObject{PyObject_HEAD ModDictObject* owner;char* field;std::vector<std::string>* pattern;};
 static void FilterBuilder_dealloc(FilterBuilderObject* s){Py_XDECREF(s->owner);free(s->field);delete s->pattern;Py_TYPE(s)->tp_free(s);}
-static PyObject* fb_op(FilterBuilderObject* s,PyObject* args,FilterOp op){
-    PyObject* v; if(!PyArg_ParseTuple(args,"O",&v)) return nullptr;
+
+/* ── scan_here helpers for returns="rows_here"/"values" ── */
+static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
+    ModValue v = ModValue::from_pyobject(pyobj);
+    int c = v.compare(fval);
+    switch(op){
+        case FilterOp::EQ: return c==0; case FilterOp::NE: return c!=0;
+        case FilterOp::LT: return c<0;  case FilterOp::LE: return c<=0;
+        case FilterOp::GT: return c>0;  case FilterOp::GE: return c>=0;
+        default: return false;
+    }
+}
+static void scan_here(PyObject* cur, const std::vector<std::string>& pat, size_t depth,
+                      FilterOp op, const ModValue& fval,
+                      bool want_values, PyObject* vf_key, PyObject* result) {
+    if (!cur || !PyDict_Check(cur) || depth >= pat.size()) return;
+    bool last = (depth == pat.size()-1);
+    if (pat[depth] == "__pass_key__") {
+        PyObject *k,*v; Py_ssize_t pos=0;
+        while (PyDict_Next(cur,&pos,&k,&v)) {
+            if (last) {
+                // Terminal ? checks the KEY itself
+                if (!fh_compare(k,op,fval)) continue;
+                PyObject* item = want_values ? (vf_key ? PyDict_GetItem(cur,vf_key) : nullptr) : cur;
+                if (item) { Py_INCREF(item); PyList_Append(result,item); Py_DECREF(item); }
+            } else if (PyDict_Check(v)) {
+                scan_here(v,pat,depth+1,op,fval,want_values,vf_key,result);
+            }
+        }
+    } else {
+        PyObject* child = PyDict_GetItemString(cur,pat[depth].c_str());
+        if (!child) return;
+        if (last) {
+            if (!fh_compare(child,op,fval)) return;
+            PyObject* item = want_values ? (vf_key ? PyDict_GetItem(cur,vf_key) : nullptr) : cur;
+            if (item) { Py_INCREF(item); PyList_Append(result,item); Py_DECREF(item); }
+        } else {
+            scan_here(child,pat,depth+1,op,fval,want_values,vf_key,result);
+        }
+    }
+}
+static PyObject* apply_filter_here(ModDictObject* owner,
+                                    const std::string& simple,
+                                    const std::vector<std::string>& pattern,
+                                    bool wc, FilterOp op, const ModValue& fval,
+                                    bool want_values, PyObject* vf_key) {
+    PyObject* result = PyList_New(0); if (!result) return nullptr;
+    std::vector<std::string> pat = wc ? pattern : std::vector<std::string>{simple};
+    bool anchored = (!pat.empty() && pat[0] != "__pass_key__");
+    const OuterEntry* anchor_e = nullptr;
+    if (anchored) {
+        PyObject* tmp = PyUnicode_FromStringAndSize(pat[0].c_str(), pat[0].size());
+        if (tmp) {
+            uint64_t h = content_hash_pyobj(tmp); Py_DECREF(tmp);
+            const OuterEntry* e = owner->internal->outer.find(h);
+            if (e && e->val_py && e->is_row) anchor_e = e; else anchored = false;
+        } else { anchored = false; }
+    }
+    if (anchored && anchor_e) {
+        scan_here(anchor_e->val_py,pat,1,op,fval,want_values,vf_key,result);
+    } else {
+        for (auto& e : owner->internal->outer.occupied()) {
+            if (!e.value.is_row || !e.value.val_py) continue;
+            scan_here(e.value.val_py,pat,0,op,fval,want_values,vf_key,result);
+        }
+    }
+    return result;
+}
+
+static PyObject* fb_op(FilterBuilderObject* s,PyObject* args,PyObject* kw,FilterOp op){
+    PyObject* v; const char* ret="rows"; PyObject* vf_obj=nullptr;
+    static const char* kwl[]={"value","returns","value_field",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|sO",(char**)kwl,&v,&ret,&vf_obj)) return nullptr;
     std::string simple(s->field); bool wc=(s->pattern!=nullptr);
     std::vector<std::string> empty; const std::vector<std::string>& pat=wc?*s->pattern:empty;
+    if (strcmp(ret,"rows")!=0) {
+        bool want_values=(strcmp(ret,"values")==0);
+        if (want_values && !vf_obj) MOD_DICT_RAISE(PyExc_ValueError,"returns='values' requires value_field");
+        ModValue fval=ModValue::from_pyobject(v);
+        return apply_filter_here(s->owner,simple,pat,wc,op,fval,want_values,vf_obj);
+    }
     return apply_filter(s->owner,simple,pat,wc,op,v);
 }
-static PyObject* FB_eq(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::EQ);}
-static PyObject* FB_ne(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::NE);}
-static PyObject* FB_lt(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::LT);}
-static PyObject* FB_lte(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::LE);}
-static PyObject* FB_gt(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::GT);}
-static PyObject* FB_gte(FilterBuilderObject* s,PyObject* a){return fb_op(s,a,FilterOp::GE);}
-static PyObject* FB_between(FilterBuilderObject* s,PyObject* args){
-    PyObject *lo,*hi; if(!PyArg_ParseTuple(args,"OO",&lo,&hi)) return nullptr;
+static PyObject* FB_eq(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::EQ);}
+static PyObject* FB_ne(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::NE);}
+static PyObject* FB_lt(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::LT);}
+static PyObject* FB_lte(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::LE);}
+static PyObject* FB_gt(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::GT);}
+static PyObject* FB_gte(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::GE);}
+static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
+    PyObject *lo,*hi; const char* ret="rows"; PyObject* vf_obj=nullptr;
+    static const char* kwl[]={"lo","hi","returns","value_field",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"OO|sO",(char**)kwl,&lo,&hi,&ret,&vf_obj)) return nullptr;
     std::string simple(s->field); bool wc=(s->pattern!=nullptr); std::vector<std::string> empty;
     const std::vector<std::string>& pat=wc?*s->pattern:empty;
+    if (strcmp(ret,"rows")!=0) {
+        bool want_values=(strcmp(ret,"values")==0);
+        if (want_values && !vf_obj) MOD_DICT_RAISE(PyExc_ValueError,"returns='values' requires value_field");
+        ModValue lo_val=ModValue::from_pyobject(lo), hi_val=ModValue::from_pyobject(hi);
+        // collect GE candidates as rows_here, then filter LE
+        PyObject* ge=apply_filter_here(s->owner,simple,pat,wc,FilterOp::GE,lo_val,false,nullptr);
+        if (!ge) return nullptr;
+        PyObject* result=PyList_New(0); if(!result){Py_DECREF(ge);return nullptr;}
+        std::vector<std::string> p=wc?pat:std::vector<std::string>{simple};
+        Py_ssize_t n=PyList_GET_SIZE(ge);
+        for (Py_ssize_t i=0;i<n;i++) {
+            PyObject* row=PyList_GET_ITEM(ge,i);
+            // extract field value and check <= hi
+            PyObject* fv_obj2=nullptr;
+            if (!p.empty() && p.back()!="__pass_key__")
+                fv_obj2=PyDict_GetItemString(row,p.back().c_str());
+            bool pass=true;
+            if (fv_obj2){ModValue fv=ModValue::from_pyobject(fv_obj2);pass=(fv.compare(hi_val)<=0);}
+            if (pass) {
+                PyObject* item=want_values?(vf_obj?PyDict_GetItem(row,vf_obj):nullptr):row;
+                if(item){Py_INCREF(item);PyList_Append(result,item);Py_DECREF(item);}
+            }
+        }
+        Py_DECREF(ge); return result;
+    }
     PyObject* r1=apply_filter(s->owner,simple,pat,wc,FilterOp::GE,lo); if(!r1) return nullptr;
     PyObject* r2=apply_filter((ModDictObject*)r1,simple,pat,wc,FilterOp::LE,hi); Py_DECREF(r1); return r2;
 }
-static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args){
-    PyObject* seq; if(!PyArg_ParseTuple(args,"O",&seq)) return nullptr;
+static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
+    PyObject* seq; const char* ret="rows"; PyObject* vf_obj=nullptr;
+    static const char* kwl[]={"values","returns","value_field",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|sO",(char**)kwl,&seq,&ret,&vf_obj)) return nullptr;
     if(!PySequence_Check(seq)) MOD_DICT_RAISE(PyExc_TypeError,"in_: argument must be a sequence");
     std::string simple(s->field); bool wc=(s->pattern!=nullptr); std::vector<std::string> empty;
     const std::vector<std::string>& pat=wc?*s->pattern:empty;
+    if (strcmp(ret,"rows")!=0) {
+        bool want_values=(strcmp(ret,"values")==0);
+        if (want_values && !vf_obj) MOD_DICT_RAISE(PyExc_ValueError,"returns='values' requires value_field");
+        PyObject* result=PyList_New(0); if(!result) return nullptr;
+        Py_ssize_t n=PySequence_Size(seq);
+        for(Py_ssize_t i=0;i<n;i++){
+            PyObject* item=PySequence_GetItem(seq,i); if(!item){Py_DECREF(result);return nullptr;}
+            ModValue mv=ModValue::from_pyobject(item); Py_DECREF(item);
+            PyObject* part=apply_filter_here(s->owner,simple,pat,wc,FilterOp::EQ,mv,want_values,vf_obj);
+            if(!part){Py_DECREF(result);return nullptr;}
+            Py_ssize_t m=PyList_GET_SIZE(part);
+            for(Py_ssize_t j=0;j<m;j++){PyObject* r=PyList_GET_ITEM(part,j);Py_INCREF(r);PyList_Append(result,r);Py_DECREF(r);}
+            Py_DECREF(part);
+        }
+        return result;
+    }
     ModDict* merged=new ModDict();
     Py_ssize_t n=PySequence_Size(seq);
     for(Py_ssize_t i=0;i<n;i++){
@@ -356,10 +506,14 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args){
     return (PyObject*)w;
 }
 static PyMethodDef FB_methods[]={
-    {"eq",(PyCFunction)FB_eq,METH_VARARGS,""}, {"ne",(PyCFunction)FB_ne,METH_VARARGS,""},
-    {"lt",(PyCFunction)FB_lt,METH_VARARGS,""}, {"lte",(PyCFunction)FB_lte,METH_VARARGS,""},
-    {"gt",(PyCFunction)FB_gt,METH_VARARGS,""}, {"gte",(PyCFunction)FB_gte,METH_VARARGS,""},
-    {"between",(PyCFunction)FB_between,METH_VARARGS,""}, {"in_",(PyCFunction)FB_in_,METH_VARARGS,""},
+    {"eq",(PyCFunction)(PyCFunctionWithKeywords)FB_eq,METH_VARARGS|METH_KEYWORDS,"eq(value,*,returns='rows',value_field=None)"},
+    {"ne",(PyCFunction)(PyCFunctionWithKeywords)FB_ne,METH_VARARGS|METH_KEYWORDS,"ne(value,*,returns='rows',value_field=None)"},
+    {"lt",(PyCFunction)(PyCFunctionWithKeywords)FB_lt,METH_VARARGS|METH_KEYWORDS,"lt(value,*,returns='rows',value_field=None)"},
+    {"lte",(PyCFunction)(PyCFunctionWithKeywords)FB_lte,METH_VARARGS|METH_KEYWORDS,"lte(value,*,returns='rows',value_field=None)"},
+    {"gt",(PyCFunction)(PyCFunctionWithKeywords)FB_gt,METH_VARARGS|METH_KEYWORDS,"gt(value,*,returns='rows',value_field=None)"},
+    {"gte",(PyCFunction)(PyCFunctionWithKeywords)FB_gte,METH_VARARGS|METH_KEYWORDS,"gte(value,*,returns='rows',value_field=None)"},
+    {"between",(PyCFunction)(PyCFunctionWithKeywords)FB_between,METH_VARARGS|METH_KEYWORDS,"between(lo,hi,*,returns='rows',value_field=None)"},
+    {"in_",(PyCFunction)(PyCFunctionWithKeywords)FB_in_,METH_VARARGS|METH_KEYWORDS,"in_(values,*,returns='rows',value_field=None)"},
     {NULL,NULL,0,NULL}};
 PyTypeObject FilterBuilder_Type={
     .tp_name="mod_dict.FilterBuilder",.tp_basicsize=sizeof(FilterBuilderObject),

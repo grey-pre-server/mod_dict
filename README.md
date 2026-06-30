@@ -31,7 +31,8 @@ mn.select(["meta.details.rank", "score"])
 
 # Update from another collection
 mn.update(other)                                 # bulk insert (like dict.update)
-mn.update(other, "*", "*")                       # key-to-key merge
+mn.update(other, "*", "*")                       # key-to-key merge (only updates existing)
+mn.update(other, "?", "?")                       # key-to-key: also inserts new keys from other
 mn.update(other, "user_id", "id")               # field-to-field
 mn.update(other, "*.geo.lat", "*.geo.lat")      # deep field only
 
@@ -42,8 +43,10 @@ mn["al"] = {"age": 33}        # replaces row via alias
 del mn["al"]                  # removes both alias and original
 print(mn.aliases())           # {"al": "alice"}
 
-# Build from a list of rows
+# Build from a list of rows or any Mapping
 mn3 = md.ModDict.from_rows(users, key="id")      # {r["id"]: r for r in users}
+mn4 = md.ModDict(other_mn)                       # copy from ModDict
+mn5 = md.ModDict(OrderedDict(...))               # any Mapping accepted
 
 # Deep copy (7.8× faster than deepcopy)
 backup = mn.copy()
@@ -116,7 +119,13 @@ mn.filter("age").gt(18)                          # age >  18
 mn.filter("age").gte(18)                         # age >= 18
 mn.filter("age").between(18, 30)                 # 18 <= age <= 30
 mn.filter("city").in_(["NY", "LA"])              # city in [...]
-mn.filter("orders.?.status").eq("shipped")       # wildcard path
+mn.filter("orders.?.status").eq("shipped")       # ? skips one key, checks value
+mn.filter("?").eq("orders")                      # terminal ?: outer rows that HAVE key "orders"
+mn.filter("g1.?.status").eq("shipped")           # anchor: first segment scopes scan to key "g1"
+
+# returns parameter: collect inner-level results without rebuilding a new ModDict
+mn.filter("age").gte(18, returns="rows_here")                    # → [row, ...]
+mn.filter("age").gte(18, returns="values", value_field="name")   # → [name, ...]
 
 # Sort / select / group — support dot-notation paths
 mn.sort_by("age", reverse=False, returns="rows")        # default → [row, ...]
@@ -162,13 +171,20 @@ mn.create_index("field") / mn.drop_index("field") / mn.has_index("field")
 
 | Token | Meaning |
 |-------|---------|
-| `*`   | **scan_key** — match by outer key |
-| `?`   | **pass_key** — wildcard one nesting level |
+| `*`   | **scan_key** — match by outer key (update: only updates existing keys) |
+| `?`   | **pass_key** — wildcard one nesting level (update: also inserts new keys; filter non-terminal: skips any key; filter terminal: checks if KEY exists at this level) |
+| `key` | **anchor** (filter) — first segment matched against outer keys to scope the scan |
 
 ```python
-mn.update(updates, "*", "*")                        # join by outer key
-mn.update(prices, "*.meta.score", "*.meta.score")  # update only one deep field
-mn.filter("orders.?.status").eq("shipped")          # status inside any order id
+mn.update(updates, "*", "*")                         # join by outer key (existing only)
+mn.update(updates, "?", "?")                         # join + insert new keys from other
+mn.update(prices, "*.meta.score", "*.meta.score")   # update one deep field
+
+mn.filter("orders.?.status").eq("shipped")           # ? skips any order id key
+mn.filter("?").eq("orders")                          # terminal ?: outer row HAS key "orders"
+mn.filter("g1.?.status").eq("shipped")               # anchor "g1": scan scoped to one row
+mn.filter("age").gte(18, returns="rows_here")        # → flat list of matching inner dicts
+mn.filter("age").gte(18, returns="values", value_field="name")  # → list of field values
 ```
 
 ### Custom type converters

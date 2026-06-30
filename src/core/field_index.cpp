@@ -76,6 +76,25 @@ void FieldIndex::build(ModDict* owner, const std::string& fname) {
 }
 
 /* ============================================================================
+   Anchor helper — if first path segment is a literal outer key, return its
+   entry so callers can scope the scan to just that row (start at depth=1).
+   Returns nullptr if the segment is a wildcard or not an outer key.
+   ============================================================================ */
+
+static const OuterEntry* find_anchor(ModDict* owner,
+                                     const std::string& seg,
+                                     uint64_t& out_hash)
+{
+    if (seg == "__pass_key__") return nullptr;
+    PyObject* tmp = PyUnicode_FromStringAndSize(seg.c_str(), seg.size());
+    if (!tmp) { PyErr_Clear(); return nullptr; }
+    out_hash = content_hash_pyobj(tmp);
+    Py_DECREF(tmp);
+    const OuterEntry* e = owner->outer.find(out_hash);
+    return (e && e->val_py && e->is_row) ? e : nullptr;
+}
+
+/* ============================================================================
    build_wildcard — pattern with __pass_key__ wildcards
    ============================================================================ */
 
@@ -94,7 +113,8 @@ static void collect_wildcard(PyObject* dict,
         PyObject *k, *v; Py_ssize_t pos = 0;
         while (PyDict_Next(dict, &pos, &k, &v)) {
             if (last) {
-                ModValue fv = ModValue::from_pyobject(v);
+                // Terminal ? checks the KEY itself, not the value
+                ModValue fv = ModValue::from_pyobject(k);
                 uint64_t fh = fv.hash();
                 std::vector<uint64_t>* bucket = idx->hash_index.find(fh);
                 if (bucket) bucket->push_back(oh);
@@ -129,9 +149,17 @@ void FieldIndex::build_wildcard(ModDict* owner, const std::vector<std::string>& 
     field_name  = "";
     clear();
 
-    for (auto& e : owner->outer.occupied()) {
-        if (!e.value.is_row || !e.value.val_py) continue;
-        collect_wildcard(e.value.val_py, pat, 0, e.key, this);
+    uint64_t anchor_hash = 0;
+    const OuterEntry* anchor = (!pat.empty()) ? find_anchor(owner, pat[0], anchor_hash) : nullptr;
+
+    if (anchor) {
+        // Anchored path: only scan the one row matched by pat[0], start at depth=1
+        collect_wildcard(anchor->val_py, pat, 1, anchor_hash, this);
+    } else {
+        for (auto& e : owner->outer.occupied()) {
+            if (!e.value.is_row || !e.value.val_py) continue;
+            collect_wildcard(e.value.val_py, pat, 0, e.key, this);
+        }
     }
 
     std::sort(sorted_index.begin(), sorted_index.end(),
@@ -189,9 +217,19 @@ void FieldIndex::on_insert_row(uint64_t oh, ModDict* owner) {
         ModValue fv = ModValue::from_pyobject(fv_obj);
         on_insert(oh, fv);
     } else {
-        PyObject* row = owner->get_row_ref(oh);
-        if (!row) return;
-        collect_wildcard(row, pattern, 0, oh, this);
+        // Anchored pattern: only update index when the anchored row itself changes
+        if (!pattern.empty() && pattern[0] != "__pass_key__") {
+            uint64_t anchor_hash = 0;
+            const OuterEntry* anchor = find_anchor(owner, pattern[0], anchor_hash);
+            if (!anchor || oh != anchor_hash) return;
+            PyObject* row = owner->get_row_ref(oh);
+            if (!row) return;
+            collect_wildcard(row, pattern, 1, oh, this);
+        } else {
+            PyObject* row = owner->get_row_ref(oh);
+            if (!row) return;
+            collect_wildcard(row, pattern, 0, oh, this);
+        }
     }
 }
 
@@ -204,6 +242,12 @@ void FieldIndex::on_remove_row(uint64_t oh, ModDict* owner) {
         ModValue fv = ModValue::from_pyobject(fv_obj);
         on_remove(oh, fv);
     } else {
+        // Anchored pattern: only update index when the anchored row itself is removed
+        if (!pattern.empty() && pattern[0] != "__pass_key__") {
+            uint64_t anchor_hash = 0;
+            const OuterEntry* anchor = find_anchor(owner, pattern[0], anchor_hash);
+            if (!anchor || oh != anchor_hash) return;
+        }
         // Full rebuild is simplest for wildcard remove
         PyObject* row = owner->get_row_ref(oh);
         if (!row) return;

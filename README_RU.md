@@ -32,7 +32,8 @@ mn.select(["meta.details.rank", "score"])
 
 # Обновление из другой коллекции
 mn.update(other)                                 # массовая вставка (как dict.update)
-mn.update(other, "*", "*")                       # по внешнему ключу
+mn.update(other, "*", "*")                       # по внешнему ключу (только существующие)
+mn.update(other, "?", "?")                       # по ключу + вставка новых ключей из other
 mn.update(other, "user_id", "id")               # по значению поля
 mn.update(other, "*.geo.lat", "*.geo.lat")      # только одно глубокое поле
 
@@ -43,8 +44,10 @@ mn["al"] = {"age": 33}        # замена строки через алиас
 del mn["al"]                  # удаляет и алиас, и оригинал
 print(mn.aliases())           # {"al": "alice"}
 
-# Построение из списка строк
+# Построение из списка строк или любого Mapping
 mn3 = md.ModDict.from_rows(users, key="id")      # {r["id"]: r for r in users}
+mn4 = md.ModDict(other_mn)                       # копия из ModDict
+mn5 = md.ModDict(OrderedDict(...))               # принимается любой Mapping
 
 # Глубокое копирование (в 7.8× быстрее deepcopy)
 backup = mn.copy()
@@ -118,7 +121,13 @@ mn.filter("age").gt(18)                          # age >  18
 mn.filter("age").gte(18)                         # age >= 18
 mn.filter("age").between(18, 30)                 # 18 <= age <= 30
 mn.filter("city").in_(["NY", "LA"])              # city в списке
-mn.filter("orders.?.status").eq("shipped")       # wildcard-путь
+mn.filter("orders.?.status").eq("shipped")       # ? пропускает один уровень ключей
+mn.filter("?").eq("orders")                      # терминальный ?: строки с ключом "orders"
+mn.filter("g1.?.status").eq("shipped")           # anchor: сканирование ограничено ключом "g1"
+
+# параметр returns: получить внутренние результаты без построения нового ModDict
+mn.filter("age").gte(18, returns="rows_here")                    # → [row, ...]
+mn.filter("age").gte(18, returns="values", value_field="name")   # → [name, ...]
 
 # Сортировка / проекция / группировка — поддержка путей через точку
 mn.sort_by("age", reverse=False, returns="rows")        # по умолчанию → [row, ...]
@@ -165,13 +174,20 @@ mn.reindex(key)
 
 | Токен | Значение |
 |-------|---------|
-| `*`   | **scan_key** — совпадение по внешнему ключу |
-| `?`   | **pass_key** — wildcard для одного уровня вложенности |
+| `*`   | **scan_key** — совпадение по внешнему ключу (update: только существующие ключи) |
+| `?`   | **pass_key** — wildcard (update: + вставка новых; filter нетерминальный: пропускает ключ; filter терминальный: проверяет наличие ключа) |
+| `key` | **anchor** (filter) — первый сегмент ограничивает сканирование одним внешним ключом |
 
 ```python
-mn.update(updates, "*", "*")                        # объединение по внешнему ключу
-mn.update(prices, "*.meta.score", "*.meta.score")  # обновить только одно глубокое поле
-mn.filter("orders.?.status").eq("shipped")          # status внутри любого order id
+mn.update(updates, "*", "*")                         # объединение по ключу (только существующие)
+mn.update(updates, "?", "?")                         # объединение + вставка новых ключей
+mn.update(prices, "*.meta.score", "*.meta.score")   # обновить одно глубокое поле
+
+mn.filter("orders.?.status").eq("shipped")           # ? пропускает любой id заказа
+mn.filter("?").eq("orders")                          # терминальный ?: строка имеет ключ "orders"
+mn.filter("g1.?.status").eq("shipped")               # anchor "g1": сканирование ограничено одной строкой
+mn.filter("age").gte(18, returns="rows_here")        # → плоский список совпадающих dict
+mn.filter("age").gte(18, returns="values", value_field="name")  # → список значений поля
 ```
 
 ### Конвертеры типов

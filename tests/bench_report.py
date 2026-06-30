@@ -4,7 +4,7 @@ Run after building: python tests/bench_report.py
 """
 import sys, os, time, random, string, datetime, json, pickle
 
-# import _env  # noqa — adds cmake-build-release to sys.path
+import _env  # noqa — adds cmake-build-release to sys.path
 import mod_dict as md
 
 random.seed(42)
@@ -198,6 +198,15 @@ row("dict key→key update  vs  mn.update(*,*)",
     tm(lambda: [dr[k].update(updates_py[k]) for k in dr if k in updates_py]),
     tm(lambda: mn.update(updates_mn, "*", "*")))
 
+# update by field key
+keyed_rows  = [{"user_id": k, "score": round(random.random()*10,4)} for k in row_keys]
+mn_keyed    = md.ModDict()
+for i, r in enumerate(keyed_rows): mn_keyed[i] = r
+t_d_kk = tm(lambda: {r["user_id"]: dr[r["user_id"]].update({"score": r["score"]})
+                     for r in keyed_rows if r["user_id"] in dr})
+t_mn_kk = tm(lambda: mn.update(mn_keyed, "user_id", "*"))
+row("update by field: manual vs mn.update(key,*)", t_d_kk, t_mn_kk)
+
 # ── 7. SERIALIZATION ──────────────────────────────────────────────────────────
 sep("7. Serialization (100 000 rows)")
 
@@ -253,6 +262,138 @@ t_cv = tm(lambda: [mn_c.__setitem__(k, r) for k, r in zip(row_keys, temp_rows)])
 
 print(f"  {'insert — no converters (fast path O(1) check)':<50} {t_no:6.0f}ms")
 print(f"  {'insert — Temp→int converter active':<50} {t_cv:6.0f}ms")
+
+# ── 10. NEW FEATURES ──────────────────────────────────────────────────────────
+sep("10. from_rows / copy / at  (100 000 rows)")
+
+rows_list = [{"id": k, **r} for k, r in zip(row_keys, rows)]
+
+# from_rows vs dict comprehension
+t_d_from  = tm(lambda: {r["id"]: r for r in rows_list}, 1)
+t_mn_from = tm(lambda: md.ModDict.from_rows(rows_list, key="id"), 1)
+row("from_rows: {r[id]:r} vs ModDict.from_rows", t_d_from, t_mn_from)
+
+# copy (deep) vs copy.deepcopy
+import copy as _copy
+mn_copy_src = md.ModDict()
+for k, r in zip(row_keys, rows): mn_copy_src[k] = r
+dr_copy_src = dict(zip(row_keys, rows))
+t_d_copy  = tm(lambda: _copy.deepcopy(dr_copy_src), 1)
+t_mn_copy = tm(lambda: mn_copy_src.copy(), 1)
+row("copy (deep): deepcopy(dict) vs mn.copy()", t_d_copy, t_mn_copy)
+
+# at() vs list index
+mn_at_src = md.ModDict()
+for k, r in zip(row_keys, rows): mn_at_src[k] = r
+row_list_src = list(zip(row_keys, rows))
+t_d_at_first = tm(lambda: row_list_src[0])
+t_mn_at_first = tm(lambda: mn_at_src.at(0))
+t_d_at_last  = tm(lambda: row_list_src[-1])
+t_mn_at_last  = tm(lambda: mn_at_src.at(-1))
+row("at(0) first: list[0] vs mn.at(0)", t_d_at_first, t_mn_at_first)
+row("at(-1) last: list[-1] vs mn.at(-1)", t_d_at_last, t_mn_at_last)
+
+# ── 11. INIT ──────────────────────────────────────────────────────────────────
+sep("11. ModDict.__init__  (100 000 rows)")
+
+from collections import OrderedDict as OD
+
+# dict init
+t_d_init  = tm(lambda: dict(zip(row_keys, rows)), 1)
+t_mn_init = tm(lambda: md.ModDict(dict(zip(row_keys, rows))), 1)
+row("dict init: dict() vs ModDict(dict)", t_d_init, t_mn_init)
+
+# ModDict copy via __init__
+mn_init_src = md.ModDict(dict(zip(row_keys, rows)))
+t_mn_cp = tm(lambda: md.ModDict(mn_init_src), 1)
+print(f"  {'ModDict(other_mn) shallow copy':<50} {t_mn_cp:6.0f}ms")
+
+# OrderedDict init
+od_src = OD(zip(row_keys, rows))
+t_od = tm(lambda: md.ModDict(od_src), 1)
+print(f"  {'ModDict(OrderedDict)':<50} {t_od:6.0f}ms")
+
+# ── 12. UPDATE ────────────────────────────────────────────────────────────────
+sep("12. update  (100 000 rows)")
+
+mn_upd = md.ModDict(dict(zip(row_keys, rows)))
+upd_same = md.ModDict({k: {"score": round(random.random()*10,4)} for k in row_keys})
+upd_dict = {k: {"score": round(random.random()*10,4)} for k in row_keys}
+
+t_d_upd = tm(lambda: [dr[k].update(upd_dict[k]) for k in row_keys if k in upd_dict])
+t_mn_star = tm(lambda: mn_upd.update(upd_same, "*", "*"))
+row("key-to-key (*,*): manual vs mn.update(*,*)", t_d_upd, t_mn_star)
+
+t_mn_q = tm(lambda: mn_upd.update(upd_same, "?", "?"))
+print(f"  {'mn.update(?,?) — same data, insert+update':<50} {t_mn_q:6.0f}ms  {t_d_upd/t_mn_q:.2f}×")
+
+upd_deep = md.ModDict({k: {"meta": {"level": random.randint(1,10)}} for k in row_keys})
+t_d_deep = tm(lambda: [dr[k]["meta"].__setitem__("level", upd_dict[k]["score"]) for k in row_keys])
+t_mn_deep = tm(lambda: mn_upd.update(upd_deep, "*.meta.level", "*.meta.level"))
+row("deep field (*.meta.level): manual vs mn.update", t_d_deep, t_mn_deep)
+
+# ── 13. WILDCARD FILTER ───────────────────────────────────────────────────────
+sep("13. Wildcard filter  (groups: 1000 outer × 100 inner rows)")
+
+N_G = 1000
+N_R = 100
+g_keys = [rstr(8) for _ in range(N_G)]
+r_keys = [rstr(6) for _ in range(N_R)]
+g_rows = [[{"_id": rk, "user_id": random.randint(1, 20), "score": round(random.random()*10,2)}
+           for rk in r_keys] for _ in range(N_G)]
+
+# build dict-of-dicts and ModDict
+dd = {gk: {r["_id"]: r for r in grp} for gk, grp in zip(g_keys, g_rows)}
+mn_g = md.ModDict()
+for gk, grp in zip(g_keys, g_rows):
+    mn_g[gk] = {r["_id"]: r for r in grp}
+
+TARGET_UID = 5
+
+# filter('?.user_id').eq(5) — scan all outer rows, find inner rows where user_id=5
+t_d_wc = tm(lambda: {gk: gv for gk, gv in dd.items()
+                     if any(r["user_id"] == TARGET_UID for r in gv.values())})
+t_mn_wc1 = tm(lambda: mn_g.filter("?.user_id").eq(TARGET_UID), 1)
+t_mn_wc2 = tm(lambda: mn_g.filter("?.user_id").eq(TARGET_UID))
+print(f"  {'dict: {gk:gv for gk,gv if any(r[uid]==5)}':<50} {t_d_wc:6.0f}ms")
+print(f"  {'mn.filter(?.user_id).eq(5) 1st call':<50} {t_mn_wc1:6.0f}ms  {t_d_wc/t_mn_wc1:.2f}×")
+print(f"  {'mn.filter(?.user_id).eq(5) 2nd+ call':<50} {t_mn_wc2:6.0f}ms  {t_d_wc/t_mn_wc2:.2f}×")
+
+# filter('?').eq(rk) — find outer rows containing a specific inner key
+TARGET_KEY = r_keys[N_R // 2]
+t_d_key = tm(lambda: {gk: gv for gk, gv in dd.items() if TARGET_KEY in gv})
+t_mn_key1 = tm(lambda: mn_g.filter("?").eq(TARGET_KEY), 1)
+t_mn_key2 = tm(lambda: mn_g.filter("?").eq(TARGET_KEY))
+print()
+print(f"  {'dict: {gk:gv for gk,gv if key in gv}':<50} {t_d_key:6.0f}ms")
+print(f"  {'mn.filter(?).eq(key) 1st call':<50} {t_mn_key1:6.0f}ms  {t_d_key/t_mn_key1:.2f}×")
+print(f"  {'mn.filter(?).eq(key) 2nd+ call':<50} {t_mn_key2:6.0f}ms  {t_d_key/t_mn_key2:.2f}×")
+
+# returns="rows_here" — collect inner dicts directly
+t_d_here = tm(lambda: [r for gv in dd.values() for r in gv.values()
+                        if r["user_id"] == TARGET_UID])
+t_mn_here = tm(lambda: mn_g.filter("?.user_id").eq(TARGET_UID, returns="rows_here"))
+print()
+row("rows_here: [r for gv in dd.values()...] vs eq(5,returns=rows_here)",
+    t_d_here, t_mn_here)
+
+# returns="values" — extract one field
+t_d_val = tm(lambda: [r["score"] for gv in dd.values() for r in gv.values()
+                       if r["user_id"] == TARGET_UID])
+t_mn_val = tm(lambda: mn_g.filter("?.user_id").eq(TARGET_UID, returns="values", value_field="score"))
+row("values: [r[score]...] vs eq(5,returns=values,value_field=score)",
+    t_d_val, t_mn_val)
+
+# anchor: filter("gk.?.user_id").eq(5) — only scan one outer row
+ANCHOR_KEY = g_keys[N_G // 2]
+t_d_anch = tm(lambda: {rk: rv for rk, rv in dd[ANCHOR_KEY].items()
+                        if rv["user_id"] == TARGET_UID})
+t_mn_anch1 = tm(lambda: mn_g.filter(f"{ANCHOR_KEY}.?.user_id").eq(TARGET_UID), 1)
+t_mn_anch2 = tm(lambda: mn_g.filter(f"{ANCHOR_KEY}.?.user_id").eq(TARGET_UID))
+print()
+print(f"  {'dict: {rk:rv for rk,rv in dd[gk].items() if uid==5}':<50} {t_d_anch:6.2f}ms")
+print(f"  {f'mn.filter({ANCHOR_KEY}.?.user_id).eq(5) 1st':<50} {t_mn_anch1:6.2f}ms  {t_d_anch/t_mn_anch1:.2f}×")
+print(f"  {f'mn.filter({ANCHOR_KEY}.?.user_id).eq(5) 2nd+':<50} {t_mn_anch2:6.2f}ms  {t_d_anch/t_mn_anch2:.2f}×")
 
 print("\n" + "═"*62)
 print("  Done.")

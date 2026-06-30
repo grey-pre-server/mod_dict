@@ -54,23 +54,52 @@ class FilterBuilder:
         mn.filter("orders.?.status").eq("shipped") # ? = any one key level
     """
 
-    def eq(self, value: Any) -> ModDict:
+    def eq(
+        self, value: Any,
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
         """
         Return rows where field **equals** value.
 
         Works for all types: str, int, float, bool, date, datetime, etc.
 
-        Example::
+        Args:
+            value:       The value to compare against.
+            returns:     What to return:
+
+                         - ``"rows"`` — new ModDict at the outer level *(default)*
+                         - ``"rows_here"`` — list of dicts at the level where the
+                           field lives (useful with wildcard paths)
+                         - ``"values"`` — list of values extracted from each
+                           matching dict (requires *value_field*)
+
+            value_field: Field name to extract when ``returns="values"``.
+
+        Examples::
 
             active_users = mn.filter("active").eq(True)
             shipped      = mn.filter("status").eq("shipped")
-            level_3      = mn.filter("meta.level").eq(3)
+
+            # wildcard: rows at the inner level where user_id==1
+            inner = mn.filter("?.user_id").eq(1, returns="rows_here")
+
+            # extract "name" from each matching inner row
+            names = mn.filter("?.user_id").eq(1, returns="values", value_field="name")
+
+            # anchor: find outer rows that contain inner key "r1"
+            has_r1 = mn.filter("?").eq("r1")
         """
         ...
 
-    def ne(self, value: Any) -> ModDict:
-        """
-        Return rows where field **does not equal** value.
+    def ne(
+        self, value: Any,
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
+        """Return rows where field **does not equal** value.
+
+        See :meth:`eq` for the ``returns`` / ``value_field`` parameters.
 
         Example::
 
@@ -78,12 +107,17 @@ class FilterBuilder:
         """
         ...
 
-    def lt(self, value: Any) -> ModDict:
-        """
-        Return rows where field is **less than** value.
+    def lt(
+        self, value: Any,
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
+        """Return rows where field is **less than** value.
 
         Supported for numeric types (int, float). Uses sorted index
         when available for O(log n) performance.
+
+        See :meth:`eq` for the ``returns`` / ``value_field`` parameters.
 
         Example::
 
@@ -91,9 +125,14 @@ class FilterBuilder:
         """
         ...
 
-    def lte(self, value: Any) -> ModDict:
-        """
-        Return rows where field is **less than or equal** to value.
+    def lte(
+        self, value: Any,
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
+        """Return rows where field is **less than or equal** to value.
+
+        See :meth:`eq` for the ``returns`` / ``value_field`` parameters.
 
         Example::
 
@@ -101,9 +140,14 @@ class FilterBuilder:
         """
         ...
 
-    def gt(self, value: Any) -> ModDict:
-        """
-        Return rows where field is **greater than** value.
+    def gt(
+        self, value: Any,
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
+        """Return rows where field is **greater than** value.
+
+        See :meth:`eq` for the ``returns`` / ``value_field`` parameters.
 
         Example::
 
@@ -112,9 +156,14 @@ class FilterBuilder:
         """
         ...
 
-    def gte(self, value: Any) -> ModDict:
-        """
-        Return rows where field is **greater than or equal** to value.
+    def gte(
+        self, value: Any,
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
+        """Return rows where field is **greater than or equal** to value.
+
+        See :meth:`eq` for the ``returns`` / ``value_field`` parameters.
 
         Example::
 
@@ -122,12 +171,14 @@ class FilterBuilder:
         """
         ...
 
-    def between(self, lo: Any, hi: Any) -> ModDict:
-        """
-        Return rows where ``lo <= field <= hi`` (inclusive on both ends).
+    def between(
+        self, lo: Any, hi: Any,
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
+        """Return rows where ``lo <= field <= hi`` (inclusive on both ends).
 
-        Equivalent to ``.gte(lo)`` chained with ``.lte(hi)``, but expressed
-        as a single readable call.
+        See :meth:`eq` for the ``returns`` / ``value_field`` parameters.
 
         Example::
 
@@ -136,12 +187,17 @@ class FilterBuilder:
         """
         ...
 
-    def in_(self, values: Sequence[Any]) -> ModDict:
-        """
-        Return rows where field matches **any** value in the sequence.
+    def in_(
+        self, values: Sequence[Any],
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
+        """Return rows where field matches **any** value in the sequence.
 
         Performs one ``eq`` lookup per value and unions the results.
         An index on the field makes each lookup O(1).
+
+        See :meth:`eq` for the ``returns`` / ``value_field`` parameters.
 
         Example::
 
@@ -215,13 +271,18 @@ class ModDict:
     # Constructors
     # ──────────────────────────────────────────────────
 
-    def __init__(self) -> None:
-        """Create an empty ModDict.
+    def __init__(self, data: dict | ModDict | None = None) -> None:
+        """Create a ModDict, optionally populated from *data*.
+
+        *data* may be a plain ``dict``, another ``ModDict``, or any
+        ``Mapping``-compatible object (e.g. ``OrderedDict``, ``defaultdict``).
 
         Example::
 
-            mn = md.ModDict()
-            mn["alice"] = {"age": 30, "score": 9.5}
+            mn = md.ModDict()                          # empty
+            mn = md.ModDict({"a": {"x": 1}})           # from dict
+            mn = md.ModDict(other_mn)                  # shallow copy of ModDict
+            mn = md.ModDict(OrderedDict([("a", {})]))  # any Mapping
         """
         ...
 
@@ -474,11 +535,20 @@ class ModDict:
             mn.filter("meta.score").between(7.0, 10.0)
             mn.filter("geo.coords.lat").lt(0)
 
-        Wildcard path (``?`` matches any single intermediate key)::
+        Wildcard path (``?`` = any single key at that level)::
 
-            # {user: {orders: {<order_id>: {status: ...}}}}
-            mn.filter("orders.?.status").eq("shipped")
+            # non-terminal ?: skip key, look at field in the value
+            mn.filter("orders.?.status").eq("shipped")   # any order id
             mn.filter("orders.?.amount").gte(100)
+
+            # terminal ?: check if that key EXISTS at the inner level
+            mn.filter("?").eq("r1")   # outer rows whose inner dict has key "r1"
+
+        Anchor path (first segment is a known outer key)::
+
+            # only scan rows inside the "g1" outer key
+            mn.filter("g1.?.user_id").eq(1)
+            mn.filter("g1.?.user_id").eq(1, returns="rows_here")
 
         **Performance**
 
