@@ -151,22 +151,39 @@ groups['g2'] = {
     "r4": {"_id": "r4", "user_id": 3, "data": "ddd"},
 }
 print("\n─── filter returns ───")
-# rows_here — плоское поле
-mn2 = md.ModDict({"a": {"age": 30, "name": "alice"}, "b": {"age": 25, "name": "bob"}})
-print(mn2.filter("age").gte(28, returns="rows_here"))
-# → [{'age': 30, 'name': 'alice'}]
+mn_fr = md.ModDict({"a": {"age": 30, "name": "alice"}, "b": {"age": 25, "name": "bob"}})
+print(mn_fr.filter("age").gte(28, returns="rows_here"))   # [{'age':30,'name':'alice'}]
+print(mn_fr.filter("age").gte(28, returns="values", value_field="name"))  # ['alice']
 
-# values
-print(mn2.filter("age").gte(28, returns="values", value_field="name"))
-# → ['alice']
+print(groups.filter("g1.?.user_id").eq(1, returns="rows_here"))   # [{'_id':'r1',...}]
+print(groups.filter("?.user_id").eq(1, returns="values", value_field="data"))  # ['aaa','ccc']
 
-# rows_here с wildcard + anchor
-print(groups.filter("g1.?.user_id").eq(1, returns="rows_here"))
-# → [{'_id': 'r1', 'user_id': 1, 'data': 'aaa'}]
+print("\n─── wildcard filter pruning ───")
+mn_p = md.ModDict({"a": {123: {"age": 30, "name": "alice"},
+                          "b": {"age": 25, "name": "bob"}}})
 
-# values с wildcard без anchor
-print(groups.filter("?.user_id").eq(1, returns="values", value_field="data"))
-# → ['aaa', 'ccc']
+# anchor prune: only matching inner entry kept
+r = mn_p.filter("a.?.age").eq(30)
+assert r.keys() == ["a"]
+assert list(r["a"].keys()) == [123], f"expected [123], got {list(r['a'].keys())}"
+print("anchor prune:      ", r["a"])   # {123: {age:30, name:alice}}
+
+# non-anchor prune
+mn_p2 = md.ModDict({
+    "g1": {"r1": {"age": 30}, "r2": {"age": 25}},
+    "g2": {"r3": {"age": 30}, "r4": {"age": 40}},
+})
+r2 = mn_p2.filter("?.age").eq(30)
+assert list(r2["g1"].keys()) == ["r1"]
+assert list(r2["g2"].keys()) == ["r3"]
+print(r2)
+print("non-anchor prune:  ", {k: list(r2[k].keys()) for k in r2.keys()})  # {g1:[r1], g2:[r3]}
+
+# chained filter AND semantics
+r3 = mn_p2.filter("?.age").gte(30).filter("?.age").lte(30)
+assert list(r3["g1"].keys()) == ["r1"]
+assert list(r3["g2"].keys()) == ["r3"]
+print("chained AND:       ", {k: list(r3[k].keys()) for k in r3.keys()})  # {g1:[r1], g2:[r3]}
 from collections import OrderedDict
 
 # ── __init__ ──────────────────────────────────────────────────────────────────

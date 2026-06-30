@@ -323,6 +323,80 @@ static void filter_add_row(ModDict* result, const ModDict* src, uint64_t oh) {
     result->order.push_back(oh);
 }
 
+static void filter_add_pruned_row(ModDict* result, const ModDict* src, uint64_t oh, PyObject* val_py) {
+    const OuterEntry* oe = src->outer.find(oh);
+    if (!oe || !oe->is_row || !oe->key_py) return;
+    Py_INCREF(oe->key_py);
+    Py_INCREF(val_py);
+    result->outer.insert(oh, {oe->key_py, val_py, true});
+    result->order.push_back(oh);
+}
+
+// Returns:
+//   nullptr  — no match
+//   Py_True  — matched, caller should use full original row (terminal ? or simple field)
+//   new dict — matched, pruned to only matching inner entries (caller owns ref)
+static PyObject* prune_match(PyObject* cur,
+                              const std::vector<std::string>& pat, size_t depth,
+                              FilterOp op, const ModValue& val)
+{
+    if (!cur || depth >= pat.size()) return nullptr;
+    bool last = (depth == pat.size() - 1);
+
+    if (pat[depth] == "__pass_key__") {
+        if (last) {
+            // Terminal ?: check if any KEY equals val — return full cur
+            if (!PyDict_Check(cur)) return nullptr;
+            PyObject *k, *v; Py_ssize_t pos = 0;
+            while (PyDict_Next(cur, &pos, &k, &v)) {
+                ModValue fv = ModValue::from_pyobject(k);
+                if (compare_values(fv, op, val)) return Py_True;
+            }
+            return nullptr;
+        } else {
+            // Non-terminal ?: prune this level — keep only matching inner keys
+            if (!PyDict_Check(cur)) return nullptr;
+            PyObject* pruned = PyDict_New();
+            if (!pruned) return nullptr;
+            PyObject *k, *v; Py_ssize_t pos = 0;
+            while (PyDict_Next(cur, &pos, &k, &v)) {
+                PyObject* sub = prune_match(v, pat, depth + 1, op, val);
+                if (!sub) continue;
+                if (sub == Py_True) {
+                    PyDict_SetItem(pruned, k, v);
+                } else {
+                    PyDict_SetItem(pruned, k, sub);
+                    Py_DECREF(sub);
+                }
+            }
+            if (PyDict_Size(pruned) == 0) { Py_DECREF(pruned); return nullptr; }
+            return pruned;
+        }
+    } else {
+        // Literal segment — navigate to child
+        if (!PyDict_Check(cur)) return nullptr;
+        PyObject* child = PyDict_GetItemString(cur, pat[depth].c_str());
+        if (!child) return nullptr;
+        if (last) {
+            ModValue fv = ModValue::from_pyobject(child);
+            return compare_values(fv, op, val) ? Py_True : nullptr;
+        } else {
+            PyObject* sub = prune_match(child, pat, depth + 1, op, val);
+            if (!sub) return nullptr;
+            if (sub == Py_True) return Py_True;
+            // sub is pruned version of child — wrap in {literal_key: sub}
+            PyObject* wrapper = PyDict_New();
+            if (!wrapper) { Py_DECREF(sub); return nullptr; }
+            PyObject* key_obj = PyUnicode_FromStringAndSize(pat[depth].c_str(), pat[depth].size());
+            if (!key_obj) { Py_DECREF(sub); Py_DECREF(wrapper); return nullptr; }
+            PyDict_SetItem(wrapper, key_obj, sub);
+            Py_DECREF(key_obj);
+            Py_DECREF(sub);
+            return wrapper;
+        }
+    }
+}
+
 ModDict* ModDict::filter(const std::string& field, FilterOp op, const ModValue& value) const {
     ModDict* result = new ModDict();
 
@@ -363,67 +437,61 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
     }
     FieldIndex* idx = *idx_ptr;
 
+    // For wildcard patterns, compute anchor once (used in all paths below)
+    bool anchored = (!pattern.empty() && pattern[0] != "__pass_key__");
+    uint64_t anchor_hash = 0;
+    const OuterEntry* anchor_entry = nullptr;
+    if (anchored) {
+        PyObject* tmp = PyUnicode_FromStringAndSize(pattern[0].c_str(), pattern[0].size());
+        if (tmp) { anchor_hash = content_hash_pyobj(tmp); Py_DECREF(tmp); }
+        anchor_entry = outer.find(anchor_hash);
+        if (!anchor_entry || !anchor_entry->val_py || !anchor_entry->is_row)
+            anchored = false;
+    }
+
+    // Helper: run prune_match and add result to result ModDict
+    auto add_pruned = [&](uint64_t oh, PyObject* val_py, size_t start_depth) {
+        PyObject* pruned = prune_match(val_py, pattern, start_depth, op, value);
+        if (!pruned) return;
+        if (pruned == Py_True) {
+            filter_add_row(result, this, oh);
+        } else {
+            filter_add_pruned_row(result, this, oh, pruned);
+            Py_DECREF(pruned);
+        }
+    };
+
     if (op == FilterOp::EQ) {
         auto* bucket = idx->find_eq(value.hash());
-        if (bucket) for (uint64_t oh : *bucket) filter_add_row(result, this, oh);
-    } else if (op != FilterOp::NE && idx->is_numeric_range_supported(value)) {
-        for (uint64_t oh : idx->find_range(op, value)) filter_add_row(result, this, oh);
-    } else {
-        // Linear scan with wildcard match
-        // Check if first segment is an anchor (outer key)
-        bool anchored = (!pattern.empty() && pattern[0] != "__pass_key__");
-        uint64_t anchor_hash = 0;
-        const OuterEntry* anchor_entry = nullptr;
-        if (anchored) {
-            PyObject* tmp = PyUnicode_FromStringAndSize(pattern[0].c_str(), pattern[0].size());
-            if (tmp) { anchor_hash = content_hash_pyobj(tmp); Py_DECREF(tmp); }
-            anchor_entry = outer.find(anchor_hash);
-            if (!anchor_entry || !anchor_entry->val_py || !anchor_entry->is_row)
-                anchored = false;
-        }
-
-        auto scan_row = [&](PyObject* val_py, uint64_t oh, size_t start_depth) {
-            bool matched = false;
-            std::function<void(PyObject*, size_t)> scan = [&](PyObject* cur, size_t depth) {
-                if (matched || depth >= pattern.size()) return;
-                if (depth == pattern.size() - 1) {
-                    if (!PyDict_Check(cur)) return;
-                    if (pattern[depth] == "__pass_key__") {
-                        // Terminal ? checks the KEY itself
-                        PyObject* k2, *v2; Py_ssize_t pos2 = 0;
-                        while (PyDict_Next(cur, &pos2, &k2, &v2) && !matched) {
-                            ModValue fv = ModValue::from_pyobject(k2);
-                            if (compare_values(fv, op, value)) matched = true;
-                        }
-                    } else {
-                        PyObject* fv_obj = PyDict_GetItemString(cur, pattern[depth].c_str());
-                        if (fv_obj) {
-                            ModValue fv = ModValue::from_pyobject(fv_obj);
-                            if (compare_values(fv, op, value)) matched = true;
-                        }
-                    }
-                    return;
-                }
-                if (!PyDict_Check(cur)) return;
-                if (pattern[depth] == "__pass_key__") {
-                    PyObject* k2, *v2; Py_ssize_t pos2 = 0;
-                    while (PyDict_Next(cur, &pos2, &k2, &v2) && !matched)
-                        scan(v2, depth + 1);
+        if (bucket) {
+            for (uint64_t oh : *bucket) {
+                if (!idx->is_wildcard) {
+                    filter_add_row(result, this, oh);
                 } else {
-                    PyObject* next = PyDict_GetItemString(cur, pattern[depth].c_str());
-                    if (next) scan(next, depth + 1);
+                    const OuterEntry* oe = outer.find(oh);
+                    if (!oe || !oe->val_py) continue;
+                    add_pruned(oh, oe->val_py, anchored ? 1 : 0);
                 }
-            };
-            scan(val_py, start_depth);
-            if (matched) filter_add_row(result, this, oh);
-        };
-
+            }
+        }
+    } else if (op != FilterOp::NE && idx->is_numeric_range_supported(value)) {
+        for (uint64_t oh : idx->find_range(op, value)) {
+            if (!idx->is_wildcard) {
+                filter_add_row(result, this, oh);
+            } else {
+                const OuterEntry* oe = outer.find(oh);
+                if (!oe || !oe->val_py) continue;
+                add_pruned(oh, oe->val_py, anchored ? 1 : 0);
+            }
+        }
+    } else {
+        // Linear scan
         if (anchored) {
-            scan_row(anchor_entry->val_py, anchor_hash, 1);
+            add_pruned(anchor_hash, anchor_entry->val_py, 1);
         } else {
             for (auto& e : outer.occupied()) {
                 if (!e.value.is_row || !e.value.val_py) continue;
-                scan_row(e.value.val_py, e.key, 0);
+                add_pruned(e.key, e.value.val_py, 0);
             }
         }
     }
