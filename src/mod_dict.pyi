@@ -712,13 +712,17 @@ class ModDict:
         Args:
             fields:  List of field names or dot-notation paths.
             returns: ``"rows"`` — new ModDict *(default)*;
-                     ``"values"`` — plain list of projected row dicts.
+                     ``"values"`` — columnar: one flat list per requested
+                     field, in the same order as ``fields``. A row missing
+                     a field contributes ``None`` at that field's position,
+                     keeping all columns the same length.
 
         Examples::
 
             slim = mn.select(["name", "age", "meta.level"])
-            rows = mn.select(["name", "score"], returns="values")
-            # → [{"name": "alice", "score": 9.5}, ...]
+            cols = mn.select(["name", "score"], returns="values")
+            # → [["alice", "bob", ...], [9.5, 6.0, ...]]
+            names, scores = mn.select(["name", "score"], returns="values")
         """
         ...
 

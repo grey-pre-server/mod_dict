@@ -22,7 +22,7 @@ keys   = mn.sort_by("age", returns="parent_keys")# → [key, key, ...]
 ages   = mn.sort_by("age", returns="values")     # → [18, 25, 30, ...]
 groups = mn.group_by("age")                      # → {value: ModDict, ...}
 slim   = mn.select(["age", "score"])             # → new ModDict
-rows   = mn.select(["age", "score"], returns="values")  # → [{"age":..}, ..]
+cols   = mn.select(["age", "score"], returns="values")  # → [[age,...], [score,...]] (columnar)
 
 # Dot-notation paths in sort / group / select
 mn.sort_by("meta.details.rank")
@@ -140,7 +140,7 @@ mn.sort_by("meta.details.rank", returns="values")       # → [val, ...]
 
 
 mn.select(["age", "name"])                              # → new ModDict
-mn.select(["age", "meta.level"], returns="values")      # → [{"age":..}, ...]
+mn.select(["age", "meta.level"], returns="values")      # → [[age,...], [meta.level,...]] (columnar)
 
 mn.group_by("active")                                   # → {value: ModDict, ...}
 mn.group_by("meta.level")

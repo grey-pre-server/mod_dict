@@ -784,12 +784,29 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     for(Py_ssize_t i=0;i<n;i++){PyObject* it=PyList_GET_ITEM(fo,i);if(!PyUnicode_Check(it))MOD_DICT_RAISE(PyExc_TypeError,"fields must be a list of strings");fields.emplace_back(PyUnicode_AsUTF8(it));}
     ModDict* result=s->internal->select(fields); MOD_DICT_CHECK_ALLOC(result);
     if(strcmp(ret,"values")==0){
-        // return list of projected row dicts in insertion order
-        PyObject* lst=PyList_New(0);
-        for(auto& e : result->outer.occupied()){
-            if(e.value.val_py){ Py_INCREF(e.value.val_py); PyList_Append(lst,e.value.val_py); Py_DECREF(e.value.val_py); }
+        // Columnar: one flat list per requested field, values in row order.
+        // N fields -> a list of N lists (not a list of projected dicts).
+        Py_ssize_t n_fields=(Py_ssize_t)fields.size();
+        PyObject* cols=PyList_New(n_fields);
+        if(!cols){ delete result; return nullptr; }
+        for(Py_ssize_t i=0;i<n_fields;i++){
+            PyObject* col=PyList_New(0);
+            if(!col){ Py_DECREF(cols); delete result; return nullptr; }
+            PyList_SET_ITEM(cols,i,col);
         }
-        delete result; return lst;
+        for(uint64_t oh : result->order){
+            const OuterEntry* e=result->outer.find(oh);
+            if(!e || !e->val_py) continue;
+            for(Py_ssize_t i=0;i<n_fields;i++){
+                PyObject* col=PyList_GET_ITEM(cols,i);
+                PyObject* v=PyDict_GetItemString(e->val_py,fields[i].c_str());
+                if(!v) v=Py_None;
+                Py_INCREF(v);
+                PyList_Append(col,v);
+                Py_DECREF(v);
+            }
+        }
+        delete result; return cols;
     }
     return ModDict_wrap_owned(result);
 }

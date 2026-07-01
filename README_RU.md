@@ -23,7 +23,7 @@ ages   = mn.sort_by("age", returns="values")      # → [18, 25, 30, ...]
 mn.sort_by("age", inplace=True)                   # изменяет порядок mn на месте, возвращает None
 groups = mn.group_by("age")                       # → {value: ModDict, ...}
 slim   = mn.select(["age", "score"])              # → новый ModDict
-rows   = mn.select(["age", "score"], returns="values")  # → [{"age":..}, ..]
+cols   = mn.select(["age", "score"], returns="values")  # → [[age,...], [score,...]] (по колонкам)
 
 # Пути через точку в sort / group / select
 mn.sort_by("meta.details.rank")
@@ -140,7 +140,7 @@ mn.sort_by("age", returns="parent_keys")                # → [key, ...]
 mn.sort_by("meta.details.rank", returns="values")       # → [val, ...]
 
 mn.select(["age", "name"])                              # → новый ModDict
-mn.select(["age", "meta.level"], returns="values")      # → [{"age":..}, ...]
+mn.select(["age", "meta.level"], returns="values")      # → [[age,...], [meta.level,...]] (по колонкам)
 
 mn.group_by("active")                                   # → {value: ModDict, ...}
 mn.group_by("meta.level")
