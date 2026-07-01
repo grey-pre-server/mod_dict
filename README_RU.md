@@ -124,6 +124,11 @@ mn.filter("city").in_(["NY", "LA"])              # city в списке
 mn.filter("orders.?.status").eq("shipped")       # ? пропускает один уровень ключей
 mn.filter("?").eq("orders")                      # терминальный ?: строки с ключом "orders"
 mn.filter("g1.?.status").eq("shipped")           # anchor: сканирование ограничено ключом "g1"
+mn.filter("region.?.?.status").eq("Active")      # один ? на уровень — для вложенности глубже цепочкой
+
+# нетерминальный wildcard возвращает PRUNED-результат: остаются только
+# совпавшие inner-ключи, поэтому цепочка фильтров работает как AND, не OR
+mn.filter("a.?.age").eq(30).filter("a.?.name").eq("alice")
 
 # параметр returns: получить внутренние результаты без построения нового ModDict
 mn.filter("age").gte(18, returns="rows_here")                    # → [row, ...]
@@ -161,7 +166,9 @@ md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}
 md.ModDict.from_row(row)                         # нормализует Mapping → обычный dict
 
 # Сериализация
-mn.serialize() / mn.deserialize(data)
+mn.serialize() / mn.deserialize(data)          # data → self, возвращает self для чейнинга
+mn.to_dict()                                   # → обычный dict (минует RowProxy)
+md.dumps(obj) / md.loads(data)                 # сериализация любого объекта; ModDict возвращается как ModDict
 
 # Управление индексами (опционально — авто-индекс покрывает большинство случаев)
 mn.create_index("field") / mn.drop_index("field") / mn.has_index("field")
@@ -186,9 +193,26 @@ mn.update(prices, "*.meta.score", "*.meta.score")   # обновить одно 
 mn.filter("orders.?.status").eq("shipped")           # ? пропускает любой id заказа
 mn.filter("?").eq("orders")                          # терминальный ?: строка имеет ключ "orders"
 mn.filter("g1.?.status").eq("shipped")               # anchor "g1": сканирование ограничено одной строкой
+mn.filter("region.?.?.status").eq("Active")          # один ? на уровень, для вложенности — цепочкой
 mn.filter("age").gte(18, returns="rows_here")        # → плоский список совпадающих dict
 mn.filter("age").gte(18, returns="values", value_field="name")  # → список значений поля
 ```
+
+Нетерминальные wildcard-совпадения **обрезаются (pruned)** — в результате
+остаются только совпавшие inner-ключи, а не вся строка целиком, поэтому цепочка
+`.filter(...)` на wildcard-путях работает как AND, а не OR. `eq()` на
+wildcard-путях (любой глубины) и терминальный `?` восстанавливаются напрямую
+из индекса без пересканирования; `ne()` и range-операции (`lt`/`gt`/...) на
+wildcard-путях пока падают на полный скан при каждом вызове — быстрого пути
+для них нет.
+
+Также новое: `mn.to_dict()` возвращает обычный `dict` (минуя RowProxy —
+полезно для библиотек вроде Pydantic, которым нужен именно `dict`), и
+модульные `md.dumps(obj)` / `md.loads(data)` сериализуют **любой**
+поддерживаемый объект, не только целиком `ModDict` — `ModDict` возвращается
+обратно как `ModDict`, всё остальное как есть. Неявной конвертации
+`ModDict` → `dict` нет; вызови `mn.to_dict()` сначала, если нужно
+сериализовать именно plain dict.
 
 ### Конвертеры типов
 

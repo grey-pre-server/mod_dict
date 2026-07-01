@@ -129,6 +129,11 @@ public:
 
     std::vector<uint8_t> serialize() const;
     void deserialize(const uint8_t* data, size_t len);
+
+    // True if data starts with the ModDict container magic (produced by serialize()).
+    // Lets module-level dumps()/loads() distinguish a whole-ModDict blob from a
+    // single arbitrary-value blob without duplicating the magic constant.
+    static bool has_container_magic(const uint8_t* data, size_t len);
 };
 
 #endif

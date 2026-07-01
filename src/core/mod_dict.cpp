@@ -8,6 +8,7 @@
 #include <cstring>
 #include <algorithm>
 #include <sstream>
+#include <unordered_map>
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
@@ -424,6 +425,84 @@ ModDict* ModDict::filter(const std::string& field, FilterOp op, const ModValue& 
     return result;
 }
 
+// Walks `pattern` from start_depth using wc_keys[i] for each "__pass_key__"
+// segment (one "?" = one level, so wc_keys[i] is exactly the key to descend
+// through at that "?"). Literal segments are resolved directly from pattern
+// (their identity is static, no need to have stored them). Builds/reuses
+// nested dicts in `pruned_root` for every segment UP TO the LAST "?" — at
+// that point the WHOLE original sub-object is kept as-is (any literal
+// segments after the last "?" were only needed to validate the match, not
+// to further prune the result — mirrors what the old prune_match did).
+static void insert_pruned_path(PyObject* pruned_root, PyObject* row,
+                                const std::vector<std::string>& pattern, size_t start_depth,
+                                const std::vector<PyObject*>& wc_keys)
+{
+    size_t last_wc_depth = SIZE_MAX;
+    for (size_t d = start_depth; d < pattern.size(); d++)
+        if (pattern[d] == "__pass_key__") last_wc_depth = d;
+    if (last_wc_depth == SIZE_MAX) return;  // caller guarantees a "?" exists
+
+    PyObject* cur_pruned = pruned_root;
+    PyObject* cur_row = row;
+    size_t wc_i = 0;
+
+    for (size_t depth = start_depth; depth < last_wc_depth; depth++) {
+        PyObject* key_obj; bool owns_key = false;
+        if (pattern[depth] == "__pass_key__") {
+            if (wc_i >= wc_keys.size()) return;
+            key_obj = wc_keys[wc_i++];
+        } else {
+            key_obj = PyUnicode_FromStringAndSize(pattern[depth].c_str(), pattern[depth].size());
+            if (!key_obj) return;
+            owns_key = true;
+        }
+        if (!cur_row || !PyDict_Check(cur_row)) { if (owns_key) Py_DECREF(key_obj); return; }
+
+        PyObject* next_pruned = PyDict_GetItem(cur_pruned, key_obj);
+        if (!next_pruned) {
+            PyObject* nd = PyDict_New();
+            if (!nd) { if (owns_key) Py_DECREF(key_obj); return; }
+            PyDict_SetItem(cur_pruned, key_obj, nd);
+            Py_DECREF(nd);
+            next_pruned = nd;
+        }
+        PyObject* next_row = PyDict_GetItem(cur_row, key_obj);
+        if (owns_key) Py_DECREF(key_obj);
+
+        cur_pruned = next_pruned;
+        cur_row = next_row;
+    }
+
+    // Last "?": keep the whole matched sub-object under its key, unpruned.
+    if (!cur_row || !PyDict_Check(cur_row) || wc_i >= wc_keys.size()) return;
+    PyObject* final_key = wc_keys[wc_i];
+    PyObject* val = PyDict_GetItem(cur_row, final_key);
+    if (val) PyDict_SetItem(cur_pruned, final_key, val);
+}
+
+// Fast reconstruction for wildcard EQ matches (any number of "?" in pattern):
+// FieldIndex::wildcard_leaf_index already has the exact chain of keys each "?"
+// resolved to per match — direct PyDict_GetItem walk, no rescanning the row.
+static void add_pruned_from_leaf(ModDict* result, const ModDict* self,
+                                  const std::vector<std::string>& pattern, size_t start_depth,
+                                  const std::vector<std::pair<uint64_t,std::vector<PyObject*>>>& matches)
+{
+    std::unordered_map<uint64_t, PyObject*> pending;  // oh -> pruned dict (owned, not yet in result)
+    for (auto& m : matches) {
+        uint64_t oh = m.first; const std::vector<PyObject*>& wc_keys = m.second;
+        const OuterEntry* oe = self->outer.find(oh);
+        if (!oe || !oe->val_py) continue;
+
+        PyObject*& pruned = pending[oh];
+        if (!pruned) pruned = PyDict_New();
+        insert_pruned_path(pruned, oe->val_py, pattern, start_depth, wc_keys);
+    }
+    for (auto& kv : pending) {
+        filter_add_pruned_row(result, self, kv.first, kv.second);
+        Py_DECREF(kv.second);
+    }
+}
+
 ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, const ModValue& value) const {
     std::string key;
     for (size_t i = 0; i < pattern.size(); i++) { if (i) key += '\x01'; key += pattern[i]; }
@@ -461,24 +540,43 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
         }
     };
 
-    if (op == FilterOp::EQ) {
+    bool terminal_pass_key = !pattern.empty() && pattern.back() == "__pass_key__";
+
+    if (op == FilterOp::EQ && idx->is_wildcard && terminal_pass_key) {
+        // Terminal ?: the matched key IS `value` itself. Dict keys are unique
+        // within a row, so a given oh can appear at most once in the bucket
+        // regardless of anchoring — no dedup needed. Direct O(1) lookup, no rescan.
         auto* bucket = idx->find_eq(value.hash());
-        if (bucket) {
+        if (bucket && value.obj) {
             for (uint64_t oh : *bucket) {
-                if (!idx->is_wildcard) {
-                    filter_add_row(result, this, oh);
-                } else {
-                    const OuterEntry* oe = outer.find(oh);
-                    if (!oe || !oe->val_py) continue;
-                    add_pruned(oh, oe->val_py, anchored ? 1 : 0);
-                }
+                const OuterEntry* oe = outer.find(oh);
+                if (!oe || !oe->val_py) continue;
+                PyObject* leaf_val = PyDict_GetItem(oe->val_py, value.obj);
+                if (!leaf_val) continue;
+                PyObject* pruned = PyDict_New();
+                PyDict_SetItem(pruned, value.obj, leaf_val);
+                filter_add_pruned_row(result, this, oh, pruned);
+                Py_DECREF(pruned);
             }
         }
+    } else if (op == FilterOp::EQ && idx->is_wildcard) {
+        // Non-terminal "?" — any number of levels ("?.field", "?.?.field", ...).
+        // wildcard_leaf_index already has the exact chain of keys each "?"
+        // resolved to per match — reconstruct directly, no rescan.
+        auto* leaf = idx->find_wildcard_leaf_eq(value.hash());
+        if (leaf) add_pruned_from_leaf(result, this, pattern, anchored ? 1 : 0, *leaf);
+    } else if (op == FilterOp::EQ) {
+        auto* bucket = idx->find_eq(value.hash());
+        if (bucket) for (uint64_t oh : *bucket) filter_add_row(result, this, oh);
     } else if (op != FilterOp::NE && idx->is_numeric_range_supported(value)) {
-        for (uint64_t oh : idx->find_range(op, value)) {
-            if (!idx->is_wildcard) {
-                filter_add_row(result, this, oh);
-            } else {
+        if (!idx->is_wildcard) {
+            for (uint64_t oh : idx->find_range(op, value)) filter_add_row(result, this, oh);
+        } else {
+            // Range queries on wildcard fields don't have a leaf index (only EQ
+            // does) — dedup at least avoids rescanning a row once per duplicate.
+            std::unordered_map<uint64_t, char> seen;
+            for (uint64_t oh : idx->find_range(op, value)) {
+                if (!seen.emplace(oh, 0).second) continue;
                 const OuterEntry* oe = outer.find(oh);
                 if (!oe || !oe->val_py) continue;
                 add_pruned(oh, oe->val_py, anchored ? 1 : 0);
@@ -1169,4 +1267,11 @@ void ModDict::deserialize(const uint8_t* data, size_t len) {
 
 truncated:
     PyErr_SetString(PyExc_ValueError, "ModDict.deserialize: buffer truncated");
+}
+
+bool ModDict::has_container_magic(const uint8_t* data, size_t len) {
+    if (len < 4) return false;
+    uint32_t magic = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+                      ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+    return magic == SERIAL_MAGIC;
 }

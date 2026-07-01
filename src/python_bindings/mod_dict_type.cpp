@@ -46,12 +46,19 @@ static ModDict* pyobj_to_moddict_temp(PyObject* obj) {
     return tmp;
 }
 
-PyObject* ModDict_wrap(ModDict* internal) {
+ModDict* ModDict_unwrap(PyObject* obj) {
+    if (!PyObject_TypeCheck(obj, &ModDict_Type)) return nullptr;
+    return ((ModDictObject*)obj)->internal;
+}
+
+// Wraps a freshly heap-allocated ModDict* with no other owner (e.g. loads()
+// building a new instance from bytes, or filter/select/copy results) — the
+// wrapper takes ownership so ModDict_dealloc frees it.
+PyObject* ModDict_wrap_owned(ModDict* internal) {
     if (!internal) Py_RETURN_NONE;
-    if (internal->py_wrapper) { Py_INCREF(internal->py_wrapper); return (PyObject*)internal->py_wrapper; }
     ModDictObject* w = PyObject_New(ModDictObject,&ModDict_Type);
     if (!w) return nullptr;
-    w->internal=internal; w->owns_internal=false; w->parent_ref=nullptr;
+    w->internal=internal; w->owns_internal=true; w->parent_ref=nullptr;
     internal->py_wrapper=w;
     return (PyObject*)w;
 }
@@ -613,6 +620,10 @@ static PyObject* ModDict_aliases(ModDictObject* s,PyObject*){
     return d;
 }
 
+static PyObject* ModDict_to_dict(ModDictObject* s,PyObject*){
+    return s->internal->to_python_dict();
+}
+
 /* Serialization */
 static PyObject* ModDict_serialize(ModDictObject* s,PyObject*){
     std::vector<uint8_t> data=s->internal->serialize(); if(PyErr_Occurred()) return nullptr;
@@ -780,7 +791,7 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
         }
         delete result; return lst;
     }
-    return ModDict_wrap(result);
+    return ModDict_wrap_owned(result);
 }
 static PyObject* ModDict_sort_by(ModDictObject* s,PyObject* args,PyObject* kw){
     const char* field=nullptr; int rev=0; const char* ret="rows"; int inplace=0;
@@ -888,7 +899,7 @@ static PyObject* ModDict_at(ModDictObject* s, PyObject* args){
 static PyObject* ModDict_copy(ModDictObject* s, PyObject*){
     ModDict* c = s->internal->deep_copy();
     if(!c){ PyErr_NoMemory(); return nullptr; }
-    return ModDict_wrap(c);
+    return ModDict_wrap_owned(c);
 }
 
 static PyObject* ModDict_pop(ModDictObject* s, PyObject* args){
@@ -926,8 +937,9 @@ static PyMethodDef ModDict_methods[]={
     {"from_json",(PyCFunction)ModDict_from_json,METH_O|METH_CLASS,"from_json(s)->ModDict"},
     {"from_rows",(PyCFunction)ModDict_from_rows,METH_VARARGS|METH_KEYWORDS|METH_CLASS,"from_rows(rows,key)->ModDict"},
     {"from_row",(PyCFunction)ModDict_from_row,METH_O|METH_CLASS,"from_row(row)->dict"},
+    {"to_dict",(PyCFunction)ModDict_to_dict,METH_NOARGS,"to_dict()->dict — shallow copy as plain dict, bypasses RowProxy"},
     {"serialize",(PyCFunction)ModDict_serialize,METH_NOARGS,"serialize()->bytes"},
-    {"deserialize",(PyCFunction)ModDict_deserialize,METH_VARARGS,"deserialize(data)->None"},
+    {"deserialize",(PyCFunction)ModDict_deserialize,METH_VARARGS,"deserialize(data)->ModDict — mutates self in place, returns self for chaining"},
     {"reindex",(PyCFunction)ModDict_reindex,METH_VARARGS,"reindex(key)->None — rebuild field indices for one row after deep nested write"},
     {"alias",(PyCFunction)ModDict_alias,METH_VARARGS,"alias(key,alias)->None — create transparent alias for an existing key"},
     {"aliases",(PyCFunction)ModDict_aliases,METH_NOARGS,"aliases()->dict — {alias_key: original_key} mapping"},

@@ -5,6 +5,7 @@
 #include "mod_value.h"
 #include <string>
 #include <vector>
+#include <utility>
 #include <cstddef>
 
 class ModDict;
@@ -55,10 +56,23 @@ public:
     std::vector<std::string> pattern;     // wildcard: сегменты пути
 
     // field_value_hash → [outer_key_hash, ...]
+    // Для wildcard-паттернов один outer_key_hash может встречаться несколько раз
+    // (по разу на каждый совпавший inner-ключ этой внешней строки).
     FlatHashMap<uint64_t, std::vector<uint64_t>> hash_index;
 
     // отсортированный список для range-запросов (числовые типы)
     std::vector<SortedEntry> sorted_index;
+
+    // Для wildcard с нетерминальным "__pass_key__" (т.е. НЕ терминальный "?",
+    // у которого своя отдельная логика через hash_index — matched key = value).
+    // Один "?" = один уровень вложенности (для нескольких уровней путь пишется
+    // явно как "?.?.field" — по одному "?" на уровень). Хранит для каждого
+    // совпадения ПОЛНУЮ цепочку ключей, выбранных каждым "?" в пути, по порядку.
+    // Литеральные сегменты пути НЕ хранятся здесь — они статически известны из
+    // `pattern` и разрешаются напрямую при восстановлении (см. insert_pruned_path
+    // в mod_dict.cpp). Позволяет filter() восстановить pruned-результат прямыми
+    // PyDict_GetItem без повторного скана внешней строки — для ЛЮБОГО числа "?".
+    FlatHashMap<uint64_t, std::vector<std::pair<uint64_t, std::vector<PyObject*>>>> wildcard_leaf_index;
 
     // ──────────────────────────────────────────────────
     // Построение / сброс
@@ -87,6 +101,10 @@ public:
     std::vector<uint64_t>* find_eq(uint64_t field_val_hash) const;
     std::vector<uint64_t> find_range(FilterOp op, const ModValue& val) const;
     bool is_numeric_range_supported(const ModValue& val) const;
+
+    // Valid whenever is_wildcard is true and the pattern's last segment is not
+    // "__pass_key__" (terminal-key patterns don't use this — see comment above).
+    const std::vector<std::pair<uint64_t,std::vector<PyObject*>>>* find_wildcard_leaf_eq(uint64_t field_val_hash) const;
 
     size_t size() const { return hash_index.size(); }
 };

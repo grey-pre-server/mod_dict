@@ -122,6 +122,11 @@ mn.filter("city").in_(["NY", "LA"])              # city in [...]
 mn.filter("orders.?.status").eq("shipped")       # ? skips one key, checks value
 mn.filter("?").eq("orders")                      # terminal ?: outer rows that HAVE key "orders"
 mn.filter("g1.?.status").eq("shipped")           # anchor: first segment scopes scan to key "g1"
+mn.filter("region.?.?.status").eq("Active")      # one ? per level — chain for deeper nesting
+
+# non-terminal wildcard results are PRUNED: only matching inner keys survive,
+# so chained filters behave as AND (not OR)
+mn.filter("a.?.age").eq(30).filter("a.?.name").eq("alice")
 
 # returns parameter: collect inner-level results without rebuilding a new ModDict
 mn.filter("age").gte(18, returns="rows_here")                    # → [row, ...]
@@ -161,7 +166,9 @@ md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}
 md.ModDict.from_row(row)                         # normalize Mapping → plain dict
 
 # Serialize
-mn.serialize() / mn.deserialize(data)
+mn.serialize() / mn.deserialize(data)          # data → self, returned for chaining
+mn.to_dict()                                   # → plain dict (bypasses RowProxy)
+md.dumps(obj) / md.loads(data)                 # serialize any object; ModDict round-trips as ModDict
 
 # Index management (optional — auto-index handles most cases)
 mn.create_index("field") / mn.drop_index("field") / mn.has_index("field")
@@ -183,9 +190,24 @@ mn.update(prices, "*.meta.score", "*.meta.score")   # update one deep field
 mn.filter("orders.?.status").eq("shipped")           # ? skips any order id key
 mn.filter("?").eq("orders")                          # terminal ?: outer row HAS key "orders"
 mn.filter("g1.?.status").eq("shipped")               # anchor "g1": scan scoped to one row
+mn.filter("region.?.?.status").eq("Active")          # one ? per level, chain for deeper nesting
 mn.filter("age").gte(18, returns="rows_here")        # → flat list of matching inner dicts
 mn.filter("age").gte(18, returns="values", value_field="name")  # → list of field values
 ```
+
+Non-terminal wildcard matches are **pruned** — the result only keeps the inner
+keys that actually matched (not the whole row), so chaining `.filter(...)`
+calls on wildcard paths behaves as AND, not OR. `eq()` on wildcard paths
+(any depth) and terminal `?` reconstruct directly from the index with no
+rescan; `ne()` and range ops (`lt`/`gt`/...) on wildcard paths fall back to a
+full scan every call — there's no index shortcut for those yet.
+
+Also new: `mn.to_dict()` returns a plain `dict` (bypasses RowProxy — useful
+for libraries like Pydantic that require an actual `dict`), and module-level
+`md.dumps(obj)` / `md.loads(data)` serialize *any* supported object, not just
+a whole `ModDict` — a `ModDict` round-trips back as a `ModDict`, everything
+else as itself. No implicit `ModDict` → `dict` conversion; call `mn.to_dict()`
+first if that's what you want serialized.
 
 ### Custom type converters
 

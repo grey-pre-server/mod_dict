@@ -523,9 +523,19 @@ class ModDict:
         The actual filter is executed when you call a comparison method
         on the returned builder (``.eq()``, ``.gte()``, etc.).
 
-        The result is a **view** — it shares the underlying store with the
-        original ModDict. Modifying the original after filtering may affect
-        the view.
+        For simple fields and terminal ``?`` the result is a **view** — outer
+        rows are shared with the original ModDict (no copy), so mutating a
+        row in the result mutates the original too.
+
+        For non-terminal wildcard paths (``?`` skipping a key, not the last
+        segment) the result is **pruned**: each outer row in the result only
+        contains the inner keys that actually matched, wrapped in freshly
+        built dicts — not a view of the original row. This makes chained
+        wildcard filters behave as AND, not OR::
+
+            mn.filter("a.?.age").eq(30)                    # -> {"a": {123: {...}}}  (only key 123 kept)
+            mn.filter("a.?.age").eq(30).filter("a.?.name").eq("alice")
+            # -> only entries matching BOTH conditions survive
 
         **Path syntax**
 
@@ -535,11 +545,16 @@ class ModDict:
             mn.filter("meta.score").between(7.0, 10.0)
             mn.filter("geo.coords.lat").lt(0)
 
-        Wildcard path (``?`` = any single key at that level)::
+        Wildcard path (``?`` = any single key at that level — one ``?`` is
+        exactly one level; for deeper wildcards chain them explicitly,
+        e.g. ``"?.?.status"``, not a single ``?`` that skips several levels)::
 
             # non-terminal ?: skip key, look at field in the value
             mn.filter("orders.?.status").eq("shipped")   # any order id
             mn.filter("orders.?.amount").gte(100)
+
+            # multiple wildcard levels — one "?" per level
+            mn.filter("region.?.?.status").eq("Active")   # region -> group -> row
 
             # terminal ?: check if that key EXISTS at the inner level
             mn.filter("?").eq("r1")   # outer rows whose inner dict has key "r1"
@@ -554,7 +569,11 @@ class ModDict:
 
         - With ``create_index("field")``: EQ is O(1), range is O(log n + k)
         - Without index: auto-builds index on first call, O(n) build + O(1) lookup
-        - Wildcard paths: auto-builds wildcard index on first call
+        - Wildcard paths: auto-builds wildcard index on first call. EQ on
+          non-terminal wildcards (any number of ``?``) and on terminal ``?``
+          reconstructs pruned results directly from the index, no rescan.
+          ``ne()`` and range ops (``lt``/``gt``/...) on wildcard paths have
+          no index shortcut and fall back to a full scan every call.
 
         Examples::
 
@@ -846,20 +865,35 @@ class ModDict:
         """
         ...
 
-    def deserialize(self, data: bytes) -> None:
+    def deserialize(self, data: bytes) -> ModDict:
         """
         Deserialize bytes produced by ``serialize()`` into this ModDict.
 
-        Clears any existing data before loading.
+        Clears any existing data before loading. Mutates self in place and
+        returns self, so the call can be chained.
 
         Args:
             data: Bytes produced by ``ModDict.serialize()``.
 
         Example::
 
-            mn2 = ModDict()
-            with open("cache.bin", "rb") as f:
-                mn2.deserialize(f.read())
+            mn2 = ModDict().deserialize(open("cache.bin", "rb").read())
+        """
+        ...
+
+    def to_dict(self) -> dict[Any, Any]:
+        """
+        Return a shallow copy of this ModDict as a plain ``dict``.
+
+        Row values are the same underlying dict objects (not copied), but
+        unlike ``mn[key]`` this bypasses RowProxy entirely — useful when
+        handing data to code that requires an actual ``dict`` (e.g. Pydantic's
+        ``model_validate``, which only accepts ``dict`` or a model instance,
+        not arbitrary Mapping-like objects).
+
+        Example::
+
+            LoginRequest.model_validate(mn.to_dict())
         """
         ...
 
@@ -895,3 +929,38 @@ class GeoAlchemyWKB:
         mn["row"] = {"geom": md.GeoAlchemyWKB(wkb_bytes)}
     """
     def __init__(self, data: bytes) -> None: ...
+
+
+def dumps(obj: Any) -> bytes:
+    """
+    Serialize any supported object to bytes — not just a ModDict.
+
+    A ``ModDict`` is serialized with its own container format (the same one
+    ``ModDict.serialize()`` uses), so ``loads()`` reconstructs a ``ModDict``
+    back. Any other supported value (dict, list, str, int, float, bytes,
+    set, frozenset, datetime, Decimal, Path, …) uses a lighter single-value
+    format and round-trips back as itself.
+
+    There is **no** implicit ``ModDict`` → ``dict`` conversion — call
+    ``mn.to_dict()`` first if you specifically want the plain-dict form
+    serialized.
+
+    Example::
+
+        data = md.dumps({"age": 30, "name": "alice"})
+        row  = md.loads(data)          # -> dict
+
+        data2 = md.dumps(mn)           # mn: ModDict
+        mn2   = md.loads(data2)        # -> ModDict
+    """
+    ...
+
+
+def loads(data: bytes) -> Any:
+    """
+    Deserialize bytes produced by ``dumps()`` (or ``ModDict.serialize()``).
+
+    Returns a ``ModDict`` if the bytes were produced from one, otherwise
+    the plain Python value that was serialized.
+    """
+    ...

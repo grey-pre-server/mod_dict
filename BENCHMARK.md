@@ -140,21 +140,51 @@ ModDict scans a flat hash table; dict uses a compact split-index design. The gap
 ## Wildcard filter (1 000 outer × 100 inner rows)
 
 Dataset: `{group_key: {row_key: {user_id, score, ...}}}` — two-level nesting.
+`filter()` on a non-terminal wildcard is **pruned**: only the inner keys that
+actually matched survive in the result, so the dict comparisons below build
+the same pruned structure (not an `any()` existence check) for a fair,
+apples-to-apples comparison.
 
 | Operation | dict equivalent | dict | ModDict 1st | ModDict 2nd+ |
 |-----------|-----------------|------|-------------|--------------|
-| `filter("?.user_id").eq(5)` | `{gk: gv for gk,gv in d.items() if any(r["user_id"]==5 for r in gv.values())}` | 2ms | 0.1ms (**13×**) | 0.1ms (**16×**) |
-| `filter("?").eq("r1")` — inner key exists | `{gk: gv for gk,gv in d.items() if "r1" in gv}` | ~0ms | ~0ms (**2.2×**) | ~0ms (**3.2×**) |
-| `filter("g1.?.user_id").eq(5)` — anchor | `{rk: rv for rk,rv in d["g1"].items() if rv["user_id"]==5}` | ~0ms | ~0ms (**2.0×**) | ~0ms (**4.8×**) |
-| `.eq(5, returns="rows_here")` | `[r for gv in d.values() for r in gv.values() if r["user_id"]==5]` | 7ms | 9ms | 9ms |
-| `.eq(5, returns="values", value_field="score")` | `[r["score"] for gv in d.values() for r in gv.values() if r["user_id"]==5]` | 7ms | 9ms | 9ms |
+| `filter("?.user_id").eq(5)` | pruned `{gk: {rk: rv for rk,rv in gv.items() if rv["user_id"]==5}}` | 9ms | 1ms (**10.8×**) | 1ms (**15.7×**) |
+| `filter("?").eq("r1")` — terminal, key exists | pruned `{gk: {"r1": gv["r1"]}}` for matching groups | ~0ms | ~0ms (**1.5×**) | ~0ms (**1.6×**) |
+| `filter("g1.?.user_id").eq(5)` — anchor | `{rk: rv for rk,rv in d["g1"].items() if rv["user_id"]==5}` | ~0ms | ~0ms (**2.1×**) | ~0ms (**3.6×**) |
+| `filter("?.?.status").eq("Active")` — 2 wildcard levels | pruned 3-level nested dict comprehension | 12ms | 7ms (**1.6×**) | 7ms (**1.7×**) |
+| `.eq(5, returns="rows_here")` | `[r for gv in d.values() for r in gv.values() if r["user_id"]==5]` | 7ms | 10ms | 10ms |
+| `.eq(5, returns="values", value_field="score")` | `[r["score"] for gv in d.values() for r in gv.values() if r["user_id"]==5]` | 7ms | 10ms | 10ms |
 
 **Path semantics:**
-- `"?.user_id"` — `?` skips one key level, filters by `user_id` in the value. Builds an index → **16× faster** on repeated calls.
+- `"?.user_id"` — `?` skips one key level, filters by `user_id` in the value. Builds an index → **15.7× faster** on repeated calls.
 - `"?"` (terminal) — checks if the value equals an inner **key**. Useful for "does this group contain row X?"
 - `"g1.?.user_id"` — anchor: first segment is a known outer key, scan scoped to that row only.
+- `"?.?.status"` — one `?` per nesting level (no implicit multi-level skip — chain wildcards explicitly for deeper structures). Uses the same index-backed reconstruction as a single `?`, no rescan.
 - `returns="rows_here"` — returns the inner dicts at the level where the field lives (no index, linear scan).
 - `returns="values", value_field="score"` — extracts one field from each matching inner dict.
+
+Non-terminal wildcard EQ (any number of `?` levels) and terminal `?` reconstruct
+the pruned result directly from the index — no rescanning the row. `ne()` and
+range ops (`lt`/`gt`/...) on wildcard paths have no index shortcut yet and fall
+back to a full scan on every call.
+
+---
+
+## to_dict / dumps / loads (100 000 rows)
+
+| Operation | Notes | Time |
+|-----------|-------|------|
+| `mn.to_dict()` | plain dict, bypasses RowProxy | 23ms |
+| `dict(mn)` | keys()+getitem, may return RowProxy if any index exists | 24ms (1.06× slower) |
+| `md.dumps(plain_dict)` | generic single-value format | 169ms |
+| `md.dumps(mn)` | ModDict's native container format (same as `mn.serialize()`) | 271ms |
+| `md.loads(dumps(dict))` | → `dict` | 488ms |
+| `md.loads(dumps(mn))` | → `ModDict` | 576ms |
+
+`md.dumps()`/`md.loads()` are module-level functions for serializing **any**
+supported object, not just a whole `ModDict`. A `ModDict` round-trips back as
+a `ModDict`; everything else round-trips as itself. There's no implicit
+`ModDict` → `dict` conversion — call `mn.to_dict()` first if that's what you
+want serialized.
 
 ---
 
@@ -176,4 +206,6 @@ Dataset: `{group_key: {row_key: {user_id, score, ...}}}` — two-level nesting.
 | Serialization | ModDict if you need date/bytes/Decimal; json for smallest file |
 | Asyncio shared cache | **ModDict** — zero-copy `PyObject*` refs, no GC pressure on reads |
 | Init from dict / ModDict / Mapping | dict is fastest; ModDict copy ~2× slower (full re-index) |
-| Wildcard filter (nested 2-level) | **ModDict** — up to **16×** faster on repeated calls |
+| Wildcard filter (`?.field`, any number of levels) | **ModDict** — up to **15.7×** faster on repeated calls |
+| `to_dict()` vs `dict(mn)` | **~equal**; `to_dict()` always bypasses RowProxy |
+| `dumps`/`loads` (any object, not just ModDict) | see dedicated section — comparable to `serialize()`/`deserialize()` |

@@ -98,11 +98,17 @@ static const OuterEntry* find_anchor(ModDict* owner,
    build_wildcard — pattern with __pass_key__ wildcards
    ============================================================================ */
 
+// wc_path: the ordered chain of keys selected by each non-terminal
+// "__pass_key__" segment seen so far during this descent (one entry per "?",
+// one "?" = one level — deeper nesting is written explicitly as "?.?.field").
+// Grown/shrunk (push_back/pop_back) as we enter/leave a wildcard level so the
+// same vector instance is reused across the whole recursive descent.
 static void collect_wildcard(PyObject* dict,
                               const std::vector<std::string>& pattern,
                               size_t depth,
                               uint64_t oh,
-                              FieldIndex* idx)
+                              FieldIndex* idx,
+                              std::vector<PyObject*>& wc_path)
 {
     if (!dict || !PyDict_Check(dict)) return;
     if (depth >= pattern.size()) return;
@@ -119,11 +125,12 @@ static void collect_wildcard(PyObject* dict,
                 std::vector<uint64_t>* bucket = idx->hash_index.find(fh);
                 if (bucket) bucket->push_back(oh);
                 else        idx->hash_index.insert(fh, {oh});
-                if (idx->sorted_index.capacity() > 0 || true)
-                    if (fv.type == ValueType::INT || fv.type == ValueType::FLOAT)
-                        idx->sorted_index.push_back(make_sorted_entry(oh, fv));
+                if (fv.type == ValueType::INT || fv.type == ValueType::FLOAT)
+                    idx->sorted_index.push_back(make_sorted_entry(oh, fv));
             } else {
-                collect_wildcard(v, pattern, depth + 1, oh, idx);
+                wc_path.push_back(k);
+                collect_wildcard(v, pattern, depth + 1, oh, idx, wc_path);
+                wc_path.pop_back();
             }
         }
     } else {
@@ -137,8 +144,13 @@ static void collect_wildcard(PyObject* dict,
             else        idx->hash_index.insert(fh, {oh});
             if (fv.type == ValueType::INT || fv.type == ValueType::FLOAT)
                 idx->sorted_index.push_back(make_sorted_entry(oh, fv));
+            if (!wc_path.empty()) {
+                auto* wbucket = idx->wildcard_leaf_index.find(fh);
+                if (wbucket) wbucket->push_back({oh, wc_path});
+                else         idx->wildcard_leaf_index.insert(fh, {{oh, wc_path}});
+            }
         } else {
-            collect_wildcard(child, pattern, depth + 1, oh, idx);
+            collect_wildcard(child, pattern, depth + 1, oh, idx, wc_path);
         }
     }
 }
@@ -154,11 +166,13 @@ void FieldIndex::build_wildcard(ModDict* owner, const std::vector<std::string>& 
 
     if (anchor) {
         // Anchored path: only scan the one row matched by pat[0], start at depth=1
-        collect_wildcard(anchor->val_py, pat, 1, anchor_hash, this);
+        std::vector<PyObject*> wc_path;
+        collect_wildcard(anchor->val_py, pat, 1, anchor_hash, this, wc_path);
     } else {
         for (auto& e : owner->outer.occupied()) {
             if (!e.value.is_row || !e.value.val_py) continue;
-            collect_wildcard(e.value.val_py, pat, 0, e.key, this);
+            std::vector<PyObject*> wc_path;
+            collect_wildcard(e.value.val_py, pat, 0, e.key, this, wc_path);
         }
     }
 
@@ -169,6 +183,7 @@ void FieldIndex::build_wildcard(ModDict* owner, const std::vector<std::string>& 
 void FieldIndex::clear() {
     hash_index = FlatHashMap<uint64_t, std::vector<uint64_t>>();
     sorted_index.clear();
+    wildcard_leaf_index = FlatHashMap<uint64_t, std::vector<std::pair<uint64_t,std::vector<PyObject*>>>>();
 }
 
 /* ============================================================================
@@ -224,11 +239,13 @@ void FieldIndex::on_insert_row(uint64_t oh, ModDict* owner) {
             if (!anchor || oh != anchor_hash) return;
             PyObject* row = owner->get_row_ref(oh);
             if (!row) return;
-            collect_wildcard(row, pattern, 1, oh, this);
+            std::vector<PyObject*> wc_path;
+            collect_wildcard(row, pattern, 1, oh, this, wc_path);
         } else {
             PyObject* row = owner->get_row_ref(oh);
             if (!row) return;
-            collect_wildcard(row, pattern, 0, oh, this);
+            std::vector<PyObject*> wc_path;
+            collect_wildcard(row, pattern, 0, oh, this, wc_path);
         }
     }
 }
@@ -252,7 +269,8 @@ void FieldIndex::on_remove_row(uint64_t oh, ModDict* owner) {
         PyObject* row = owner->get_row_ref(oh);
         if (!row) return;
 
-        // For each value under wildcard that this row contributed, remove from index
+        // For each value under wildcard that this row contributed, remove from
+        // hash_index/sorted_index (precise, single pass over the still-valid row).
         std::function<void(PyObject*, size_t)> collect_remove = [&](PyObject* dict, size_t depth) {
             if (!dict || !PyDict_Check(dict) || depth >= pattern.size()) return;
             bool last = (depth == pattern.size() - 1);
@@ -270,23 +288,58 @@ void FieldIndex::on_remove_row(uint64_t oh, ModDict* owner) {
             }
         };
         collect_remove(row, 0);
+
+        // wildcard_leaf_index entries for this row can be scattered across
+        // several buckets (one per matched leaf) — purge by oh wholesale
+        // rather than trying to re-derive and match each exact path.
+        std::vector<uint64_t> dead_wc_buckets;
+        for (auto& b : wildcard_leaf_index.occupied()) {
+            auto new_end = std::remove_if(b.value.begin(), b.value.end(),
+                [oh](const std::pair<uint64_t,std::vector<PyObject*>>& p){ return p.first == oh; });
+            b.value.erase(new_end, b.value.end());
+            if (b.value.empty()) dead_wc_buckets.push_back(b.key);
+        }
+        for (uint64_t bk : dead_wc_buckets) wildcard_leaf_index.erase(bk);
     }
 }
 
 void FieldIndex::remove_outer_key(uint64_t oh) {
-    // Scan all hash_index buckets — remove oh regardless of what field value it had.
-    uint64_t dead_bucket = 0; bool found = false;
-    for (auto& b : hash_index.occupied()) {
-        auto it = std::find(b.value.begin(), b.value.end(), oh);
-        if (it != b.value.end()) {
-            b.value.erase(it);
-            if (b.value.empty()) { dead_bucket = b.key; found = true; }
-            break; // a row appears in at most one bucket per simple field
+    if (!is_wildcard) {
+        // Simple field: oh appears in at most one bucket — first match wins.
+        uint64_t dead_bucket = 0; bool found = false;
+        for (auto& b : hash_index.occupied()) {
+            auto it = std::find(b.value.begin(), b.value.end(), oh);
+            if (it != b.value.end()) {
+                b.value.erase(it);
+                if (b.value.empty()) { dead_bucket = b.key; found = true; }
+                break;
+            }
         }
-    }
-    if (found) hash_index.erase(dead_bucket);
+        if (found) hash_index.erase(dead_bucket);
+    } else {
+        // Wildcard: oh can appear multiple times in one bucket (one per matching
+        // inner key) and across multiple buckets (different inner values) — must
+        // scan and remove every occurrence, not just the first.
+        std::vector<uint64_t> dead_buckets;
+        for (auto& b : hash_index.occupied()) {
+            auto new_end = std::remove(b.value.begin(), b.value.end(), oh);
+            b.value.erase(new_end, b.value.end());
+            if (b.value.empty()) dead_buckets.push_back(b.key);
+        }
+        for (uint64_t bk : dead_buckets) hash_index.erase(bk);
 
-    // Remove from sorted_index (at most one entry per outer key)
+        std::vector<uint64_t> dead_wc_buckets;
+        for (auto& b : wildcard_leaf_index.occupied()) {
+            auto new_end = std::remove_if(b.value.begin(), b.value.end(),
+                [oh](const std::pair<uint64_t,std::vector<PyObject*>>& p){ return p.first == oh; });
+            b.value.erase(new_end, b.value.end());
+            if (b.value.empty()) dead_wc_buckets.push_back(b.key);
+        }
+        for (uint64_t bk : dead_wc_buckets) wildcard_leaf_index.erase(bk);
+    }
+
+    // Remove from sorted_index (at most one entry per outer key for simple
+    // fields; wildcard fields may have several — remove all matches).
     auto new_end = std::remove_if(sorted_index.begin(), sorted_index.end(),
                                   [oh](const SortedEntry& e){ return e.outer_key_hash == oh; });
     sorted_index.erase(new_end, sorted_index.end());
@@ -298,6 +351,11 @@ void FieldIndex::remove_outer_key(uint64_t oh) {
 
 std::vector<uint64_t>* FieldIndex::find_eq(uint64_t field_val_hash) const {
     return const_cast<FlatHashMap<uint64_t, std::vector<uint64_t>>&>(hash_index).find(field_val_hash);
+}
+
+const std::vector<std::pair<uint64_t,std::vector<PyObject*>>>* FieldIndex::find_wildcard_leaf_eq(uint64_t field_val_hash) const {
+    return const_cast<FlatHashMap<uint64_t, std::vector<std::pair<uint64_t,std::vector<PyObject*>>>>&>
+        (wildcard_leaf_index).find(field_val_hash);
 }
 
 bool FieldIndex::is_numeric_range_supported(const ModValue& val) const {

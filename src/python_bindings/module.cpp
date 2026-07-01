@@ -1,6 +1,9 @@
 #include <Python.h>
 #include <structmember.h>
 #include "converter_registry.h"
+#include "mod_dict_binding.h"
+#include "../core/mod_dict.h"
+#include "../core/codecs/serializer.h"
 
 extern PyTypeObject ModDict_Type;
 extern PyTypeObject ModDictIter_Type;
@@ -115,12 +118,69 @@ static PyObject* py_register_converter(PyObject*, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+/* ============================================================================
+   dumps / loads — module-level serialization for arbitrary objects.
+
+   A ModDict is serialized with its own container format (magic+version+outer
+   entries, same as ModDict.serialize()) so loads() reconstructs a ModDict
+   back. Anything else uses the generic single-value format. No implicit
+   ModDict → dict conversion — call mn.to_dict() first if a plain dict is
+   what you want serialized.
+   ============================================================================ */
+
+static PyObject* py_dumps(PyObject*, PyObject* obj) {
+    std::vector<uint8_t> buf;
+    ModDict* mdo = ModDict_unwrap(obj);
+    if (mdo) {
+        buf = mdo->serialize();
+    } else {
+        Serializer::serialize_pyobject(buf, obj);
+    }
+    if (PyErr_Occurred()) return nullptr;
+    return PyBytes_FromStringAndSize((const char*)buf.data(), (Py_ssize_t)buf.size());
+}
+
+static PyObject* py_loads(PyObject*, PyObject* args) {
+    const char* data; Py_ssize_t len;
+    if (!PyArg_ParseTuple(args, "y#", &data, &len)) return nullptr;
+
+    if (ModDict::has_container_magic((const uint8_t*)data, (size_t)len)) {
+        ModDict* internal = new ModDict();
+        internal->deserialize((const uint8_t*)data, (size_t)len);
+        if (PyErr_Occurred()) { delete internal; return nullptr; }
+        return ModDict_wrap_owned(internal);
+    }
+
+    const uint8_t* ptr = (const uint8_t*)data;
+    const uint8_t* end = ptr + len;
+    ModValue mv = Serializer::deserialize_value(ptr, end, nullptr);
+    if (PyErr_Occurred()) return nullptr;
+    // ModValue's destructor Py_XDECREFs obj — null it out here so returning
+    // the pointer transfers ownership instead of leaving a dangling ref
+    // (deserialize_value hands back a fresh refcount=1 object; without this
+    // the ~ModValue() at function exit would drop it to 0 and free it out
+    // from under the caller).
+    PyObject* result = mv.obj;
+    mv.obj = nullptr;
+    if (result) return result;
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
     {"register_converter", py_register_converter, METH_VARARGS,
      "register_converter(type, callable)\n"
      "Register a converter for a custom type.\n"
      "callable(obj) must return a value ModDict can store natively.\n"
      "Subclasses are matched via MRO walk."},
+    {"dumps", py_dumps, METH_O,
+     "dumps(obj)->bytes\n"
+     "Serialize any supported object. A ModDict is serialized with its native\n"
+     "container format (round-trips back to ModDict via loads()); everything\n"
+     "else uses the generic single-value format. Call mn.to_dict() first if\n"
+     "you want the plain-dict form serialized instead."},
+    {"loads", py_loads, METH_VARARGS,
+     "loads(data)->object\n"
+     "Deserialize bytes produced by dumps() (or ModDict.serialize())."},
     {nullptr, nullptr, 0, nullptr}
 };
 
