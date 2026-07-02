@@ -356,9 +356,13 @@ static void FilterBuilder_dealloc(FilterBuilderObject* s){Py_XDECREF(s->owner);f
 /* ── scan_here helpers for returns="rows_here"/"values" ── */
 static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
     ModValue v = ModValue::from_pyobject(pyobj);
-    int c = v.compare(fval);
+    if (op == FilterOp::EQ) return v.equals(fval);
+    if (op == FilterOp::NE) return !v.equals(fval);
+    bool ok = true;
+    int c = v.compare(fval, &ok);
+    // Not comparable (e.g. None vs int) — excluded from every range predicate.
+    if (!ok) return false;
     switch(op){
-        case FilterOp::EQ: return c==0; case FilterOp::NE: return c!=0;
         case FilterOp::LT: return c<0;  case FilterOp::LE: return c<=0;
         case FilterOp::GT: return c>0;  case FilterOp::GE: return c>=0;
         default: return false;
@@ -464,7 +468,11 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
             if (!p.empty() && p.back()!="__pass_key__")
                 fv_obj2=PyDict_GetItemString(row,p.back().c_str());
             bool pass=true;
-            if (fv_obj2){ModValue fv=ModValue::from_pyobject(fv_obj2);pass=(fv.compare(hi_val)<=0);}
+            if (fv_obj2){
+                ModValue fv=ModValue::from_pyobject(fv_obj2);
+                bool ok=true; int c=fv.compare(hi_val,&ok);
+                pass = ok && (c<=0);   // not comparable (e.g. None vs int) -> excluded
+            }
             if (pass) {
                 PyObject* item=want_values?(vf_obj?PyDict_GetItem(row,vf_obj):nullptr):row;
                 if(item){Py_INCREF(item);PyList_Append(result,item);Py_DECREF(item);}

@@ -75,7 +75,15 @@ struct ModValue {
 
     uint64_t hash() const { return hash_val; }
     bool equals(const ModValue& other) const;
-    int  compare(const ModValue& other) const;
+
+    // Returns -1/0/1 for less/equal/greater. For non-numeric types whose
+    // Python objects don't support rich comparison with each other (e.g.
+    // None vs int in an unnormalized dataset), the underlying TypeError is
+    // cleared and *ok is set to false — callers must treat a not-comparable
+    // pair as excluded from any <,<=,>,>= predicate rather than trust the
+    // returned 0. Pass ok=nullptr only when comparability is already
+    // guaranteed by the caller (e.g. both operands confirmed numeric).
+    int compare(const ModValue& other, bool* ok = nullptr) const;
 };
 
 #endif

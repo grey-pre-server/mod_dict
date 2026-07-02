@@ -575,6 +575,16 @@ class ModDict:
           ``ne()`` and range ops (``lt``/``gt``/...) on wildcard paths have
           no index shortcut and fall back to a full scan every call.
 
+        **Mixed / unnormalized types**
+
+        A field with incompatible types across rows (e.g. some rows have
+        ``age: 30``, others ``age: None``) never raises. ``eq()``/``ne()``
+        use normal equality, so ``None`` only matches ``eq(None)``. Range
+        ops (``lt``/``lte``/``gt``/``gte``/``between``) treat a value that
+        can't be ordered against the query value (e.g. ``None`` vs an int)
+        as excluded — it matches none of them, rather than being silently
+        treated as equal.
+
         Examples::
 
             mn.create_index("age")

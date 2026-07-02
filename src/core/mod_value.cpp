@@ -123,6 +123,14 @@ PyObject* ModValue::to_pyobject() const {
 bool ModValue::equals(const ModValue& other) const {
     if (hash_val != other.hash_val) return false;
     if (obj == other.obj) return true;
+    if (type == ValueType::INT && other.type == ValueType::INT)
+        return PyLong_AsLongLong(obj) == PyLong_AsLongLong(other.obj);
+    if ((type == ValueType::INT || type == ValueType::FLOAT) &&
+        (other.type == ValueType::INT || other.type == ValueType::FLOAT)) {
+        double a = (type == ValueType::FLOAT) ? PyFloat_AsDouble(obj)       : (double)PyLong_AsLongLong(obj);
+        double b = (other.type == ValueType::FLOAT) ? PyFloat_AsDouble(other.obj) : (double)PyLong_AsLongLong(other.obj);
+        return a == b;
+    }
     PyObject* a = obj      ? obj      : Py_None;
     PyObject* b = other.obj ? other.obj : Py_None;
     int r = PyObject_RichCompareBool(a, b, Py_EQ);
@@ -130,7 +138,8 @@ bool ModValue::equals(const ModValue& other) const {
     return r == 1;
 }
 
-int ModValue::compare(const ModValue& other) const {
+int ModValue::compare(const ModValue& other, bool* ok) const {
+    if (ok) *ok = true;
     if (type == ValueType::INT && other.type == ValueType::INT) {
         long long a = PyLong_AsLongLong(obj);
         long long b = PyLong_AsLongLong(other.obj);
@@ -144,7 +153,11 @@ int ModValue::compare(const ModValue& other) const {
     }
     PyObject* ao = obj       ? obj       : Py_None;
     PyObject* bo = other.obj ? other.obj : Py_None;
-    if (PyObject_RichCompareBool(ao, bo, Py_LT) == 1) return -1;
-    if (PyObject_RichCompareBool(ao, bo, Py_GT) == 1) return  1;
+    int lt = PyObject_RichCompareBool(ao, bo, Py_LT);
+    if (lt == -1) { PyErr_Clear(); if (ok) *ok = false; return 0; }
+    if (lt == 1) return -1;
+    int gt = PyObject_RichCompareBool(ao, bo, Py_GT);
+    if (gt == -1) { PyErr_Clear(); if (ok) *ok = false; return 0; }
+    if (gt == 1) return 1;
     return 0;
 }

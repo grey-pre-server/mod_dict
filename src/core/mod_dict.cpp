@@ -305,10 +305,23 @@ static bool compare_values(const ModValue& a, FilterOp op, const ModValue& b) {
     switch (op) {
         case FilterOp::EQ: return  a.equals(b);
         case FilterOp::NE: return !a.equals(b);
-        case FilterOp::LT: return a.compare(b) < 0;
-        case FilterOp::LE: return a.compare(b) <= 0;
-        case FilterOp::GT: return a.compare(b) > 0;
-        case FilterOp::GE: return a.compare(b) >= 0;
+        case FilterOp::LT:
+        case FilterOp::LE:
+        case FilterOp::GT:
+        case FilterOp::GE: {
+            bool ok = true;
+            int c = a.compare(b, &ok);
+            // Not comparable (e.g. None vs int in an unnormalized field) —
+            // excluded from every range predicate, not just silently "equal".
+            if (!ok) return false;
+            switch (op) {
+                case FilterOp::LT: return c < 0;
+                case FilterOp::LE: return c <= 0;
+                case FilterOp::GT: return c > 0;
+                case FilterOp::GE: return c >= 0;
+                default: return false;
+            }
+        }
     }
     return false;
 }
