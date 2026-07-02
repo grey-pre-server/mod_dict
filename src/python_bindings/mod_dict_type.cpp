@@ -267,6 +267,10 @@ static std::vector<const char*> parse_merge_path(PyObject* obj,std::vector<std::
     size_t base=st.size();
     if(PyUnicode_Check(obj)){
         std::string raw=PyUnicode_AsUTF8(obj);
+        // space/tab is a literal alias for '.' — normalize, then split with
+        // the original strict splitter (no collapsing; fields with a literal
+        // '.'/' ' need the tuple form).
+        for(char& c: raw) if(c==' '||c=='\t') c='.';
         if(raw.find('.')!=std::string::npos){size_t pos=0;while(true){size_t d=raw.find('.',pos);st.push_back(tr(raw.substr(pos,d==std::string::npos?d:d-pos)));if(d==std::string::npos)break;pos=d+1;}}
         else st.push_back(tr(raw));
     } else if(PyTuple_Check(obj)||PyList_Check(obj)){
@@ -316,9 +320,14 @@ static PyObject* ModDict_update(ModDictObject* s,PyObject* args,PyObject* kwargs
 }
 
 /* field/pattern parser */
+// '.' (strict) or whitespace (collapsed) — space is a readability alias for
+// '.'; fields containing a literal '.'/' ' need the tuple/list path form.
 static bool parse_field_or_pattern(PyObject* arg,std::string& simple,std::vector<std::string>& pattern,bool& wc){
     if(PyUnicode_Check(arg)){
         std::string raw=PyUnicode_AsUTF8(arg);
+        // space/tab is a literal alias for '.' — normalize, then split with
+        // the original strict splitter (no collapsing).
+        for(char& c: raw) if(c==' '||c=='\t') c='.';
         if(raw.find('.')!=std::string::npos || raw=="?"){
             size_t pos=0; while(true){size_t d=raw.find('.',pos);std::string seg=raw.substr(pos,d==std::string::npos?d:d-pos);pattern.push_back(seg=="?"?"__pass_key__":seg);if(d==std::string::npos)break;pos=d+1;}
             wc=true;

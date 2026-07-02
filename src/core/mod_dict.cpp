@@ -24,12 +24,21 @@ static std::vector<std::string> split_path_sep(const std::string& s) {
 }
 
 // Split "age.a.b" → ["age","a","b"]. Single segment stays as-is.
+// Space/tab is a literal alias for '.' — normalize then split with the
+// original strict single-char splitter. No collapsing: "meta  level" (two
+// spaces) is "meta..level" after normalization and produces an empty
+// segment, exactly like "meta..level" already does with dots — same
+// strictness either way, no special-cased leniency for one separator.
+// Field names containing a literal '.' or ' ' need the tuple/list path
+// form instead (each element taken as one exact segment, no splitting).
 static std::vector<std::string> split_path(const std::string& field) {
+    std::string norm = field;
+    for (char& c : norm) if (c == ' ' || c == '\t') c = '.';
     std::vector<std::string> segs;
     size_t pos = 0;
     while (true) {
-        size_t d = field.find('.', pos);
-        segs.push_back(field.substr(pos, d == std::string::npos ? d : d - pos));
+        size_t d = norm.find('.', pos);
+        segs.push_back(norm.substr(pos, d == std::string::npos ? d : d - pos));
         if (d == std::string::npos) break;
         pos = d + 1;
     }
@@ -554,8 +563,16 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
     };
 
     bool terminal_pass_key = !pattern.empty() && pattern.back() == "__pass_key__";
+    // idx->is_wildcard just means "built via build_wildcard" — true for ANY
+    // multi-segment pattern, including purely literal ones like "meta.score"
+    // or a single-element tuple ("first name",) with no "?" anywhere.
+    // wildcard_leaf_index is only populated when a "__pass_key__" actually
+    // occurs in the pattern — has_pass_key is the real signal for which EQ
+    // path applies; a purely literal pattern has no wildcard to prune, so it
+    // must fall through to the plain find_eq()+filter_add_row() path below.
+    bool has_pass_key = std::find(pattern.begin(), pattern.end(), "__pass_key__") != pattern.end();
 
-    if (op == FilterOp::EQ && idx->is_wildcard && terminal_pass_key) {
+    if (op == FilterOp::EQ && has_pass_key && terminal_pass_key) {
         // Terminal ?: the matched key IS `value` itself. Dict keys are unique
         // within a row, so a given oh can appear at most once in the bucket
         // regardless of anchoring — no dedup needed. Direct O(1) lookup, no rescan.
@@ -572,7 +589,7 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
                 Py_DECREF(pruned);
             }
         }
-    } else if (op == FilterOp::EQ && idx->is_wildcard) {
+    } else if (op == FilterOp::EQ && has_pass_key) {
         // Non-terminal "?" — any number of levels ("?.field", "?.?.field", ...).
         // wildcard_leaf_index already has the exact chain of keys each "?"
         // resolved to per match — reconstruct directly, no rescan.

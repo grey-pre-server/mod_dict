@@ -31,6 +31,15 @@ Quick start::
     # Index for repeated queries
     mn.create_index("age")
     by_city = mn.group_by("geo.city")
+
+Path strings (used by filter/sort_by/group_by/select/update/create_index/...):
+  A dot ``.`` separates nesting levels; whitespace is a literal alias for
+  ``.`` (normalized before splitting, no collapsing — ``"a  b"`` behaves
+  exactly like ``"a..b"``: an empty segment in the middle, matches nothing) —
+  ``"geo.city"`` and ``"geo city"`` are equivalent. A field name that itself
+  contains a literal ``.`` or space can't be expressed as a string path;
+  pass a tuple/list of exact segments instead: ``("geo.city",)`` means one
+  field literally named ``"geo.city"``, not nesting into ``geo`` then ``city``.
 """
 from __future__ import annotations
 from typing import Any, Iterator, Literal, Sequence, overload
@@ -48,7 +57,8 @@ class FilterBuilder:
 
         mn.filter("age").gte(18).filter("active").eq(True)
 
-    Path syntax for nested fields::
+    Path syntax for nested fields (whitespace is an alias for '.' — see the
+    module docstring)::
 
         mn.filter("meta.score").gte(8.0)          # dot-notation
         mn.filter("orders.?.status").eq("shipped") # ? = any one key level
@@ -539,11 +549,14 @@ class ModDict:
 
         **Path syntax**
 
-        Simple field (any nesting level via dot-notation)::
+        Simple field (any nesting level via dot-notation; whitespace is an
+        accepted alias for ``.`` — see the module docstring for details and
+        the tuple-path escape hatch for field names containing ``.``/``  ``)::
 
             mn.filter("age").gte(18)
             mn.filter("meta.score").between(7.0, 10.0)
             mn.filter("geo.coords.lat").lt(0)
+            mn.filter("geo coords lat").lt(0)             # same as above
 
         Wildcard path (``?`` = any single key at that level — one ``?`` is
         exactly one level; for deeper wildcards chain them explicitly,

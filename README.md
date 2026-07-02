@@ -202,6 +202,28 @@ calls on wildcard paths behaves as AND, not OR. `eq()` on wildcard paths
 rescan; `ne()` and range ops (`lt`/`gt`/...) on wildcard paths fall back to a
 full scan every call — there's no index shortcut for those yet.
 
+### Space is an alias for `.` in path strings
+
+Every path-accepting API (`filter`, `sort_by`, `group_by`, `select`, `update`,
+`create_index`, ...) treats whitespace as a literal alias for `.` — `"meta.level"`
+and `"meta level"` are identical. No collapsing: `"meta   level"` (extra spaces)
+is equivalent to `"meta...level"` (extra dots) — both produce empty segments
+in the middle, matching nothing. Same strictness for both separators.
+
+```python
+mn.filter("meta level").eq(5)          # same as mn.filter("meta.level").eq(5)
+mn.filter("g1 ? user_id").eq(1)        # same as mn.filter("g1.?.user_id").eq(1)
+```
+
+A field name that itself contains a literal `.` or space can't be written as
+a string path — pass a **tuple/list** instead, where each element is taken
+as one exact segment with no splitting at all:
+
+```python
+mn.filter(("first name",)).eq("alice")   # field literally named "first name"
+mn.filter(("a.b",)).eq(1)                # field literally named "a.b"
+```
+
 Also new: `mn.to_dict()` returns a plain `dict` (bypasses RowProxy — useful
 for libraries like Pydantic that require an actual `dict`), and module-level
 `md.dumps(obj)` / `md.loads(data)` serialize *any* supported object, not just
