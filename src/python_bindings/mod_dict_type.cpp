@@ -129,6 +129,14 @@ struct RowProxyObject {
     PyObject*      row;
     ModDictObject* owner;
     uint64_t       outer_hash;
+    // true only for the proxy returned directly by ModDict[table] — i.e. `row`
+    // IS the table dict {pk: row}, and a key passed to __delitem__/.pop() is a
+    // PRIMARY KEY, so link on_delete semantics (restrict/cascade/set_null)
+    // apply. Nested proxies (returned by __getitem__ when a value is itself a
+    // dict, e.g. mn[table][pk] or deeper) are field-level views of a single
+    // row — a key there is a FIELD name, not a pk, so link delete semantics
+    // must not apply; only the write-time reindex/validation does.
+    bool           is_root;
 };
 
 // ── forward-declare callbacks so RowProxy_Type can reference them ─────────────
@@ -142,9 +150,11 @@ static PyObject*  RowProxy_repr    (RowProxyObject*);
 static PyObject*  RowProxy_richcmp (RowProxyObject*, PyObject*, int);
 static PyObject*  RowProxy_getattro(RowProxyObject*, PyObject*);
 static PyObject*  RowProxy_update  (RowProxyObject*, PyObject*, PyObject*);
+static PyObject*  RowProxy_pop     (RowProxyObject*, PyObject*);
 
 static PyMethodDef RowProxy_methods[] = {
     {"update",(PyCFunction)(PyCFunctionWithKeywords)RowProxy_update,METH_VARARGS|METH_KEYWORDS,""},
+    {"pop",(PyCFunction)RowProxy_pop,METH_VARARGS,""},
     {NULL,NULL,0,NULL}};
 static PyMappingMethods  RowProxy_mapping  = {(lenfunc)RowProxy_len,(binaryfunc)RowProxy_getitem,(objobjargproc)RowProxy_setitem};
 static PySequenceMethods RowProxy_sequence = {.sq_contains=(objobjproc)RowProxy_contains};
@@ -164,11 +174,11 @@ PyTypeObject RowProxy_Type = {
 };
 
 // ── RowProxy implementations ──────────────────────────────────────────────────
-static PyObject* RowProxy_create(ModDictObject* owner, PyObject* row, uint64_t oh) {
+static PyObject* RowProxy_create(ModDictObject* owner, PyObject* row, uint64_t oh, bool is_root = true) {
     RowProxyObject* p = PyObject_New(RowProxyObject, &RowProxy_Type);
     if (!p) return nullptr;
     Py_INCREF(row); Py_INCREF(owner);
-    p->row = row; p->owner = owner; p->outer_hash = oh;
+    p->row = row; p->owner = owner; p->outer_hash = oh; p->is_root = is_root;
     return (PyObject*)p;
 }
 static void RowProxy_dealloc(RowProxyObject* s) {
@@ -176,13 +186,47 @@ static void RowProxy_dealloc(RowProxyObject* s) {
     Py_TYPE(s)->tp_free((PyObject*)s);
 }
 static PyObject* RowProxy_getitem(RowProxyObject* s, PyObject* key) {
-    return PyObject_GetItem(s->row, key);
+    PyObject* child = PyObject_GetItem(s->row, key);
+    // Wrap nested dict values too (same table/outer_hash, non-root), so a
+    // write at any depth — mn[table][pk][field] = x, or deeper — still routes
+    // through RowProxy_setitem and triggers reindex_row()/link validation.
+    if (child && PyDict_Check(child) && s->owner->internal) {
+        PyObject* nested = RowProxy_create(s->owner, child, s->outer_hash, false);
+        Py_DECREF(child);
+        return nested;
+    }
+    return child;
+}
+// If this row is a declared link's target table (references_pattern[0] ==
+// this row's own outer key), routes the delete through link on_delete
+// semantics (restrict/cascade/set_null) instead of a plain dict delete.
+// Returns true if it handled the delete (caller must not also delete),
+// false if there's no matching link (caller should do a plain delete).
+static bool try_link_delete(RowProxyObject* s, PyObject* key, int& out_r) {
+    if (!s->is_root || s->owner->internal->links.empty()) return false;
+    const OuterEntry* te = s->owner->internal->outer.find(s->outer_hash);
+    if (!te || !te->key_py || !PyUnicode_Check(te->key_py)) return false;
+    const char* table = PyUnicode_AsUTF8(te->key_py);
+    if (!table) { PyErr_Clear(); return false; }
+    out_r = s->owner->internal->delete_with_link_semantics(std::string(table), key) ? 0 : -1;
+    return true;
 }
 static int RowProxy_setitem(RowProxyObject* s, PyObject* key, PyObject* value) {
-    int r = value ? PyObject_SetItem(s->row, key, value)
-                  : PyObject_DelItem(s->row, key);
-    if (r == 0 && s->owner->internal)
+    if (!value) {
+        int r;
+        if (try_link_delete(s, key, r)) return r;  // deletion (+ reindex) already applied inside
+        int dr = PyObject_DelItem(s->row, key);
+        if (dr == 0 && s->owner->internal) {
+            s->owner->internal->reindex_row(s->outer_hash);
+            if (PyErr_Occurred()) return -1;  // reindex_row may raise (link validation)
+        }
+        return dr;
+    }
+    int r = PyObject_SetItem(s->row, key, value);
+    if (r == 0 && s->owner->internal) {
         s->owner->internal->reindex_row(s->outer_hash);
+        if (PyErr_Occurred()) return -1;  // reindex_row may raise (link validation)
+    }
     return r;
 }
 static PyObject* RowProxy_update(RowProxyObject* s, PyObject* args, PyObject* kwargs) {
@@ -190,8 +234,44 @@ static PyObject* RowProxy_update(RowProxyObject* s, PyObject* args, PyObject* kw
     if (!fn) return nullptr;
     PyObject* res = PyObject_Call(fn, args, kwargs);
     Py_DECREF(fn);
-    if (res && s->owner->internal)
+    if (res && s->owner->internal) {
         s->owner->internal->reindex_row(s->outer_hash);
+        if (PyErr_Occurred()) { Py_DECREF(res); return nullptr; }
+    }
+    return res;
+}
+static PyObject* RowProxy_pop(RowProxyObject* s, PyObject* args) {
+    PyObject *key, *def=nullptr;
+    if (!PyArg_ParseTuple(args, "O|O", &key, &def)) return nullptr;
+
+    if (s->is_root && !s->owner->internal->links.empty()) {
+        const OuterEntry* te = s->owner->internal->outer.find(s->outer_hash);
+        if (te && te->key_py && PyUnicode_Check(te->key_py)) {
+            const char* table = PyUnicode_AsUTF8(te->key_py);
+            if (!table) PyErr_Clear();
+            else {
+                PyObject* existing = PyDict_GetItem(s->row, key);  // borrowed
+                if (!existing) {
+                    if (def) { Py_INCREF(def); return def; }
+                    PyErr_SetObject(PyExc_KeyError, key);
+                    return nullptr;
+                }
+                Py_INCREF(existing);  // hold — delete_with_link_semantics is about to remove it from s->row
+                bool ok = s->owner->internal->delete_with_link_semantics(std::string(table), key);
+                if (!ok) { Py_DECREF(existing); return nullptr; }
+                return existing;  // transfers the held ref to the caller
+            }
+        }
+    }
+
+    PyObject* fn = PyObject_GetAttrString(s->row, "pop");
+    if (!fn) return nullptr;
+    PyObject* res = PyObject_Call(fn, args, nullptr);
+    Py_DECREF(fn);
+    if (res && s->owner->internal) {
+        s->owner->internal->reindex_row(s->outer_hash);
+        if (PyErr_Occurred()) { Py_DECREF(res); return nullptr; }
+    }
     return res;
 }
 static int        RowProxy_contains(RowProxyObject* s, PyObject* k) { return PySequence_Contains(s->row, k); }
@@ -322,6 +402,23 @@ static PyObject* ModDict_update(ModDictObject* s,PyObject* args,PyObject* kwargs
 /* field/pattern parser */
 // '.' (strict) or whitespace (collapsed) — space is a readability alias for
 // '.'; fields containing a literal '.'/' ' need the tuple/list path form.
+// Splits one "->"-free chunk on '.' (space/tab normalized to '.' first),
+// translating a bare "?" segment to "__pass_key__". Shared by
+// parse_field_or_pattern (whole strings) and parse_link_pattern (one hop
+// of a "->" path).
+static std::vector<std::string> split_dot_chunk(std::string raw){
+    for(char& c: raw) if(c==' '||c=='\t') c='.';
+    std::vector<std::string> segs;
+    size_t pos=0;
+    while(true){
+        size_t d=raw.find('.',pos);
+        std::string seg=raw.substr(pos,d==std::string::npos?std::string::npos:d-pos);
+        segs.push_back(seg=="?"?"__pass_key__":seg);
+        if(d==std::string::npos) break;
+        pos=d+1;
+    }
+    return segs;
+}
 static bool parse_field_or_pattern(PyObject* arg,std::string& simple,std::vector<std::string>& pattern,bool& wc){
     if(PyUnicode_Check(arg)){
         std::string raw=PyUnicode_AsUTF8(arg);
@@ -329,7 +426,7 @@ static bool parse_field_or_pattern(PyObject* arg,std::string& simple,std::vector
         // the original strict splitter (no collapsing).
         for(char& c: raw) if(c==' '||c=='\t') c='.';
         if(raw.find('.')!=std::string::npos || raw=="?"){
-            size_t pos=0; while(true){size_t d=raw.find('.',pos);std::string seg=raw.substr(pos,d==std::string::npos?d:d-pos);pattern.push_back(seg=="?"?"__pass_key__":seg);if(d==std::string::npos)break;pos=d+1;}
+            pattern=split_dot_chunk(raw);
             wc=true;
         } else { simple=raw; wc=false; }
         return true;
@@ -341,11 +438,53 @@ static bool parse_field_or_pattern(PyObject* arg,std::string& simple,std::vector
     }
     return false;
 }
+// Splits raw on "->", dot-splits each chunk via split_dot_chunk, and inserts
+// "__follow_link__" sentinels between chunks. Validates shape: the first
+// chunk must be exactly ["table","?","field"] (a link source_path shape);
+// every middle hop (there's another "->" after it) must be a single field
+// name — a "->" hop always lands on an already-resolved row, so there's no
+// anchor/wildcard segment to have there. The last chunk (the continuation
+// read off the final target row) may be any dotted path. Returns false
+// (PyErr set) on a malformed "->" pattern.
+static bool parse_link_pattern(const std::string& raw, std::vector<std::string>& pattern){
+    std::vector<std::string> chunks;
+    size_t pos=0;
+    while(true){
+        size_t d=raw.find("->",pos);
+        chunks.push_back(raw.substr(pos,d==std::string::npos?std::string::npos:d-pos));
+        if(d==std::string::npos) break;
+        pos=d+2;
+    }
+    for(size_t i=0;i<chunks.size();i++){
+        if(chunks[i].empty()){
+            PyErr_SetString(PyExc_ValueError,"filter: '->' must have a path segment on both sides");
+            return false;
+        }
+        std::vector<std::string> segs=split_dot_chunk(chunks[i]);
+        if(i==0){
+            if(segs.size()!=3 || segs[1]!="__pass_key__"){
+                PyErr_SetString(PyExc_ValueError,"filter: '->' left side must be a wildcard path like \"table.?.field\"");
+                return false;
+            }
+        } else if(i+1<chunks.size()){
+            if(segs.size()!=1){
+                PyErr_SetString(PyExc_ValueError,"filter: '->' hop must be a single field name, not a nested path");
+                return false;
+            }
+        }
+        if(i>0) pattern.push_back("__follow_link__");
+        for(auto& s:segs) pattern.push_back(s);
+    }
+    return true;
+}
 
 static PyObject* apply_filter(ModDictObject* owner,const std::string& simple,const std::vector<std::string>& pattern,bool wc,FilterOp op,PyObject* val_obj){
     ModValue fv=ModValue::from_pyobject(val_obj);
     ModDict* result=wc?owner->internal->filter(pattern,op,fv):owner->internal->filter(simple,op,fv);
-    MOD_DICT_CHECK_ALLOC(result);
+    // A null result can mean a specific error (e.g. "->" hop with no
+    // declared link) rather than allocation failure — don't clobber it with
+    // a generic MemoryError via MOD_DICT_CHECK_ALLOC.
+    if(!result) return nullptr;
     ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
     if(!w){delete result;return nullptr;}
     w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)owner; Py_INCREF(owner);
@@ -411,6 +550,10 @@ static PyObject* apply_filter_here(ModDictObject* owner,
                                     const std::vector<std::string>& pattern,
                                     bool wc, FilterOp op, const ModValue& fval,
                                     bool want_values, PyObject* vf_key) {
+    if (wc && std::find(pattern.begin(), pattern.end(), "__follow_link__") != pattern.end()) {
+        PyErr_SetString(PyExc_ValueError, "filter: '->' paths only support returns='rows' for now");
+        return nullptr;
+    }
     PyObject* result = PyList_New(0); if (!result) return nullptr;
     std::vector<std::string> pat = wc ? pattern : std::vector<std::string>{simple};
     bool anchored = (!pat.empty() && pat[0] != "__pass_key__");
@@ -454,6 +597,58 @@ static PyObject* FB_lt(FilterBuilderObject* s,PyObject* a,PyObject* kw){return f
 static PyObject* FB_lte(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::LE);}
 static PyObject* FB_gt(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::GT);}
 static PyObject* FB_gte(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::GE);}
+// FB_between/FB_in_ "rows" paths normally compose multiple filter() calls by
+// chaining (between: re-filter the previous result) or by outer-key de-dup
+// (in_: skip if the anchor hash is already present). Both assumptions break
+// for a "->" pattern's anchored {table: {pk: row}} result: chaining re-filters
+// an intermediate ModDict that never carries the original's `links` (so
+// find_link() fails), and outer-key de-dup collapses every part down to
+// whichever was merged first (all parts share the SAME single anchor hash).
+// These two helpers do the same job correctly for that one shape, operating
+// on two independent filter() calls off the *original* owner instead.
+static bool pattern_has_link_hop(const std::vector<std::string>& pat) {
+    return std::find(pat.begin(), pat.end(), "__follow_link__") != pat.end();
+}
+// Intersects two anchored (single outer-key, nested-dict-value) results at
+// the inner-row level. Consumes and frees both a and b.
+static ModDict* intersect_anchored(ModDict* a, ModDict* b) {
+    ModDict* result = new ModDict();
+    for (auto& e : a->outer.occupied()) {
+        const OuterEntry* be = b->outer.find(e.key);
+        if (!be || !be->val_py || !e.value.val_py || !e.value.is_row || !be->is_row
+            || !PyDict_Check(e.value.val_py) || !PyDict_Check(be->val_py)) continue;
+        PyObject* pruned = PyDict_New();
+        PyObject *k2,*v2; Py_ssize_t pos2=0;
+        while (PyDict_Next(e.value.val_py,&pos2,&k2,&v2))
+            if (PyDict_Contains(be->val_py,k2)) PyDict_SetItem(pruned,k2,v2);
+        if (PyDict_Size(pruned) > 0) {
+            Py_XINCREF(e.value.key_py);
+            result->outer.insert(e.key, {e.value.key_py, pruned, true});
+            result->order.push_back(e.key);
+        } else Py_DECREF(pruned);
+    }
+    delete a; delete b;
+    return result;
+}
+// Unions src's anchored inner rows into dst (dst takes ownership of nothing
+// new from src — copies refs). Unlike the plain outer-key de-dup this
+// replaces, a second part sharing dst's single anchor hash gets its inner
+// rows merged in rather than dropped.
+static void union_anchored_into(ModDict* dst, ModDict* src) {
+    for (auto& e : src->outer.occupied()) {
+        OuterEntry* existing = dst->outer.find(e.key);
+        if (!existing) {
+            Py_XINCREF(e.value.key_py); Py_XINCREF(e.value.val_py);
+            dst->outer.insert(e.key, {e.value.key_py, e.value.val_py, e.value.is_row});
+            dst->order.push_back(e.key);
+        } else if (e.value.is_row && existing->is_row && e.value.val_py && existing->val_py
+                   && PyDict_Check(e.value.val_py) && PyDict_Check(existing->val_py)) {
+            PyObject *k2,*v2; Py_ssize_t pos2=0;
+            while (PyDict_Next(e.value.val_py,&pos2,&k2,&v2))
+                if (!PyDict_Contains(existing->val_py,k2)) PyDict_SetItem(existing->val_py,k2,v2);
+        }
+    }
+}
 static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
     PyObject *lo,*hi; const char* ret="rows"; PyObject* vf_obj=nullptr;
     static const char* kwl[]={"lo","hi","returns","value_field",nullptr};
@@ -489,6 +684,25 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         }
         Py_DECREF(ge); return result;
     }
+    if (wc && pattern_has_link_hop(pat)) {
+        // Chaining (re-filtering r1) doesn't work here — r1 is a fresh ModDict
+        // with no `links` of its own, so find_link() inside the second call
+        // would fail. Compute GE/LE independently off the original owner and
+        // intersect the two anchored results at the row level instead.
+        ModDict* ge = s->owner->internal->filter(pat, FilterOp::GE, ModValue::from_pyobject(lo));
+        if (!ge) return nullptr;
+        ModDict* le = s->owner->internal->filter(pat, FilterOp::LE, ModValue::from_pyobject(hi));
+        if (!le) { delete ge; return nullptr; }
+        ModDict* result = intersect_anchored(ge, le);
+        MOD_DICT_CHECK_ALLOC(result);
+        // Rows are borrowed from s->owner's own data (zero-copy) -- keep it
+        // alive via parent_ref, same as apply_filter() does. ModDict_wrap_owned
+        // would leave parent_ref null, risking a use-after-free.
+        ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
+        if(!w){delete result;return nullptr;}
+        w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)s->owner; Py_INCREF(s->owner);
+        result->py_wrapper=w; return (PyObject*)w;
+    }
     PyObject* r1=apply_filter(s->owner,simple,pat,wc,FilterOp::GE,lo); if(!r1) return nullptr;
     PyObject* r2=apply_filter((ModDictObject*)r1,simple,pat,wc,FilterOp::LE,hi); Py_DECREF(r1); return r2;
 }
@@ -522,7 +736,15 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         ModValue mv=ModValue::from_pyobject(item); Py_DECREF(item);
         ModDict* part=wc?s->owner->internal->filter(pat,FilterOp::EQ,mv):s->owner->internal->filter(simple,FilterOp::EQ,mv);
         if(!part){delete merged;return nullptr;}
-        for(auto& e:part->outer.occupied()) if(!merged->outer.find(e.key)){Py_XINCREF(e.value.key_py);Py_XINCREF(e.value.val_py);merged->outer.insert(e.key,{e.value.key_py,e.value.val_py,e.value.is_row});}
+        if(wc && pattern_has_link_hop(pat)){
+            // Every part shares the SAME single anchor hash (an anchored
+            // "->" result is always {table: {...}}) -- union inner rows
+            // instead of the plain de-dup below, which would silently keep
+            // only the first value's matches.
+            union_anchored_into(merged, part);
+        } else {
+            for(auto& e:part->outer.occupied()) if(!merged->outer.find(e.key)){Py_XINCREF(e.value.key_py);Py_XINCREF(e.value.val_py);merged->outer.insert(e.key,{e.value.key_py,e.value.val_py,e.value.is_row});merged->order.push_back(e.key);}
+        }
         delete part;
     }
     ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type); if(!w){delete merged;return nullptr;}
@@ -546,7 +768,18 @@ PyTypeObject FilterBuilder_Type={
 
 static PyObject* FilterBuilder_new_obj(ModDictObject* owner,PyObject* fo){
     std::string simple; std::vector<std::string>* pat=nullptr; bool wc;
-    {std::vector<std::string> tmp; if(!parse_field_or_pattern(fo,simple,tmp,wc)){PyErr_SetString(PyExc_TypeError,"filter: field must be str or tuple");return nullptr;}if(wc)pat=new std::vector<std::string>(std::move(tmp));}
+    if(PyUnicode_Check(fo)){
+        std::string raw=PyUnicode_AsUTF8(fo);
+        if(raw.find("->")!=std::string::npos){
+            std::vector<std::string> tmp;
+            if(!parse_link_pattern(raw,tmp)) return nullptr;  // PyErr already set
+            pat=new std::vector<std::string>(std::move(tmp));
+            wc=true;
+        }
+    }
+    if(!pat){
+        std::vector<std::string> tmp; if(!parse_field_or_pattern(fo,simple,tmp,wc)){PyErr_SetString(PyExc_TypeError,"filter: field must be str or tuple");return nullptr;}if(wc)pat=new std::vector<std::string>(std::move(tmp));
+    }
     FilterBuilderObject* fb=(FilterBuilderObject*)FilterBuilder_Type.tp_alloc(&FilterBuilder_Type,0);
     if(!fb){delete pat;return nullptr;}
     fb->owner=owner;Py_INCREF(owner);fb->field=portable_strdup(simple.c_str());fb->pattern=pat;
@@ -676,6 +909,85 @@ static PyObject* ModDict_has_index(ModDictObject* s,PyObject* args){
     return PyBool_FromLong(wc?s->internal->has_index(pat):s->internal->has_index(simple));
 }
 
+/* Links */
+static bool parse_on_delete(const char* s, LinkOnDelete& out) {
+    if(!strcmp(s,"restrict")){out=LinkOnDelete::RESTRICT;return true;}
+    if(!strcmp(s,"cascade")) {out=LinkOnDelete::CASCADE; return true;}
+    if(!strcmp(s,"set_null")){out=LinkOnDelete::SET_NULL;return true;}
+    return false;
+}
+static PyObject* ModDict_link(ModDictObject* s,PyObject* args,PyObject* kw){
+    PyObject *src,*ref; const char* on_del="restrict";
+    static const char* kwl[]={"source_path","references_path","on_delete",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"OO|s",(char**)kwl,&src,&ref,&on_del)) return nullptr;
+    std::string s1,s2; std::vector<std::string> src_pat,ref_pat; bool wc;
+    if(!parse_field_or_pattern(src,s1,src_pat,wc) || !wc){
+        PyErr_SetString(PyExc_ValueError,"link: source_path must be a wildcard path like 'table.?.field'");
+        return nullptr;
+    }
+    if(!parse_field_or_pattern(ref,s2,ref_pat,wc) || !wc){
+        PyErr_SetString(PyExc_ValueError,"link: references_path must be 'table.?' (pk) or 'table.?.field' (non-pk)");
+        return nullptr;
+    }
+    LinkOnDelete mode;
+    if(!parse_on_delete(on_del,mode)){
+        PyErr_SetString(PyExc_ValueError,"link: on_delete must be 'restrict', 'cascade', or 'set_null'");
+        return nullptr;
+    }
+    s->internal->link(src_pat,ref_pat,mode);
+    if(PyErr_Occurred()) return nullptr;
+    Py_RETURN_NONE;
+}
+static PyObject* ModDict_follow(ModDictObject* s,PyObject* args,PyObject* kw){
+    PyObject *src,*keys_seq=nullptr,*values_seq=nullptr;
+    static const char* kwl[]={"source_path","keys","values",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|OO",(char**)kwl,&src,&keys_seq,&values_seq)) return nullptr;
+    if(keys_seq==Py_None) keys_seq=nullptr;
+    if(values_seq==Py_None) values_seq=nullptr;
+    if(keys_seq && values_seq){
+        PyErr_SetString(PyExc_ValueError,"follow: keys and values are mutually exclusive");
+        return nullptr;
+    }
+
+    std::string simple; std::vector<std::string> src_pat; bool wc;
+    if(!parse_field_or_pattern(src,simple,src_pat,wc) || !wc){
+        PyErr_SetString(PyExc_ValueError,"follow: source_path must be a wildcard path like 'table.?.field'");
+        return nullptr;
+    }
+
+    std::vector<uint64_t> key_hashes;
+    if(keys_seq){
+        if(!PySequence_Check(keys_seq)){PyErr_SetString(PyExc_TypeError,"follow: keys must be a sequence");return nullptr;}
+        Py_ssize_t n=PySequence_Size(keys_seq);
+        for(Py_ssize_t i=0;i<n;i++){
+            PyObject* item=PySequence_GetItem(keys_seq,i); if(!item) return nullptr;
+            key_hashes.push_back(content_hash_pyobj(item));
+            Py_DECREF(item);
+        }
+    }
+
+    std::vector<PyObject*> values_vec;  // owned refs, released below
+    if(values_seq){
+        if(!PySequence_Check(values_seq)){PyErr_SetString(PyExc_TypeError,"follow: values must be a sequence");return nullptr;}
+        Py_ssize_t n=PySequence_Size(values_seq);
+        values_vec.reserve((size_t)n);
+        for(Py_ssize_t i=0;i<n;i++){
+            PyObject* item=PySequence_GetItem(values_seq,i);
+            if(!item){ for(PyObject* p:values_vec) Py_DECREF(p); return nullptr; }
+            values_vec.push_back(item);
+        }
+    }
+
+    ModDict* result=s->internal->follow(src_pat,
+        keys_seq?&key_hashes:nullptr,
+        values_seq?&values_vec:nullptr);
+
+    for(PyObject* p:values_vec) Py_DECREF(p);
+
+    if(!result) return nullptr;  // PyErr already set (no such link declared, or table missing)
+    return ModDict_wrap_owned(result);
+}
+
 /* from_dict/from_json */
 static PyObject* ModDict_from_dict(PyObject* cls,PyObject* arg){
     if(!PyDict_Check(arg)){PyErr_SetString(PyExc_TypeError,"argument must be a dict");return nullptr;}
@@ -792,18 +1104,97 @@ static PyObject* resolve_field_path(PyObject* row, const std::string& field) {
     return cur;
 }
 
+// Default result-row key for a select() path with no explicit label: the
+// text after the last "->" (if any), then the text after the last "." in
+// that (space/tab count as "." too, matching the rest of the path syntax).
+// "age.a" -> "a", "score" -> "score", "orders.?.customer_id->name" -> "name".
+static std::string default_select_label(const std::string& raw){
+    size_t start=0;
+    size_t arrow=raw.rfind("->");
+    if(arrow!=std::string::npos) start=arrow+2;
+    size_t dot=std::string::npos;
+    for(size_t i=raw.size(); i-->start; ){
+        char c=raw[i];
+        if(c=='.'||c==' '||c=='\t'){ dot=i; break; }
+    }
+    return dot==std::string::npos ? raw.substr(start) : raw.substr(dot+1);
+}
 static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     PyObject* fo; const char* ret="rows";
     static const char* kwl[]={"fields","returns",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"O|s",const_cast<char**>(kwl),&fo,&ret)) return nullptr;
-    if(!PyList_Check(fo)) MOD_DICT_RAISE(PyExc_TypeError,"fields must be a list of strings");
-    std::vector<std::string> fields; Py_ssize_t n=PyList_Size(fo); fields.reserve((size_t)n);
-    for(Py_ssize_t i=0;i<n;i++){PyObject* it=PyList_GET_ITEM(fo,i);if(!PyUnicode_Check(it))MOD_DICT_RAISE(PyExc_TypeError,"fields must be a list of strings");fields.emplace_back(PyUnicode_AsUTF8(it));}
-    ModDict* result=s->internal->select(fields); MOD_DICT_CHECK_ALLOC(result);
+
+    // fields is either a list of paths (result keyed by each path's default
+    // last-segment label — collision raises) or a {label: path} dict (result
+    // keyed by the given labels, collision-free by construction).
+    std::vector<std::string> paths, labels;
+    if(PyDict_Check(fo)){
+        Py_ssize_t n=PyDict_Size(fo);
+        paths.reserve((size_t)n); labels.reserve((size_t)n);
+        PyObject *k,*v; Py_ssize_t pos=0;
+        while(PyDict_Next(fo,&pos,&k,&v)){
+            if(!PyUnicode_Check(k)||!PyUnicode_Check(v)) MOD_DICT_RAISE(PyExc_TypeError,
+                "select: dict form must be {label: path}, both strings");
+            labels.emplace_back(PyUnicode_AsUTF8(k));
+            paths.emplace_back(PyUnicode_AsUTF8(v));
+        }
+    } else if(PyList_Check(fo)){
+        Py_ssize_t n=PyList_Size(fo); paths.reserve((size_t)n); labels.reserve((size_t)n);
+        for(Py_ssize_t i=0;i<n;i++){
+            PyObject* it=PyList_GET_ITEM(fo,i);
+            if(!PyUnicode_Check(it)) MOD_DICT_RAISE(PyExc_TypeError,"select: fields must be a list of strings");
+            paths.emplace_back(PyUnicode_AsUTF8(it));
+        }
+        for(auto& p:paths) labels.push_back(default_select_label(p));
+        for(size_t i=0;i<labels.size();i++) for(size_t j=i+1;j<labels.size();j++)
+            if(labels[i]==labels[j]) MOD_DICT_RAISE_FMT(PyExc_ValueError,
+                "select: \"%s\" and \"%s\" both default to the result key \"%s\" - "
+                "use the {label: path} dict form to disambiguate",
+                paths[i].c_str(), paths[j].c_str(), labels[i].c_str());
+    } else {
+        MOD_DICT_RAISE(PyExc_TypeError,"select: fields must be a list of paths or a {label: path} dict");
+    }
+
+    // Detect wildcard/anchored paths ("orders.?.customer_id", optionally with
+    // a "->" hop). If any path is wildcard-shaped, all must be — they're
+    // scanned together off one shared anchor table, row by row.
+    bool any_wc=false, all_wc=true;
+    for(auto& f:paths){
+        bool wc=(f.find("->")!=std::string::npos);
+        if(!wc && (f.find('.')!=std::string::npos || f=="?")){
+            for(auto& seg:split_dot_chunk(f)) if(seg=="__pass_key__"){ wc=true; break; }
+        }
+        any_wc=any_wc||wc; all_wc=all_wc&&wc;
+    }
+    if(any_wc && !all_wc) MOD_DICT_RAISE(PyExc_ValueError,
+        "select: cannot mix wildcard paths (e.g. \"orders.?.customer_id\") with plain paths in one call");
+
+    ModDict* result;
+    if(any_wc){
+        std::vector<std::vector<std::string>> patterns; patterns.reserve(paths.size());
+        for(auto& f:paths){
+            std::vector<std::string> pat;
+            if(f.find("->")!=std::string::npos){
+                if(!parse_link_pattern(f,pat)) return nullptr;  // PyErr already set
+            } else {
+                pat=split_dot_chunk(f);
+            }
+            if(pat.size()<2 || pat[1]!="__pass_key__") MOD_DICT_RAISE(PyExc_ValueError,
+                "select: wildcard paths must be a table-anchored path like \"table.?.field\"");
+            patterns.push_back(std::move(pat));
+        }
+        result=s->internal->select_anchored(patterns,labels);
+    } else {
+        result=s->internal->select(paths,labels);
+    }
+    // A null result can carry a specific error (e.g. "->" hop with no
+    // declared link, mixed anchors) rather than allocation failure — don't
+    // clobber it with a generic MemoryError via MOD_DICT_CHECK_ALLOC.
+    if(!result) return nullptr;
     if(strcmp(ret,"values")==0){
         // Columnar: one flat list per requested field, values in row order.
         // N fields -> a list of N lists (not a list of projected dicts).
-        Py_ssize_t n_fields=(Py_ssize_t)fields.size();
+        Py_ssize_t n_fields=(Py_ssize_t)labels.size();
         PyObject* cols=PyList_New(n_fields);
         if(!cols){ delete result; return nullptr; }
         for(Py_ssize_t i=0;i<n_fields;i++){
@@ -816,7 +1207,7 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
             if(!e || !e->val_py) continue;
             for(Py_ssize_t i=0;i<n_fields;i++){
                 PyObject* col=PyList_GET_ITEM(cols,i);
-                PyObject* v=PyDict_GetItemString(e->val_py,fields[i].c_str());
+                PyObject* v=PyDict_GetItemString(e->val_py,labels[i].c_str());
                 if(!v) v=Py_None;
                 Py_INCREF(v);
                 PyList_Append(col,v);
@@ -881,6 +1272,7 @@ static PyObject* ModDict_reindex(ModDictObject* s, PyObject* args) {
     PyObject* key;
     if (!PyArg_ParseTuple(args,"O",&key)) return nullptr;
     s->internal->reindex_row(content_hash_pyobj(key));
+    if (PyErr_Occurred()) return nullptr;  // reindex_row may raise (link validation)
     Py_RETURN_NONE;
 }
 
@@ -964,6 +1356,10 @@ static PyMethodDef ModDict_methods[]={
     {"create_index",(PyCFunction)ModDict_create_index,METH_VARARGS,"create_index(field)->None"},
     {"drop_index",(PyCFunction)ModDict_drop_index,METH_VARARGS,"drop_index(field)->None"},
     {"has_index",(PyCFunction)ModDict_has_index,METH_VARARGS,"has_index(field)->bool"},
+    {"link",(PyCFunction)(PyCFunctionWithKeywords)ModDict_link,METH_VARARGS|METH_KEYWORDS,
+     "link(source_path,references_path,on_delete='restrict')->None — declare a relationship"},
+    {"follow",(PyCFunction)(PyCFunctionWithKeywords)ModDict_follow,METH_VARARGS|METH_KEYWORDS,
+     "follow(source_path,keys=None,values=None)->ModDict — traverse a declared link"},
     {"sort_by",(PyCFunction)ModDict_sort_by,METH_VARARGS|METH_KEYWORDS,"sort_by(field,reverse=False,returns='rows',inplace=False)->list|None"},
     {"select",(PyCFunction)ModDict_select,METH_VARARGS|METH_KEYWORDS,"select(fields,returns='rows')->ModDict|list"},
     {"group_by",(PyCFunction)ModDict_group_by,METH_VARARGS,"group_by(field)->dict"},

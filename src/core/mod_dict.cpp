@@ -10,6 +10,12 @@
 #include <sstream>
 #include <unordered_map>
 
+// Forward decls — defined later in this file, needed by reindex_row() above
+// their definition (links validation runs on every reindex, not just link()).
+static std::string pattern_key(const std::vector<std::string>& pattern);
+static const OuterEntry* resolve_table(const ModDict* self, const std::string& seg, uint64_t& out_hash);
+static bool validate_link(ModDict* self, const LinkDecl& ld);
+
 // ── Utilities ────────────────────────────────────────────────────────────────
 
 static std::vector<std::string> split_path_sep(const std::string& s) {
@@ -243,13 +249,39 @@ PyObject* ModDict::get_subrow(uint64_t oh, const std::string& prefix) const {
 
 // ── Reindex one row (after in-place field write via RowProxy) ────────────────
 
-void ModDict::reindex_row(uint64_t oh) {
+void ModDict::reindex_row_no_validate(uint64_t oh) {
     // if accessed via alias, reindex the original key so the index stays correct
-    OuterEntry* e = outer.find(oh);
     if (const uint64_t* orig = alias_to_orig.find(oh)) oh = *orig;
     for (auto& fi : indices.by_field.occupied()) {
         fi.value->remove_outer_key(oh);
         fi.value->on_insert_row(oh, this);
+    }
+}
+
+void ModDict::reindex_row(uint64_t oh) {
+    // if accessed via alias, reindex the original key so the index stays correct
+    if (const uint64_t* orig = alias_to_orig.find(oh)) oh = *orig;
+    reindex_row_no_validate(oh);
+
+    // If this row is a declared link's SOURCE table, re-validate it now —
+    // catches a dangling reference introduced by whatever write triggered
+    // this reindex (new row, changed field), not just at link() declaration
+    // time. Raises on the first bad reference found (PyErr set); the write
+    // itself already happened (no rollback — same as any Python exception
+    // raised after a successful dict mutation elsewhere in this codebase).
+    if (!links.empty()) {
+        const OuterEntry* te = outer.find(oh);
+        if (te && te->key_py && PyUnicode_Check(te->key_py)) {
+            const char* table = PyUnicode_AsUTF8(te->key_py);
+            if (table) {
+                std::string table_s(table);
+                for (auto& ld : links) {
+                    if (ld.source_pattern[0] == table_s && !validate_link(this, ld)) return;
+                }
+            } else {
+                PyErr_Clear();
+            }
+        }
     }
 }
 
@@ -355,13 +387,64 @@ static void filter_add_pruned_row(ModDict* result, const ModDict* src, uint64_t 
     result->order.push_back(oh);
 }
 
+// ── "->" link-hop resolution (shared by prune_match and select_anchored) ─────
+
+enum class LinkHopResult { OK, NO_MATCH, NO_LINK };
+
+// Resolves one "->" hop: fk_val is the value just read from `field` on a row
+// of `current_table`. Looks up the link declared for exactly
+// {current_table, "?", field} and, if found, resolves fk_val against its
+// target (pk or non-pk, mirroring follow()'s own resolution). NO_LINK if no
+// such link was declared — caller should raise. NO_MATCH if fk_val is
+// None/missing/dangling — never an error, same nullable-FK semantics as
+// everywhere else in the links feature. On OK, *out_ld/*out_target_row are
+// borrowed (target_row lives in the table dict, ld lives in self->links).
+static LinkHopResult resolve_link_hop(const ModDict* self, const std::string& current_table,
+                                       const std::string& field, PyObject* fk_val,
+                                       const LinkDecl** out_ld, PyObject** out_target_row)
+{
+    std::vector<std::string> source_pattern{current_table, "__pass_key__", field};
+    const LinkDecl* ld = self->find_link(source_pattern);
+    if (!ld) return LinkHopResult::NO_LINK;
+    *out_ld = ld;
+    if (!fk_val || fk_val == Py_None) return LinkHopResult::NO_MATCH;
+
+    uint64_t target_anchor_hash = 0;
+    const OuterEntry* target_anchor = resolve_table(self, ld->references_pattern[0], target_anchor_hash);
+    if (!target_anchor || !PyDict_Check(target_anchor->val_py)) return LinkHopResult::NO_MATCH;
+
+    bool target_is_pk = (ld->references_pattern.size() == 2);
+    PyObject* target_row = nullptr;
+    if (target_is_pk) {
+        target_row = PyDict_GetItem(target_anchor->val_py, fk_val);
+    } else {
+        auto* p = self->indices.by_field.find(pattern_key(ld->references_pattern));
+        FieldIndex* target_field_idx = p ? *p : nullptr;
+        auto* leaf = target_field_idx ? target_field_idx->find_wildcard_leaf_eq(content_hash_pyobj(fk_val)) : nullptr;
+        if (leaf) {
+            for (auto& m : *leaf) {
+                if (m.second.empty()) continue;
+                target_row = PyDict_GetItem(target_anchor->val_py, m.second[0]);
+                if (target_row) break;
+            }
+        }
+    }
+    if (!target_row) return LinkHopResult::NO_MATCH;
+    *out_target_row = target_row;
+    return LinkHopResult::OK;
+}
+
 // Returns:
 //   nullptr  — no match
 //   Py_True  — matched, caller should use full original row (terminal ? or simple field)
 //   new dict — matched, pruned to only matching inner entries (caller owns ref)
+// `self`/`current_table` are only used when a "__follow_link__" hop is hit —
+// current_table is the table `cur` belongs to right now, updated to the hop's
+// target table after a successful jump (see the jump_next branch below).
 static PyObject* prune_match(PyObject* cur,
                               const std::vector<std::string>& pat, size_t depth,
-                              FilterOp op, const ModValue& val)
+                              FilterOp op, const ModValue& val,
+                              const ModDict* self, const std::string& current_table)
 {
     if (!cur || depth >= pat.size()) return nullptr;
     bool last = (depth == pat.size() - 1);
@@ -383,7 +466,7 @@ static PyObject* prune_match(PyObject* cur,
             if (!pruned) return nullptr;
             PyObject *k, *v; Py_ssize_t pos = 0;
             while (PyDict_Next(cur, &pos, &k, &v)) {
-                PyObject* sub = prune_match(v, pat, depth + 1, op, val);
+                PyObject* sub = prune_match(v, pat, depth + 1, op, val, self, current_table);
                 if (!sub) continue;
                 if (sub == Py_True) {
                     PyDict_SetItem(pruned, k, v);
@@ -400,11 +483,27 @@ static PyObject* prune_match(PyObject* cur,
         if (!PyDict_Check(cur)) return nullptr;
         PyObject* child = PyDict_GetItemString(cur, pat[depth].c_str());
         if (!child) return nullptr;
+        bool jump_next = (depth + 1 < pat.size() && pat[depth + 1] == "__follow_link__");
         if (last) {
             ModValue fv = ModValue::from_pyobject(child);
             return compare_values(fv, op, val) ? Py_True : nullptr;
+        } else if (jump_next) {
+            // `child` is an FK value (not a nested dict) — resolve the "->" hop
+            // and continue matching on the target row. Propagate the target's
+            // result AS-IS (Py_True/nullptr), never wrapped under this field's
+            // key: a "...field->..." hop collapses to a single yes/no about the
+            // ORIGINAL row, same as an ordinary terminal-field match.
+            const LinkDecl* ld = nullptr; PyObject* target_row = nullptr;
+            LinkHopResult res = resolve_link_hop(self, current_table, pat[depth], child, &ld, &target_row);
+            if (res == LinkHopResult::NO_LINK) {
+                PyErr_SetString(PyExc_ValueError,
+                    "filter: no link declared for this source_path - call mn.link() first");
+                return nullptr;
+            }
+            if (res == LinkHopResult::NO_MATCH) return nullptr;
+            return prune_match(target_row, pat, depth + 2, op, val, self, ld->references_pattern[0]);
         } else {
-            PyObject* sub = prune_match(child, pat, depth + 1, op, val);
+            PyObject* sub = prune_match(child, pat, depth + 1, op, val, self, current_table);
             if (!sub) return nullptr;
             if (sub == Py_True) return Py_True;
             // sub is pruned version of child — wrap in {literal_key: sub}
@@ -526,6 +625,27 @@ static void add_pruned_from_leaf(ModDict* result, const ModDict* self,
 }
 
 ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, const ModValue& value) const {
+    // "->" hop(s) present — dispatch away from the ordinary single-table
+    // engine entirely (never builds/touches a FieldIndex over a pattern
+    // containing the "__follow_link__" sentinel). EQ gets an index-chain-join
+    // fast path; every other op falls back to a per-anchor-row linear scan
+    // via the link-aware prune_match.
+    if (std::find(pattern.begin(), pattern.end(), "__follow_link__") != pattern.end()) {
+        if (op == FilterOp::EQ) return filter_linked_eq(pattern, value);
+        ModDict* result = new ModDict();
+        uint64_t anchor_hash = 0;
+        const OuterEntry* anchor_entry = resolve_table(this, pattern[0], anchor_hash);
+        if (!anchor_entry || !PyDict_Check(anchor_entry->val_py)) return result;
+        PyObject* pruned = prune_match(anchor_entry->val_py, pattern, 1, op, value, this, pattern[0]);
+        if (pruned) {
+            if (pruned == Py_True) filter_add_row(result, this, anchor_hash);
+            else { filter_add_pruned_row(result, this, anchor_hash, pruned); Py_DECREF(pruned); }
+        } else if (PyErr_Occurred()) {
+            delete result; return nullptr;
+        }
+        return result;
+    }
+
     std::string key;
     for (size_t i = 0; i < pattern.size(); i++) { if (i) key += '\x01'; key += pattern[i]; }
 
@@ -552,7 +672,10 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
 
     // Helper: run prune_match and add result to result ModDict
     auto add_pruned = [&](uint64_t oh, PyObject* val_py, size_t start_depth) {
-        PyObject* pruned = prune_match(val_py, pattern, start_depth, op, value);
+        // self/current_table only matter if `pattern` contains "__follow_link__",
+        // which can't happen here (that shape is handled entirely by the
+        // early-return branch above, before this lambda is ever built).
+        PyObject* pruned = prune_match(val_py, pattern, start_depth, op, value, this, pattern.empty()?std::string():pattern[0]);
         if (!pruned) return;
         if (pruned == Py_True) {
             filter_add_row(result, this, oh);
@@ -628,11 +751,11 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
 
 // ── select ───────────────────────────────────────────────────────────────────
 
-ModDict* ModDict::select(const std::vector<std::string>& fields) const {
+ModDict* ModDict::select(const std::vector<std::string>& paths, const std::vector<std::string>& labels) const {
     // Pre-split all field paths once
-    std::vector<std::vector<std::string>> paths;
-    paths.reserve(fields.size());
-    for (const auto& f : fields) paths.push_back(split_path(f));
+    std::vector<std::vector<std::string>> split_paths;
+    split_paths.reserve(paths.size());
+    for (const auto& f : paths) split_paths.push_back(split_path(f));
 
     ModDict* result = new ModDict();
 
@@ -652,16 +775,96 @@ ModDict* ModDict::select(const std::vector<std::string>& fields) const {
         PyObject* new_row = PyDict_New();
         if (!new_row) { delete result; return nullptr; }
         bool has_any = false;
-        for (size_t i = 0; i < fields.size(); i++) {
+        for (size_t i = 0; i < paths.size(); i++) {
             std::vector<const char*> segs;
-            for (const auto& s : paths[i]) segs.push_back(s.c_str());
+            for (const auto& s : split_paths[i]) segs.push_back(s.c_str());
             PyObject* fv = get_nested_segs(e.val_py, segs);
-            if (fv) { PyDict_SetItemString(new_row, fields[i].c_str(), fv); has_any = true; }
+            if (fv) { PyDict_SetItemString(new_row, labels[i].c_str(), fv); has_any = true; }
         }
         if (has_any) {
             Py_XINCREF(e.key_py);
             result->outer.insert(oh, {e.key_py, new_row, true});
             result->order.push_back(oh);
+        } else {
+            Py_DECREF(new_row);
+        }
+    }
+    return result;
+}
+
+// Like get_nested_segs, but understands "->" hops: on reaching a literal
+// segment immediately followed by "__follow_link__", resolves it as an FK via
+// resolve_link_hop() and continues on the target row instead of navigating
+// into `cur` as a nested dict. Returns a borrowed value, or nullptr (no PyErr)
+// on a missing/nullable/dangling path — same as get_nested_segs — or nullptr
+// with PyErr set if a hop's link was never declared.
+static PyObject* get_nested_via_links(const ModDict* self, PyObject* cur,
+                                       const std::vector<std::string>& pat, size_t depth,
+                                       std::string current_table)
+{
+    for (; depth < pat.size(); depth++) {
+        if (!cur || !PyDict_Check(cur)) return nullptr;
+        PyObject* child = PyDict_GetItemString(cur, pat[depth].c_str());
+        if (!child) return nullptr;
+        if (depth + 1 < pat.size() && pat[depth + 1] == "__follow_link__") {
+            const LinkDecl* ld = nullptr; PyObject* target_row = nullptr;
+            LinkHopResult res = resolve_link_hop(self, current_table, pat[depth], child, &ld, &target_row);
+            if (res == LinkHopResult::NO_LINK) {
+                PyErr_SetString(PyExc_ValueError, "select: no link declared for this source_path - call mn.link() first");
+                return nullptr;
+            }
+            if (res == LinkHopResult::NO_MATCH) return nullptr;
+            cur = target_row;
+            current_table = ld->references_pattern[0];
+            depth++;  // loop's own ++ then skips past the "__follow_link__" marker too
+            continue;
+        }
+        cur = child;
+    }
+    return cur;
+}
+
+// ── select_anchored ─────────────────────────────────────────────────────────
+// One or more patterns of shape [table, "?", ...], all sharing the same
+// anchor table, optionally containing "->" hops. Unlike select()'s flat mode
+// (which projects every outer entry of `this`), this scans ONE specific
+// anchor table's rows and projects each into a flat result keyed by that
+// row's own key — select()'s first-ever wildcard/anchor support.
+ModDict* ModDict::select_anchored(const std::vector<std::vector<std::string>>& patterns,
+                                   const std::vector<std::string>& field_labels) const
+{
+    ModDict* result = new ModDict();
+    if (patterns.empty()) return result;
+
+    const std::string& anchor_table = patterns[0][0];
+    for (auto& p : patterns) {
+        if (p[0] != anchor_table) {
+            PyErr_SetString(PyExc_ValueError,
+                "select: all wildcard fields must share the same anchor table");
+            delete result; return nullptr;
+        }
+    }
+
+    uint64_t anchor_hash = 0;
+    const OuterEntry* anchor_entry = resolve_table(this, anchor_table, anchor_hash);
+    if (!anchor_entry || !PyDict_Check(anchor_entry->val_py)) return result;
+
+    PyObject *pk, *row; Py_ssize_t pos = 0;
+    while (PyDict_Next(anchor_entry->val_py, &pos, &pk, &row)) {
+        if (!PyDict_Check(row)) continue;
+        PyObject* new_row = PyDict_New();
+        if (!new_row) { delete result; return nullptr; }
+        bool has_any = false;
+        for (size_t i = 0; i < patterns.size(); i++) {
+            PyObject* fv = get_nested_via_links(this, row, patterns[i], 2, anchor_table);
+            if (PyErr_Occurred()) { Py_DECREF(new_row); delete result; return nullptr; }
+            if (fv) { PyDict_SetItemString(new_row, field_labels[i].c_str(), fv); has_any = true; }
+        }
+        if (has_any) {
+            Py_INCREF(pk);
+            uint64_t rh = content_hash_pyobj(pk);
+            result->outer.insert(rh, {pk, new_row, true});
+            result->order.push_back(rh);
         } else {
             Py_DECREF(new_row);
         }
@@ -1166,6 +1369,365 @@ bool ModDict::has_index(const std::string& field_name) const {
 
 bool ModDict::has_index(const std::vector<std::string>& pattern) const {
     return indices.by_field.find(pattern_key(pattern)) != nullptr;
+}
+
+// ── Links ────────────────────────────────────────────────────────────────────
+// v1 scope: source_pattern = [table, "__pass_key__", field] exactly.
+// references_pattern = [table, "__pass_key__"] (pk) or [table, "__pass_key__", field] (non-pk).
+
+const LinkDecl* ModDict::find_link(const std::vector<std::string>& source_pattern) const {
+    for (auto& l : links) if (l.source_pattern == source_pattern) return &l;
+    return nullptr;
+}
+
+// Resolves outer.find(hash of literal string seg) — used for the table/anchor
+// segment of a link path (always segment 0, always a literal table name).
+static const OuterEntry* resolve_table(const ModDict* self, const std::string& seg, uint64_t& out_hash) {
+    PyObject* tmp = PyUnicode_FromStringAndSize(seg.c_str(), seg.size());
+    if (!tmp) { PyErr_Clear(); return nullptr; }
+    out_hash = content_hash_pyobj(tmp);
+    Py_DECREF(tmp);
+    const OuterEntry* e = self->outer.find(out_hash);
+    return (e && e->val_py && e->is_row) ? e : nullptr;
+}
+
+// Validates that every current row matching ld.source_pattern resolves to a
+// real row in ld.references_pattern's target (or is None/absent — a
+// nullable FK, not a dangling reference). Shared by link() (at declaration,
+// against existing data) and reindex_row() (after a write, against the
+// row that just changed). Returns false with PyErr set on the first
+// dangling reference found; true if everything currently resolves.
+static bool validate_link(ModDict* self, const LinkDecl& ld) {
+    bool target_is_pk = (ld.references_pattern.size() == 2);
+
+    uint64_t target_anchor_hash = 0;
+    const OuterEntry* target_anchor = resolve_table(self, ld.references_pattern[0], target_anchor_hash);
+    if (!target_anchor || !PyDict_Check(target_anchor->val_py)) {
+        PyErr_SetString(PyExc_ValueError, "link: references table not found (or not a table-shaped row)");
+        return false;
+    }
+
+    FieldIndex* target_field_idx = nullptr;
+    if (!target_is_pk) {
+        self->create_index(ld.references_pattern);
+        auto* p = self->indices.by_field.find(pattern_key(ld.references_pattern));
+        target_field_idx = p ? *p : nullptr;
+    }
+
+    uint64_t source_anchor_hash = 0;
+    const OuterEntry* source_anchor = resolve_table(self, ld.source_pattern[0], source_anchor_hash);
+    if (!source_anchor || !PyDict_Check(source_anchor->val_py)) {
+        PyErr_SetString(PyExc_ValueError, "link: source table not found (or not a table-shaped row)");
+        return false;
+    }
+
+    PyObject *pk, *row; Py_ssize_t pos = 0;
+    while (PyDict_Next(source_anchor->val_py, &pos, &pk, &row)) {
+        if (!PyDict_Check(row)) continue;
+        PyObject* val = PyDict_GetItemString(row, ld.source_pattern[2].c_str());
+        if (!val || val == Py_None) continue;  // absent/None -> not a reference, skip
+
+        bool resolves;
+        if (target_is_pk) {
+            resolves = PyDict_GetItem(target_anchor->val_py, val) != nullptr;
+        } else {
+            uint64_t vh = content_hash_pyobj(val);
+            resolves = target_field_idx && target_field_idx->find_eq(vh) != nullptr;
+        }
+        if (!resolves) {
+            PyErr_Format(PyExc_ValueError,
+                "link: dangling reference - %R.%s = %R does not resolve to any row in '%s'",
+                pk, ld.source_pattern[2].c_str(), val, ld.references_pattern[0].c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+void ModDict::link(const std::vector<std::string>& source_pattern,
+                    const std::vector<std::string>& references_pattern,
+                    LinkOnDelete on_delete)
+{
+    if (source_pattern.size() != 3 || source_pattern[1] != "__pass_key__") {
+        PyErr_SetString(PyExc_ValueError,
+            "link: source_path must be exactly 'table.?.field' (anchor, one wildcard, one field)");
+        return;
+    }
+    if (!((references_pattern.size() == 2 && references_pattern[1] == "__pass_key__") ||
+          (references_pattern.size() == 3 && references_pattern[1] == "__pass_key__"
+           && references_pattern[2] != "__pass_key__"))) {
+        PyErr_SetString(PyExc_ValueError,
+            "link: references_path must be 'table.?' (pk) or 'table.?.field' (non-pk)");
+        return;
+    }
+
+    if (find_link(source_pattern)) return;  // identical link already declared — no-op
+
+    LinkDecl ld{source_pattern, references_pattern, on_delete};
+    if (!validate_link(this, ld)) return;  // PyErr already set
+
+    create_index(source_pattern);  // build reverse-lookup structures for follow()/cascade
+    links.push_back(std::move(ld));
+}
+
+ModDict* ModDict::follow(const std::vector<std::string>& source_pattern,
+                          const std::vector<uint64_t>* key_filter,
+                          const std::vector<PyObject*>* value_filter) const
+{
+    const LinkDecl* ld = find_link(source_pattern);
+    if (!ld) {
+        PyErr_SetString(PyExc_ValueError, "follow: no link declared for this source_path — call mn.link() first");
+        return nullptr;
+    }
+
+    uint64_t target_anchor_hash = 0;
+    const OuterEntry* target_anchor = resolve_table(this, ld->references_pattern[0], target_anchor_hash);
+    if (!target_anchor || !PyDict_Check(target_anchor->val_py)) {
+        PyErr_SetString(PyExc_ValueError, "follow: references table not found");
+        return nullptr;
+    }
+    bool target_is_pk = (ld->references_pattern.size() == 2);
+
+    FieldIndex* target_field_idx = nullptr;
+    if (!target_is_pk) {
+        auto* p = indices.by_field.find(pattern_key(ld->references_pattern));
+        target_field_idx = p ? *p : nullptr;
+    }
+
+    ModDict* result = new ModDict();
+
+    auto add_target_row = [&](PyObject* key, PyObject* row) {
+        uint64_t rh = content_hash_pyobj(key);
+        if (result->outer.find(rh)) return;  // dedup: multiple sources may resolve to the same target row
+        Py_INCREF(key); Py_INCREF(row);
+        result->outer.insert(rh, {key, row, true});
+        result->order.push_back(rh);
+    };
+
+    auto resolve_value = [&](PyObject* val) {
+        if (!val || val == Py_None) return;  // nullable FK — no match, not an error
+        if (target_is_pk) {
+            PyObject* target_row = PyDict_GetItem(target_anchor->val_py, val);
+            if (target_row) add_target_row(val, target_row);
+        } else {
+            auto* leaf = target_field_idx ? target_field_idx->find_wildcard_leaf_eq(content_hash_pyobj(val)) : nullptr;
+            if (!leaf) return;
+            for (auto& m : *leaf) {
+                if (m.second.empty()) continue;
+                PyObject* target_pk = m.second[0];
+                PyObject* target_row = PyDict_GetItem(target_anchor->val_py, target_pk);
+                if (target_row) add_target_row(target_pk, target_row);
+            }
+        }
+    };
+
+    if (value_filter) {
+        // Bypass the source table entirely — resolve given values directly.
+        for (PyObject* v : *value_filter) resolve_value(v);
+        return result;
+    }
+
+    uint64_t source_anchor_hash = 0;
+    const OuterEntry* source_anchor = resolve_table(this, source_pattern[0], source_anchor_hash);
+    if (!source_anchor || !PyDict_Check(source_anchor->val_py)) {
+        PyErr_SetString(PyExc_ValueError, "follow: source table not found");
+        return nullptr;
+    }
+
+    PyObject *pk, *row; Py_ssize_t pos = 0;
+    while (PyDict_Next(source_anchor->val_py, &pos, &pk, &row)) {
+        if (!PyDict_Check(row)) continue;
+        if (key_filter) {
+            uint64_t kh = content_hash_pyobj(pk);
+            if (std::find(key_filter->begin(), key_filter->end(), kh) == key_filter->end()) continue;
+        }
+        resolve_value(PyDict_GetItemString(row, source_pattern[2].c_str()));
+    }
+    return result;
+}
+
+// ── "->" EQ fast path ───────────────────────────────────────────────────────
+// Chains FieldIndex::find_wildcard_leaf_eq lookups across each hop's already-
+// built index — the source-side index every link() call builds, and the
+// target-side index built lazily like any other wildcard filter — instead of
+// scanning rows. Never touches field_index.cpp: every index it reads is an
+// ordinary [table,"?",...] wildcard index, nothing "->"-aware about it.
+ModDict* ModDict::filter_linked_eq(const std::vector<std::string>& pattern, const ModValue& value) const {
+    // Split on "__follow_link__" into hop groups: groups[0] is hop 1's full
+    // source pattern [T0,"?",F0]; groups[1..n-2] are single-field FK names for
+    // subsequent hops; groups.back() is the final comparison path.
+    std::vector<std::vector<std::string>> groups;
+    {
+        std::vector<std::string> cur_group;
+        for (auto& seg : pattern) {
+            if (seg == "__follow_link__") { groups.push_back(std::move(cur_group)); cur_group.clear(); }
+            else cur_group.push_back(seg);
+        }
+        groups.push_back(std::move(cur_group));
+    }
+    size_t n_hops = groups.size() - 1;
+    if (groups[0].size() != 3 || groups[0][1] != "__pass_key__") {
+        PyErr_SetString(PyExc_ValueError, "filter: '->' left side must be a wildcard path like \"table.?.field\"");
+        return nullptr;
+    }
+
+    // Left-to-right: resolve each hop's LinkDecl, tracking the table we land on.
+    std::vector<const LinkDecl*> hop_lds;
+    std::string cur_table = groups[0][0];
+    std::vector<std::string> src_pat = groups[0];
+    for (size_t i = 0; i < n_hops; i++) {
+        if (i > 0) {
+            if (groups[i].size() != 1) {
+                PyErr_SetString(PyExc_ValueError, "filter: '->' hop must be a single field name, not a nested path");
+                return nullptr;
+            }
+            src_pat = {cur_table, "__pass_key__", groups[i][0]};
+        }
+        const LinkDecl* ld = find_link(src_pat);
+        if (!ld) {
+            PyErr_SetString(PyExc_ValueError, "filter: no link declared for this source_path - call mn.link() first");
+            return nullptr;
+        }
+        hop_lds.push_back(ld);
+        cur_table = ld->references_pattern[0];
+    }
+
+    // Rightmost condition: index on [cur_table, "?", ...final_group] (built
+    // lazily, same as any ordinary wildcard filter) -> matching PKs in cur_table.
+    std::vector<std::string> final_pattern{cur_table, "__pass_key__"};
+    for (auto& s : groups.back()) final_pattern.push_back(s);
+    std::string final_key = pattern_key(final_pattern);
+    auto* final_idx_ptr = indices.by_field.find(final_key);
+    if (!final_idx_ptr) {
+        const_cast<ModDict*>(this)->create_index(final_pattern);
+        final_idx_ptr = indices.by_field.find(final_key);
+    }
+    FieldIndex* final_idx = final_idx_ptr ? *final_idx_ptr : nullptr;
+    auto* leaf = final_idx ? final_idx->find_wildcard_leaf_eq(value.hash()) : nullptr;
+
+    std::vector<PyObject*> pks;  // current hop's matching PKs (borrowed refs)
+    if (leaf) for (auto& m : *leaf) if (!m.second.empty()) pks.push_back(m.second[0]);
+    if (pks.empty()) return new ModDict();
+
+    // Right-to-left: reverse-resolve through each hop's own source_pattern
+    // index (guaranteed built — link() always calls create_index(source_pattern)).
+    for (size_t i = n_hops; i-- > 0; ) {
+        auto* src_idx_p = indices.by_field.find(pattern_key(hop_lds[i]->source_pattern));
+        FieldIndex* src_idx = src_idx_p ? *src_idx_p : nullptr;
+        std::vector<PyObject*> next_pks;
+        std::unordered_map<uint64_t, char> seen;
+        for (PyObject* pk : pks) {
+            auto* rev_leaf = src_idx ? src_idx->find_wildcard_leaf_eq(content_hash_pyobj(pk)) : nullptr;
+            if (!rev_leaf) continue;
+            for (auto& m : *rev_leaf) {
+                if (m.second.empty()) continue;
+                PyObject* rpk = m.second[0];
+                if (seen.emplace(content_hash_pyobj(rpk), 0).second) next_pks.push_back(rpk);
+            }
+        }
+        pks = std::move(next_pks);
+        if (pks.empty()) return new ModDict();
+    }
+
+    // pks now = matching keys of pattern[0] (the original anchor table).
+    ModDict* result = new ModDict();
+    uint64_t t0_hash = 0;
+    const OuterEntry* t0_anchor = resolve_table(this, pattern[0], t0_hash);
+    if (!t0_anchor || !PyDict_Check(t0_anchor->val_py)) return result;
+    PyObject* pruned = PyDict_New();
+    if (!pruned) { delete result; return nullptr; }
+    for (PyObject* pk : pks) {
+        PyObject* row = PyDict_GetItem(t0_anchor->val_py, pk);
+        if (row) PyDict_SetItem(pruned, pk, row);
+    }
+    if (PyDict_Size(pruned) == 0) { Py_DECREF(pruned); return result; }
+    Py_INCREF(t0_anchor->key_py);
+    result->outer.insert(t0_hash, {t0_anchor->key_py, pruned, true});
+    result->order.push_back(t0_hash);
+    return result;
+}
+
+bool ModDict::delete_with_link_semantics(const std::string& table, PyObject* key) {
+    uint64_t table_hash = 0;
+    const OuterEntry* table_anchor = resolve_table(this, table, table_hash);
+    if (!table_anchor || !PyDict_Check(table_anchor->val_py)) {
+        PyErr_SetString(PyExc_KeyError, "table not found");
+        return false;
+    }
+    PyObject* row_being_deleted = PyDict_GetItem(table_anchor->val_py, key);  // borrowed, valid pre-delete
+
+    // Precompute, for every link targeting this table, the value referencing
+    // rows would match against (the key itself for pk-based, or a field read
+    // from the row NOW, before it's gone, for non-pk), and look up who
+    // currently references that value.
+    struct Pending {
+        const LinkDecl* ld;
+        const std::vector<std::pair<uint64_t,std::vector<PyObject*>>>* leaf;
+    };
+    std::vector<Pending> pending;
+    for (auto& ld : links) {
+        if (ld.references_pattern[0] != table) continue;
+        bool target_is_pk = (ld.references_pattern.size() == 2);
+        PyObject* match_value = key;
+        if (!target_is_pk) {
+            if (!row_being_deleted || !PyDict_Check(row_being_deleted)) continue;
+            match_value = PyDict_GetItemString(row_being_deleted, ld.references_pattern[2].c_str());
+            if (!match_value) continue;
+        }
+        auto* src_idx_p = indices.by_field.find(pattern_key(ld.source_pattern));
+        FieldIndex* src_idx = src_idx_p ? *src_idx_p : nullptr;
+        auto* leaf = src_idx ? src_idx->find_wildcard_leaf_eq(content_hash_pyobj(match_value)) : nullptr;
+        pending.push_back({&ld, leaf});
+    }
+
+    // restrict — refuse before mutating anything.
+    for (auto& p : pending) {
+        if (p.ld->on_delete == LinkOnDelete::RESTRICT && p.leaf && !p.leaf->empty()) {
+            PyErr_Format(PyExc_ValueError,
+                "link: cannot delete key from '%s' - still referenced by %zu row(s) in '%s' (on_delete='restrict')",
+                table.c_str(), p.leaf->size(), p.ld->source_pattern[0].c_str());
+            return false;
+        }
+    }
+
+    // Snapshot referencing pks for cascade/set_null now, while leaf pointers
+    // are still valid (they live in the FieldIndex we're about to reindex).
+    struct Effect { LinkOnDelete mode; std::string src_table; std::string src_field; std::vector<PyObject*> pks; };
+    std::vector<Effect> effects;
+    for (auto& p : pending) {
+        if (p.ld->on_delete == LinkOnDelete::RESTRICT || !p.leaf || p.leaf->empty()) continue;
+        Effect eff{p.ld->on_delete, p.ld->source_pattern[0], p.ld->source_pattern[2], {}};
+        for (auto& m : *p.leaf) if (!m.second.empty()) { Py_INCREF(m.second[0]); eff.pks.push_back(m.second[0]); }
+        effects.push_back(std::move(eff));
+    }
+
+    auto release_effects = [&]() { for (auto& e : effects) for (PyObject* p2 : e.pks) Py_DECREF(p2); };
+
+    // Delete now, THEN reindex — this scrubs `key`'s own contribution to any
+    // index (e.g. if `key` itself references something) before we look up
+    // who referenced `key`, which is what makes cascade cycle-safe below.
+    if (PyDict_DelItem(table_anchor->val_py, key) != 0) { release_effects(); return false; }
+    reindex_row_no_validate(table_hash);
+
+    for (auto& e : effects) {
+        if (e.mode == LinkOnDelete::SET_NULL) {
+            uint64_t sh = 0;
+            const OuterEntry* src_anchor = resolve_table(this, e.src_table, sh);
+            if (src_anchor && PyDict_Check(src_anchor->val_py)) {
+                for (PyObject* rpk : e.pks) {
+                    PyObject* rrow = PyDict_GetItem(src_anchor->val_py, rpk);
+                    if (rrow) PyDict_SetItemString(rrow, e.src_field.c_str(), Py_None);
+                }
+                reindex_row_no_validate(sh);
+            }
+        } else if (e.mode == LinkOnDelete::CASCADE) {
+            for (PyObject* rpk : e.pks) {
+                if (!delete_with_link_semantics(e.src_table, rpk)) { release_effects(); return false; }
+            }
+        }
+    }
+    release_effects();
+    return true;
 }
 
 // ── to_python_dict / dump / to_json ─────────────────────────────────────────

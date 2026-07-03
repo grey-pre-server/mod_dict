@@ -29,6 +29,11 @@ mn.sort_by("meta.details.rank")
 mn.group_by("meta.level")
 mn.select(["meta.details.rank", "score"])
 
+# Links between rows — declare, traverse, JOIN-in-WHERE, ON DELETE
+mn.link("orders.?.customer_id", "customers.?")
+mn.follow("orders.?.customer_id")                # → ModDict of resolved customers
+mn.filter("orders.?.customer_id->name").eq("Alice")  # JOIN in WHERE, chainable ("->name->city")
+
 # Update from another collection
 mn.update(other)                                 # bulk insert (like dict.update)
 mn.update(other, "*", "*")                       # key-to-key merge (only updates existing)
@@ -132,6 +137,10 @@ mn.filter("a.?.age").eq(30).filter("a.?.name").eq("alice")
 mn.filter("age").gte(18, returns="rows_here")                    # → [row, ...]
 mn.filter("age").gte(18, returns="values", value_field="name")   # → [name, ...]
 
+# "->" — JOIN a declared link() mid-path, chainable, index-accelerated on .eq()
+mn.filter("orders.?.customer_id->name").eq("Alice")
+mn.filter("orders.?.customer_id->company_id->name").eq("Acme")   # 2 hops
+
 # Sort / select / group — support dot-notation paths
 mn.sort_by("age", reverse=False, returns="rows")        # default → [row, ...]
 mn.sort_by("age", returns="parent_keys")                # → [key, ...]
@@ -139,11 +148,17 @@ mn.sort_by("age", inplace=True)                         # reorders mn in-place, 
 mn.sort_by("meta.details.rank", returns="values")       # → [val, ...]
 
 
-mn.select(["age", "name"])                              # → new ModDict
+mn.select(["age", "name"])                              # → new ModDict, keyed by each path's last segment
+mn.select({"user_age": "age"})                          # explicit labels — also disambiguates collisions
 mn.select(["age", "meta.level"], returns="values")      # → [[age,...], [meta.level,...]] (columnar)
+mn.select(["orders.?.customer_id->name"])                # wildcard/"->" fields too — {order_pk: {"name": ...}}
 
 mn.group_by("active")                                   # → {value: ModDict, ...}
 mn.group_by("meta.level")
+
+# Links between rows (self-references allowed) — see "Links between rows" below
+mn.link("orders.?.customer_id", "customers.?", on_delete="restrict")  # restrict|cascade|set_null
+mn.follow("orders.?.customer_id")                        # → ModDict of resolved target rows
 
 # Aliases
 mn.alias(key, alias)                     # create alias (1 per key)
@@ -230,6 +245,54 @@ for libraries like Pydantic that require an actual `dict`), and module-level
 a whole `ModDict` — a `ModDict` round-trips back as a `ModDict`, everything
 else as itself. No implicit `ModDict` → `dict` conversion; call `mn.to_dict()`
 first if that's what you want serialized.
+
+## Links between rows
+
+Declare a foreign-key-style relationship between rows in the same `ModDict` —
+including self-references, e.g. an employee hierarchy via `manager_id`:
+
+```python
+mn = md.ModDict({
+    "orders":    {1: {"customer_id": 100}, 2: {"customer_id": 200}},
+    "customers": {100: {"name": "Alice"},  200: {"name": "Bob"}},
+})
+mn.link("orders.?.customer_id", "customers.?")            # pk-based
+mn.link("orders.?.customer_id", "customers.?.email")      # or match by a non-pk field
+
+mn.follow("orders.?.customer_id")                         # → ModDict of resolved customers
+mn.follow("orders.?.customer_id", keys=[1])                # only for order 1
+mn.follow("orders.?.customer_id", values=[100, 200])        # resolve ids directly, no table scan
+
+# ON DELETE — SQL-style, self-reference-safe (a cycle breaks itself on the first delete)
+mn.link("employees.?.manager_id", "employees.?", on_delete="cascade")
+del mn["employees"][1]                                      # cascades to every direct/indirect report
+
+# JOIN in WHERE — "->" resolves a declared link mid-path, chainable across hops
+mn.filter("orders.?.customer_id->name").eq("Alice")         # orders whose customer's name is "Alice"
+mn.filter("orders.?.customer_id->company_id->name").eq("Acme")  # 2 hops
+mn.select(["orders.?.customer_id->name"])                   # {order_pk: {"name": ...}, ...}
+```
+
+`on_delete` is `"restrict"` *(default — refuses if still referenced)*,
+`"cascade"` *(deletes referencing rows too, recursively)*, or `"set_null"`
+*(clears the reference field on referencing rows)*. A `None`/missing FK is
+never a dangling-reference error — same as a nullable SQL foreign key. Both
+`link()` (at declaration, against existing data) and every later write to the
+source table validate references immediately — not just at delete time.
+
+`follow()`'s `keys=` composes multi-hop walks of *unknown* depth (e.g.
+walking a hierarchy to its root) via an explicit Python loop:
+
+```python
+managers      = mn.follow("employees.?.manager_id")                       # 1 hop
+skip_managers = mn.follow("employees.?.manager_id", keys=managers.keys()) # 2 hops
+```
+
+`->`, by contrast, is for a *statically known* number of hops in one
+expression and works inside `filter()`/`select()` directly — `.eq()` is
+index-accelerated (no table scan); `.ne()/.lt()/.between()/.in_()/...` fall
+back to a scan of the anchor table. `returns="rows_here"`/`"values"` aren't
+supported on a `->` path (ambiguous once two tables are involved).
 
 ### Custom type converters
 

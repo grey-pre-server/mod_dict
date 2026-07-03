@@ -11,6 +11,24 @@
 
 enum class MergeConflict { KEEP_LEFT, KEEP_RIGHT, MERGE, CONCAT };
 enum class FilterOp      { EQ, NE, LT, LE, GT, GE };
+enum class LinkOnDelete  { RESTRICT, CASCADE, SET_NULL };
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LinkDecl — a declared relationship between rows within one ModDict.
+//
+// v1 scope (deliberately narrow, see project memory project-link-feature-design):
+//   source_pattern     = [table, "__pass_key__", field]   e.g. "employees.?.manager_id"
+//   references_pattern = [table, "__pass_key__"]          pk-based, e.g. "employees.?"
+//                      or [table, "__pass_key__", field]  non-pk,   e.g. "customers.?.email"
+// Self-reference (source table == target table) is allowed — cycles are safe
+// under CASCADE because deleting a row scrubs its own reverse-index entry
+// before cascade looks up who referenced it (no separate visited-set needed).
+// ──────────────────────────────────────────────────────────────────────────────
+struct LinkDecl {
+    std::vector<std::string> source_pattern;
+    std::vector<std::string> references_pattern;
+    LinkOnDelete on_delete = LinkOnDelete::RESTRICT;
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // OuterEntry — one record in the outer FlatHashMap.
@@ -45,6 +63,8 @@ public:
     struct {
         FlatHashMap<std::string, class FieldIndex*> by_field;
     } indices;
+
+    std::vector<LinkDecl> links;
 
     PyObject* on_change_cb = nullptr;
     PyObject* on_merge_cb  = nullptr;
@@ -93,6 +113,15 @@ public:
     bool remove(const ModValue& key);
     void reindex_row(uint64_t outer_hash);
 
+    // Same field-index rebuild as reindex_row(), but skips the link-validation
+    // pass. Used internally by delete_with_link_semantics() for the reindex
+    // steps that happen BETWEEN cascade steps, where the table is expected to
+    // be transiently inconsistent (a referrer not yet cascade-deleted still
+    // pointing at a just-deleted row) — validating there would reject states
+    // the cascade is already in the middle of fixing. The cascade's own logic
+    // guarantees the table is fully consistent once it returns.
+    void reindex_row_no_validate(uint64_t outer_hash);
+
     // ──────────────────────────────────────────────────
     // Operations
     // ──────────────────────────────────────────────────
@@ -106,10 +135,35 @@ public:
     ModDict* filter(const std::vector<std::string>& pattern,
                     FilterOp op, const ModValue& value) const;
 
+    // EQ-only fast path for a pattern containing one or more "__follow_link__"
+    // hops (e.g. "orders.?.customer_id->name") — chains FieldIndex::
+    // find_wildcard_leaf_eq lookups backwards from the rightmost (compared)
+    // segment through each hop's already-built link index, never falling back
+    // to a per-row scan. Called by filter(pattern,...) when op==EQ and the
+    // pattern contains a hop; ValueError (ptr set) if any hop's link wasn't
+    // declared via link() first.
+    ModDict* filter_linked_eq(const std::vector<std::string>& pattern, const ModValue& value) const;
+
     using SortResult  = std::vector<PyObject*>;
     SortResult sort_by(const std::string& field, bool reverse) const;
 
-    ModDict* select(const std::vector<std::string>& fields) const;
+    // paths[i] is looked up on each row; labels[i] is the key it's stored
+    // under in the result row (result key naming — default "last segment of
+    // the path" vs. explicit user labels — is a binding-layer concern; this
+    // just requires paths.size()==labels.size(), no uniqueness check of its
+    // own — a later paths[i] silently overwrites an earlier one under the
+    // same label, same as any PyDict_SetItemString would).
+    ModDict* select(const std::vector<std::string>& paths, const std::vector<std::string>& labels) const;
+
+    // Anchored/wildcard select — one or more patterns of shape "table.?...",
+    // optionally containing "__follow_link__" hops, all sharing the same
+    // anchor table (segment 0). Result is a FLAT ModDict keyed by each
+    // matched anchor row's own key (same convention as the plain select()
+    // above), one projected {field_labels[i]: value} dict per row — not
+    // filter()'s {table: {...}} nesting. Rows missing every field are
+    // skipped, same as plain select().
+    ModDict* select_anchored(const std::vector<std::vector<std::string>>& patterns,
+                              const std::vector<std::string>& field_labels) const;
 
     using GroupResult = std::vector<std::pair<ModValue, ModDict*>>;
     GroupResult group_by(const std::string& field) const;
@@ -120,6 +174,50 @@ public:
     void drop_index(const std::vector<std::string>& pattern);
     bool has_index(const std::string& field_name) const;
     bool has_index(const std::vector<std::string>& pattern) const;
+
+    // ──────────────────────────────────────────────────
+    // Links (see LinkDecl above)
+    // ──────────────────────────────────────────────────
+
+    // Declares source_pattern -> references_pattern. Validates every existing
+    // match resolves to a real target row (raises ValueError on any dangling
+    // reference — ptr set on error). No-op (silently ignored) if an identical
+    // link is already declared.
+    void link(const std::vector<std::string>& source_pattern,
+              const std::vector<std::string>& references_pattern,
+              LinkOnDelete on_delete = LinkOnDelete::RESTRICT);
+
+    // Finds the declared link matching source_pattern exactly (raises
+    // ValueError if none). Returns a new ModDict of the resolved target rows
+    // for every current match of source_pattern (outer keys = target keys).
+    //
+    // key_filter (optional): only scan source rows whose own key hashes into
+    // one of these — lets a caller chain hops by passing the previous hop's
+    // result keys, e.g. org.follow(path, &prev_result_key_hashes).
+    //
+    // value_filter (optional, mutually exclusive with key_filter): skip
+    // scanning the source table entirely and resolve these values directly
+    // against the target — for values obtained from somewhere other than a
+    // source-table scan (e.g. an external list of ids).
+    ModDict* follow(const std::vector<std::string>& source_pattern,
+                     const std::vector<uint64_t>* key_filter = nullptr,
+                     const std::vector<PyObject*>* value_filter = nullptr) const;
+
+    const LinkDecl* find_link(const std::vector<std::string>& source_pattern) const;
+
+    // Deletes `key` from `table`'s nested row, applying on_delete semantics
+    // for any declared link that targets this table:
+    //   restrict  — refuses (raises ValueError, table left untouched) if any
+    //               row still references `key`.
+    //   cascade   — deletes referencing rows too, recursively. Safe under
+    //               cycles: deletes `key` (and reindexes) BEFORE looking up
+    //               who referenced it, so a cycle's own back-reference is
+    //               already scrubbed by the time recursion would return to
+    //               it — no separate visited-set needed.
+    //   set_null  — clears the reference field on referencing rows.
+    // Returns false (PyErr set) on restrict-refusal or a real Python error;
+    // true if the deletion (and any cascade/set_null side effects) completed.
+    bool delete_with_link_semantics(const std::string& table, PyObject* key);
 
     PyObject* to_python_dict() const;
     std::string to_string() const;

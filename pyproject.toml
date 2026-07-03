@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "mod_dict"
-version = "0.4.5"
+version = "0.5.0"
 description = "Nested dictionary with indexed field queries, merge and serialization"
 readme = "README.md"
 requires-python = ">=3.11"

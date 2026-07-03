@@ -598,6 +598,33 @@ class ModDict:
         as excluded — it matches none of them, rather than being silently
         treated as equal.
 
+        **Link hops ("->")**
+
+        A path can hop across a declared ``link()`` mid-pattern with ``->``
+        — a JOIN-in-WHERE. Each hop's left side must be the *exact* path
+        passed to a prior ``link()`` call; the right side continues reading
+        from the resolved target row, and can itself contain another ``->``
+        for a multi-hop chain (each hop has statically known depth, so this
+        composes — unlike ``follow()``, which needs ``keys=`` for hierarchy
+        walks of *unknown* depth)::
+
+            mn.link("orders.?.customer_id", "customers.?")
+            mn.filter("orders.?.customer_id->name").eq("Alice")
+            # -> {"orders": {pk: row, ...}} for every order whose customer's name is "Alice"
+
+            mn.link("customers.?.company_id", "companies.?")
+            mn.filter("orders.?.customer_id->company_id->name").eq("Acme")
+            # 2 hops: orders -> customers -> companies
+
+        Supported on ``.eq()/.ne()/.lt()/.lte()/.gt()/.gte()/.between()/.in_()``,
+        but only with the default ``returns="rows"`` — ``returns="rows_here"``
+        and ``returns="values"`` raise ``ValueError`` for a ``->`` path (their
+        semantics get ambiguous once two tables are involved). Raises
+        ``ValueError`` if any hop's link wasn't declared via ``link()`` first.
+        ``.eq()`` is index-accelerated (chains each hop's already-built link
+        index — no full scan); the other operators fall back to a linear scan
+        of the anchor table.
+
         Examples::
 
             mn.create_index("age")
@@ -682,6 +709,102 @@ class ModDict:
         ...
 
     # ──────────────────────────────────────────────────
+    # Links — declared relationships between rows in one ModDict
+    # ──────────────────────────────────────────────────
+
+    def link(
+        self,
+        source_path: str | tuple[str, ...],
+        references_path: str | tuple[str, ...],
+        on_delete: Literal["restrict", "cascade", "set_null"] = "restrict",
+    ) -> None:
+        """
+        Declare that ``source_path`` is a foreign-key-style reference to
+        ``references_path``, within this ModDict. ``follow()`` (and nothing
+        else — there's no implicit resolution) only works on paths declared
+        here first.
+
+        **v1 shape (deliberately narrow):**
+
+        - ``source_path``: exactly ``"table.?.field"`` — one anchor (an
+          outer key of this ModDict), one wildcard, one literal field.
+        - ``references_path``: ``"table.?"`` (match by key — pk-based) or
+          ``"table.?.field"`` (match by a field's value — non-pk).
+
+        Self-reference is allowed — ``source_path`` and ``references_path``
+        can share the same table (e.g. an employee hierarchy where
+        ``manager_id`` points to another row of the same ``employees``
+        table). Cycles are safe under ``cascade``: deleting a row scrubs its
+        own reverse-index entry before the cascade looks up who referenced
+        it, so a cycle breaks itself on the first deletion — no separate
+        cycle detection needed.
+
+        A ``None``/missing field value is treated as "no reference" (like a
+        nullable SQL foreign key) — it's never a dangling reference.
+        Anything else that doesn't resolve to a real row in the target
+        raises immediately, at declaration time (existing data) and at
+        write time (future writes) — never silently.
+
+        Args:
+            source_path: path to the referencing field, e.g. ``"orders.?.customer_id"``.
+            references_path: path identifying the target, e.g. ``"customers.?"``.
+            on_delete: what happens to referencing rows when the target row
+                is deleted — ``"restrict"`` *(default)* refuses the delete;
+                ``"cascade"`` deletes referencing rows too; ``"set_null"``
+                clears the reference field on referencing rows.
+
+        Examples::
+
+            mn.link("orders.?.customer_id", "customers.?")
+            mn.link("orders.?.customer_id", "customers.?.email")   # non-pk
+            mn.link("employees.?.manager_id", "employees.?")       # self-reference
+        """
+        ...
+
+    def follow(
+        self,
+        source_path: str | tuple[str, ...],
+        keys: Sequence[Any] | None = None,
+        values: Sequence[Any] | None = None,
+    ) -> ModDict:
+        """
+        Traverse a link declared with ``link()``.
+
+        For every current row matching ``source_path``, resolves the field
+        value against the declared target and collects the matched target
+        rows into a new ``ModDict`` (keyed by the target's own key — results
+        are naturally de-duplicated if multiple source rows resolve to the
+        same target row). A ``None``/missing field value contributes nothing
+        (not an error).
+
+        Raises ``ValueError`` if no link was declared for this exact
+        ``source_path`` — call ``link()`` first.
+
+        Args:
+            source_path: the exact path passed to a prior ``link()`` call.
+            keys: restrict the scan to source rows whose own key is in this
+                sequence (default: scan every row of the source table).
+                Mutually exclusive with ``values``.
+            values: skip scanning the source table entirely and resolve
+                these values directly against the target — for values that
+                didn't come from a source-table scan (e.g. an external list
+                of ids). Mutually exclusive with ``keys``.
+
+        Multi-hop traversal (unbounded depth, e.g. walking a hierarchy to
+        its root) isn't a single-string DSL — use ``keys`` to chain calls,
+        since each hop's *depth* isn't known until you get there::
+
+            mn.link("employees.?.manager_id", "employees.?")
+            managers = mn.follow("employees.?.manager_id")             # 1 hop
+            skip_managers = mn.follow("employees.?.manager_id",
+                                       keys=managers.keys())            # 2 hops
+
+            # values=: resolve ids that came from elsewhere, no source scan
+            mn.follow("orders.?.customer_id", values=[100, 200])
+        """
+        ...
+
+    # ──────────────────────────────────────────────────
     # Query helpers
     # ──────────────────────────────────────────────────
 
@@ -723,26 +846,54 @@ class ModDict:
 
     def select(
         self,
-        fields: list[str],
+        fields: list[str] | dict[str, str],
         returns: Literal["rows", "values"] = "rows",
     ) -> ModDict | list[Any]:
         """
         Project rows to the specified fields.
 
-        Supports dot-notation paths; the full path string is used as the key
-        in the result row (e.g. ``"meta.level"`` → ``row["meta.level"]``).
+        Supports dot-notation paths. The result-row key for each field is its
+        **last segment** — the text after the last ``"->"`` (if any), then
+        after the last ``"."`` in that (e.g. ``"meta.level"`` → key
+        ``"level"``, ``"orders.?.customer_id->name"`` → key ``"name"``) — not
+        the full path string. If two fields default to the same key, this
+        raises ``ValueError``; pass ``fields`` as a ``{label: path}`` dict
+        instead to give explicit, collision-free result keys::
+
+            mn.select(["age", "meta.level"])                       # -> {"age": ..., "level": ...}
+            mn.select({"user_age": "age", "lvl": "meta.level"})     # explicit labels
+            mn.select(["orders.?.customer_id->name", "orders.?.vendor_id->name"])
+            # ValueError: both default to "name" -- use the dict form:
+            mn.select({"customer": "orders.?.customer_id->name", "vendor": "orders.?.vendor_id->name"})
 
         Args:
-            fields:  List of field names or dot-notation paths.
+            fields:  List of paths (label = last segment, auto-computed) or
+                     a ``{label: path}`` dict (explicit labels).
             returns: ``"rows"`` — new ModDict *(default)*;
                      ``"values"`` — columnar: one flat list per requested
                      field, in the same order as ``fields``. A row missing
                      a field contributes ``None`` at that field's position,
                      keeping all columns the same length.
 
+        **Wildcard fields and link hops ("->")**
+
+        A field can also be a table-anchored wildcard path, ``"table.?..."``
+        — the first time ``select()`` looks past a single flat collection —
+        optionally with a ``->`` hop across a declared ``link()``, same
+        syntax and semantics as ``filter()``'s. When any field is
+        wildcard-shaped, every field must be (mixing plain and wildcard
+        fields in one call raises ``ValueError``), and all wildcard fields
+        must share the same anchor table. The result is still flat, keyed by
+        each matched anchor row's own key — not nested under the table name::
+
+            mn.link("orders.?.customer_id", "customers.?")
+            mn.select(["orders.?.customer_id->name", "orders.?.customer_id->email"])
+            # -> {order_pk: {"name": ..., "email": ...}, ...}
+
         Examples::
 
             slim = mn.select(["name", "age", "meta.level"])
+            # -> {pk: {"name": ..., "age": ..., "level": ...}, ...}
             cols = mn.select(["name", "score"], returns="values")
             # → [["alice", "bob", ...], [9.5, 6.0, ...]]
             names, scores = mn.select(["name", "score"], returns="values")
