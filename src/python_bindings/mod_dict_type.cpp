@@ -516,32 +516,52 @@ static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
         default: return false;
     }
 }
-static void scan_here(PyObject* cur, const std::vector<std::string>& pat, size_t depth,
+// `self`/`current_table` are only used when a "__follow_link__" hop is hit —
+// on a jump, `cur` becomes the TARGET row, so a match reached after the jump
+// naturally reports data from the target row (e.g. the customer, not the
+// order) — that's the whole point of asking for "rows_here"/"values" through
+// a "->" path. `*err` is set (with PyErr already raised) if a hop's link
+// wasn't declared; callers must stop scanning and propagate once it's true.
+static void scan_here(ModDict* self, std::string current_table,
+                      PyObject* cur, const std::vector<std::string>& pat, size_t depth,
                       FilterOp op, const ModValue& fval,
-                      bool want_values, PyObject* vf_key, PyObject* result) {
-    if (!cur || !PyDict_Check(cur) || depth >= pat.size()) return;
+                      bool want_values, PyObject* vf_key, PyObject* result, bool* err) {
+    if (*err || !cur || !PyDict_Check(cur) || depth >= pat.size()) return;
     bool last = (depth == pat.size()-1);
     if (pat[depth] == "__pass_key__") {
         PyObject *k,*v; Py_ssize_t pos=0;
         while (PyDict_Next(cur,&pos,&k,&v)) {
+            if (*err) return;
             if (last) {
                 // Terminal ? checks the KEY itself
                 if (!fh_compare(k,op,fval)) continue;
                 PyObject* item = want_values ? (vf_key ? PyDict_GetItem(cur,vf_key) : nullptr) : cur;
                 if (item) { Py_INCREF(item); PyList_Append(result,item); Py_DECREF(item); }
             } else if (PyDict_Check(v)) {
-                scan_here(v,pat,depth+1,op,fval,want_values,vf_key,result);
+                scan_here(self,current_table,v,pat,depth+1,op,fval,want_values,vf_key,result,err);
             }
         }
     } else {
         PyObject* child = PyDict_GetItemString(cur,pat[depth].c_str());
         if (!child) return;
+        bool jump_next = (depth+1 < pat.size() && pat[depth+1]=="__follow_link__");
         if (last) {
             if (!fh_compare(child,op,fval)) return;
             PyObject* item = want_values ? (vf_key ? PyDict_GetItem(cur,vf_key) : nullptr) : cur;
             if (item) { Py_INCREF(item); PyList_Append(result,item); Py_DECREF(item); }
+        } else if (jump_next) {
+            std::string next_table = current_table;
+            bool no_link = false;
+            PyObject* target_row = self->resolve_hop(next_table, pat[depth], child, &no_link);
+            if (no_link) {
+                PyErr_SetString(PyExc_ValueError, "filter: no link declared for this source_path - call mn.link() first");
+                *err = true;
+                return;
+            }
+            if (!target_row) return;  // nullable/dangling FK -> no match, not an error
+            scan_here(self,next_table,target_row,pat,depth+2,op,fval,want_values,vf_key,result,err);
         } else {
-            scan_here(child,pat,depth+1,op,fval,want_values,vf_key,result);
+            scan_here(self,current_table,child,pat,depth+1,op,fval,want_values,vf_key,result,err);
         }
     }
 }
@@ -550,10 +570,6 @@ static PyObject* apply_filter_here(ModDictObject* owner,
                                     const std::vector<std::string>& pattern,
                                     bool wc, FilterOp op, const ModValue& fval,
                                     bool want_values, PyObject* vf_key) {
-    if (wc && std::find(pattern.begin(), pattern.end(), "__follow_link__") != pattern.end()) {
-        PyErr_SetString(PyExc_ValueError, "filter: '->' paths only support returns='rows' for now");
-        return nullptr;
-    }
     PyObject* result = PyList_New(0); if (!result) return nullptr;
     std::vector<std::string> pat = wc ? pattern : std::vector<std::string>{simple};
     bool anchored = (!pat.empty() && pat[0] != "__pass_key__");
@@ -566,14 +582,20 @@ static PyObject* apply_filter_here(ModDictObject* owner,
             if (e && e->val_py && e->is_row) anchor_e = e; else anchored = false;
         } else { anchored = false; }
     }
+    bool err = false;
     if (anchored && anchor_e) {
-        scan_here(anchor_e->val_py,pat,1,op,fval,want_values,vf_key,result);
+        scan_here(owner->internal,pat[0],anchor_e->val_py,pat,1,op,fval,want_values,vf_key,result,&err);
     } else {
         for (auto& e : owner->internal->outer.occupied()) {
             if (!e.value.is_row || !e.value.val_py) continue;
-            scan_here(e.value.val_py,pat,0,op,fval,want_values,vf_key,result);
+            // Unanchored patterns can never contain "->" (its left side must
+            // be an exact "table.?.field" link source_path, always anchored)
+            // — current_table="" here is dead code for the jump branch.
+            scan_here(owner->internal,std::string(),e.value.val_py,pat,0,op,fval,want_values,vf_key,result,&err);
+            if (err) break;
         }
     }
+    if (err) { Py_DECREF(result); return nullptr; }
     return result;
 }
 

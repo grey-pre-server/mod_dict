@@ -617,13 +617,25 @@ class ModDict:
             # 2 hops: orders -> customers -> companies
 
         Supported on ``.eq()/.ne()/.lt()/.lte()/.gt()/.gte()/.between()/.in_()``,
-        but only with the default ``returns="rows"`` — ``returns="rows_here"``
-        and ``returns="values"`` raise ``ValueError`` for a ``->`` path (their
-        semantics get ambiguous once two tables are involved). Raises
-        ``ValueError`` if any hop's link wasn't declared via ``link()`` first.
-        ``.eq()`` is index-accelerated (chains each hop's already-built link
-        index — no full scan); the other operators fall back to a linear scan
-        of the anchor table.
+        with every ``returns`` mode. Raises ``ValueError`` if any hop's link
+        wasn't declared via ``link()`` first. ``.eq()`` is index-accelerated
+        (chains each hop's already-built link index — no full scan); the
+        other operators fall back to a linear scan of the anchor table.
+
+        ``returns="rows_here"``/``"values"`` report data from the *target*
+        row (wherever the ``->`` chain lands), not the anchor row — the match
+        itself happens there, so "here" means there too. One entry per
+        matching **anchor** row, not deduplicated by target — if 5 orders
+        share the same customer, that customer's row (or field) appears 5
+        times, mirroring what ``returns="rows_here"`` already does for an
+        ordinary (non-``->``) wildcard path::
+
+            mn.link("orders.?.customer_id", "customers.?")
+            mn.filter("orders.?.customer_id->name").eq("Alice", returns="rows_here")
+            # -> [customer_row, customer_row, ...] — Alice's row once per matching order
+            mn.filter("orders.?.customer_id->name").eq("Alice",
+                                                          returns="values", value_field="email")
+            # -> [alice_email, alice_email, ...] — same repetition
 
         Examples::
 

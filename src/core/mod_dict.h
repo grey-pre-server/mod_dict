@@ -187,6 +187,20 @@ public:
               const std::vector<std::string>& references_pattern,
               LinkOnDelete on_delete = LinkOnDelete::RESTRICT);
 
+    // Resolves one "->" hop: fk_val is the value just read from `field` on a
+    // row of `*current_table`. Looks up the link declared for exactly
+    // {*current_table, "?", field}. On success, updates *current_table to the
+    // hop's target table (for chaining further hops) and returns the
+    // (borrowed) target row. Returns nullptr for a nullable/dangling FK (not
+    // an error — *no_link stays false) or for no declared link (*no_link set
+    // true — caller should raise). Public because the "->"-aware scan_here()
+    // engine for filter()'s returns="rows_here"/"values" lives in the Python
+    // binding layer (mod_dict_type.cpp), not core, and needs this without
+    // reaching into core-internal statics (resolve_link_hop/resolve_table
+    // stay file-local to mod_dict.cpp).
+    PyObject* resolve_hop(std::string& current_table, const std::string& field,
+                           PyObject* fk_val, bool* no_link) const;
+
     // Finds the declared link matching source_pattern exactly (raises
     // ValueError if none). Returns a new ModDict of the resolved target rows
     // for every current match of source_pattern (outer keys = target keys).

@@ -1470,6 +1470,17 @@ void ModDict::link(const std::vector<std::string>& source_pattern,
     links.push_back(std::move(ld));
 }
 
+PyObject* ModDict::resolve_hop(std::string& current_table, const std::string& field,
+                                PyObject* fk_val, bool* no_link) const
+{
+    const LinkDecl* ld = nullptr; PyObject* target_row = nullptr;
+    LinkHopResult res = resolve_link_hop(this, current_table, field, fk_val, &ld, &target_row);
+    *no_link = (res == LinkHopResult::NO_LINK);
+    if (res != LinkHopResult::OK) return nullptr;
+    current_table = ld->references_pattern[0];
+    return target_row;
+}
+
 ModDict* ModDict::follow(const std::vector<std::string>& source_pattern,
                           const std::vector<uint64_t>* key_filter,
                           const std::vector<PyObject*>* value_filter) const
