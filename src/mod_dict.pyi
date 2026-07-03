@@ -622,20 +622,25 @@ class ModDict:
         (chains each hop's already-built link index — no full scan); the
         other operators fall back to a linear scan of the anchor table.
 
-        ``returns="rows_here"``/``"values"`` report data from the *target*
-        row (wherever the ``->`` chain lands), not the anchor row — the match
-        itself happens there, so "here" means there too. One entry per
-        matching **anchor** row, not deduplicated by target — if 5 orders
-        share the same customer, that customer's row (or field) appears 5
-        times, mirroring what ``returns="rows_here"`` already does for an
-        ordinary (non-``->``) wildcard path::
+        ``returns="rows_here"``/``"values"`` report data from the **anchor**
+        row (``orders``, e.g.) — not wherever the ``->`` chain lands — since
+        the comparison value is one you already supplied via ``.eq(...)``
+        (or similar), so echoing back the target row/field wouldn't tell you
+        anything new; the useful, non-redundant data is on the row you're
+        actually filtering, same as ``returns="rows"`` already returns (its
+        ``{table: {...}}`` nesting is keyed by that same anchor table) — this
+        just flattens it instead of nesting it. One entry per matching
+        **anchor** row, not deduplicated by target — if 5 orders share the
+        same customer, the matching order appears 5 times, mirroring what
+        ``returns="rows_here"`` already does for an ordinary (non-``->``)
+        wildcard path::
 
             mn.link("orders.?.customer_id", "customers.?")
             mn.filter("orders.?.customer_id->name").eq("Alice", returns="rows_here")
-            # -> [customer_row, customer_row, ...] — Alice's row once per matching order
+            # -> [order_row, order_row, ...] — one per order whose customer is named Alice
             mn.filter("orders.?.customer_id->name").eq("Alice",
-                                                          returns="values", value_field="email")
-            # -> [alice_email, alice_email, ...] — same repetition
+                                                          returns="values", value_field="total")
+            # -> [order_total, order_total, ...] — a field read off each matching ORDER
 
         Examples::
 

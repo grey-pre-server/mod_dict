@@ -516,16 +516,26 @@ static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
         default: return false;
     }
 }
-// `self`/`current_table` are only used when a "__follow_link__" hop is hit —
-// on a jump, `cur` becomes the TARGET row, so a match reached after the jump
-// naturally reports data from the target row (e.g. the customer, not the
-// order) — that's the whole point of asking for "rows_here"/"values" through
-// a "->" path. `*err` is set (with PyErr already raised) if a hop's link
-// wasn't declared; callers must stop scanning and propagate once it's true.
-static void scan_here(ModDict* self, std::string current_table,
+// `report_row` is null until the first "__follow_link__" jump, then pinned
+// to `cur`'s value from right before that jump (the SOURCE/anchor row, e.g.
+// the order — not wherever the "->" chain eventually lands) for the rest of
+// this branch's recursion, however many further hops follow. rows_here/
+// value_field report from `report_row` once it's pinned, `cur` otherwise —
+// so "here" stays anchored to the row you're actually filtering, matching
+// what returns="rows" already returns (its {table: {...}} nesting is keyed
+// by the same anchor table), not the target you already named in .eq(...).
+// `self`/`current_table` are only needed to resolve a jump. `*err` is set
+// (with PyErr already raised) if a hop's link wasn't declared; callers must
+// stop scanning and propagate once it's true. `cmp_out`, if non-null, gets
+// the raw value that was actually compared (`k` or `child` — wherever it
+// lived, target row included) appended in lockstep with `result` — used by
+// FB_between, which needs to re-check that same value against `hi` but can
+// no longer just re-read it off the reported item now that the item is the
+// anchor row, not (necessarily) the row the field lives on.
+static void scan_here(ModDict* self, std::string current_table, PyObject* report_row,
                       PyObject* cur, const std::vector<std::string>& pat, size_t depth,
                       FilterOp op, const ModValue& fval,
-                      bool want_values, PyObject* vf_key, PyObject* result, bool* err) {
+                      bool want_values, PyObject* vf_key, PyObject* result, PyObject* cmp_out, bool* err) {
     if (*err || !cur || !PyDict_Check(cur) || depth >= pat.size()) return;
     bool last = (depth == pat.size()-1);
     if (pat[depth] == "__pass_key__") {
@@ -535,10 +545,14 @@ static void scan_here(ModDict* self, std::string current_table,
             if (last) {
                 // Terminal ? checks the KEY itself
                 if (!fh_compare(k,op,fval)) continue;
-                PyObject* item = want_values ? (vf_key ? PyDict_GetItem(cur,vf_key) : nullptr) : cur;
-                if (item) { Py_INCREF(item); PyList_Append(result,item); Py_DECREF(item); }
+                PyObject* rr = report_row ? report_row : cur;
+                PyObject* item = want_values ? (vf_key ? PyDict_GetItem(rr,vf_key) : nullptr) : rr;
+                if (item) {
+                    Py_INCREF(item); PyList_Append(result,item); Py_DECREF(item);
+                    if (cmp_out) PyList_Append(cmp_out,k);
+                }
             } else if (PyDict_Check(v)) {
-                scan_here(self,current_table,v,pat,depth+1,op,fval,want_values,vf_key,result,err);
+                scan_here(self,current_table,report_row,v,pat,depth+1,op,fval,want_values,vf_key,result,cmp_out,err);
             }
         }
     } else {
@@ -547,8 +561,12 @@ static void scan_here(ModDict* self, std::string current_table,
         bool jump_next = (depth+1 < pat.size() && pat[depth+1]=="__follow_link__");
         if (last) {
             if (!fh_compare(child,op,fval)) return;
-            PyObject* item = want_values ? (vf_key ? PyDict_GetItem(cur,vf_key) : nullptr) : cur;
-            if (item) { Py_INCREF(item); PyList_Append(result,item); Py_DECREF(item); }
+            PyObject* rr = report_row ? report_row : cur;
+            PyObject* item = want_values ? (vf_key ? PyDict_GetItem(rr,vf_key) : nullptr) : rr;
+            if (item) {
+                Py_INCREF(item); PyList_Append(result,item); Py_DECREF(item);
+                if (cmp_out) PyList_Append(cmp_out,child);
+            }
         } else if (jump_next) {
             std::string next_table = current_table;
             bool no_link = false;
@@ -559,9 +577,10 @@ static void scan_here(ModDict* self, std::string current_table,
                 return;
             }
             if (!target_row) return;  // nullable/dangling FK -> no match, not an error
-            scan_here(self,next_table,target_row,pat,depth+2,op,fval,want_values,vf_key,result,err);
+            PyObject* pinned = report_row ? report_row : cur;  // pin on first jump only
+            scan_here(self,next_table,pinned,target_row,pat,depth+2,op,fval,want_values,vf_key,result,cmp_out,err);
         } else {
-            scan_here(self,current_table,child,pat,depth+1,op,fval,want_values,vf_key,result,err);
+            scan_here(self,current_table,report_row,child,pat,depth+1,op,fval,want_values,vf_key,result,cmp_out,err);
         }
     }
 }
@@ -569,7 +588,7 @@ static PyObject* apply_filter_here(ModDictObject* owner,
                                     const std::string& simple,
                                     const std::vector<std::string>& pattern,
                                     bool wc, FilterOp op, const ModValue& fval,
-                                    bool want_values, PyObject* vf_key) {
+                                    bool want_values, PyObject* vf_key, PyObject* cmp_out = nullptr) {
     PyObject* result = PyList_New(0); if (!result) return nullptr;
     std::vector<std::string> pat = wc ? pattern : std::vector<std::string>{simple};
     bool anchored = (!pat.empty() && pat[0] != "__pass_key__");
@@ -584,14 +603,14 @@ static PyObject* apply_filter_here(ModDictObject* owner,
     }
     bool err = false;
     if (anchored && anchor_e) {
-        scan_here(owner->internal,pat[0],anchor_e->val_py,pat,1,op,fval,want_values,vf_key,result,&err);
+        scan_here(owner->internal,pat[0],nullptr,anchor_e->val_py,pat,1,op,fval,want_values,vf_key,result,cmp_out,&err);
     } else {
         for (auto& e : owner->internal->outer.occupied()) {
             if (!e.value.is_row || !e.value.val_py) continue;
             // Unanchored patterns can never contain "->" (its left side must
             // be an exact "table.?.field" link source_path, always anchored)
             // — current_table="" here is dead code for the jump branch.
-            scan_here(owner->internal,std::string(),e.value.val_py,pat,0,op,fval,want_values,vf_key,result,&err);
+            scan_here(owner->internal,std::string(),nullptr,e.value.val_py,pat,0,op,fval,want_values,vf_key,result,cmp_out,&err);
             if (err) break;
         }
     }
@@ -681,18 +700,20 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         bool want_values=(strcmp(ret,"values")==0);
         if (want_values && !vf_obj) MOD_DICT_RAISE(PyExc_ValueError,"returns='values' requires value_field");
         ModValue lo_val=ModValue::from_pyobject(lo), hi_val=ModValue::from_pyobject(hi);
-        // collect GE candidates as rows_here, then filter LE
-        PyObject* ge=apply_filter_here(s->owner,simple,pat,wc,FilterOp::GE,lo_val,false,nullptr);
-        if (!ge) return nullptr;
-        PyObject* result=PyList_New(0); if(!result){Py_DECREF(ge);return nullptr;}
-        std::vector<std::string> p=wc?pat:std::vector<std::string>{simple};
+        // collect GE candidates as rows_here, then filter LE. cmp_list holds
+        // the raw compared value in lockstep with ge — needed instead of
+        // re-reading the pattern's last segment off each reported row,
+        // since for a "->" path the reported row is the ANCHOR (e.g. the
+        // order) while the compared field lives on the TARGET (e.g. the
+        // customer) — p.back() wouldn't be found on the reported row at all.
+        PyObject* cmp_list=PyList_New(0); if(!cmp_list) return nullptr;
+        PyObject* ge=apply_filter_here(s->owner,simple,pat,wc,FilterOp::GE,lo_val,false,nullptr,cmp_list);
+        if (!ge) { Py_DECREF(cmp_list); return nullptr; }
+        PyObject* result=PyList_New(0); if(!result){Py_DECREF(ge);Py_DECREF(cmp_list);return nullptr;}
         Py_ssize_t n=PyList_GET_SIZE(ge);
         for (Py_ssize_t i=0;i<n;i++) {
             PyObject* row=PyList_GET_ITEM(ge,i);
-            // extract field value and check <= hi
-            PyObject* fv_obj2=nullptr;
-            if (!p.empty() && p.back()!="__pass_key__")
-                fv_obj2=PyDict_GetItemString(row,p.back().c_str());
+            PyObject* fv_obj2=PyList_GET_ITEM(cmp_list,i);
             bool pass=true;
             if (fv_obj2){
                 ModValue fv=ModValue::from_pyobject(fv_obj2);
@@ -704,7 +725,7 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
                 if(item){Py_INCREF(item);PyList_Append(result,item);Py_DECREF(item);}
             }
         }
-        Py_DECREF(ge); return result;
+        Py_DECREF(ge); Py_DECREF(cmp_list); return result;
     }
     if (wc && pattern_has_link_hop(pat)) {
         // Chaining (re-filtering r1) doesn't work here — r1 is a fresh ModDict
