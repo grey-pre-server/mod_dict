@@ -864,48 +864,94 @@ class ModDict:
     def select(
         self,
         fields: list[str] | dict[str, str],
-        returns: Literal["rows", "values"] = "rows",
+        returns: Literal["rows", "rows_here", "values"] = "rows",
     ) -> ModDict | list[Any]:
         """
-        Project rows to the specified fields.
+        Project rows to the specified fields — or (default, for wildcard/
+        ``->`` fields) land on and keep the tables those fields refer to.
 
-        Supports dot-notation paths. The result-row key for each field is its
-        **last segment** — the text after the last ``"->"`` (if any), then
-        after the last ``"."`` in that (e.g. ``"meta.level"`` → key
-        ``"level"``, ``"orders.?.customer_id->name"`` → key ``"name"``) — not
-        the full path string. If two fields default to the same key, this
-        raises ``ValueError``; pass ``fields`` as a ``{label: path}`` dict
-        instead to give explicit, collision-free result keys::
+        Supports dot-notation paths. Ignore the rest of this docstring's
+        label discussion when ``returns="rows"`` and any field is wildcard-
+        shaped — table-landing mode (below) doesn't use labels at all. For
+        every other case, the result-row key for each field is its **last
+        segment** — the text after the last ``"->"`` (if any), then after
+        the last ``"."`` in that (e.g. ``"meta.level"`` → key ``"level"``,
+        ``"orders.?.customer_id->name"`` → key ``"name"``) — not the full
+        path string. If two fields default to the same key, this raises
+        ``ValueError``; pass ``fields`` as a ``{label: path}`` dict instead
+        to give explicit, collision-free result keys::
 
             mn.select(["age", "meta.level"])                       # -> {"age": ..., "level": ...}
             mn.select({"user_age": "age", "lvl": "meta.level"})     # explicit labels
-            mn.select(["orders.?.customer_id->name", "orders.?.vendor_id->name"])
+            mn.select(["orders.?.customer_id->name", "orders.?.vendor_id->name"], returns="rows_here")
             # ValueError: both default to "name" -- use the dict form:
-            mn.select({"customer": "orders.?.customer_id->name", "vendor": "orders.?.vendor_id->name"})
+            mn.select({"customer": "orders.?.customer_id->name", "vendor": "orders.?.vendor_id->name"}, returns="rows_here")
 
         Args:
-            fields:  List of paths (label = last segment, auto-computed) or
-                     a ``{label: path}`` dict (explicit labels).
-            returns: ``"rows"`` — new ModDict *(default)*;
+            fields:  List of paths, or a ``{label: path}`` dict (explicit
+                     labels — irrelevant for table-landing mode, see below).
+            returns: ``"rows"`` *(default)* — new ModDict. If any field is a
+                     table-anchored wildcard path (``"table.?..."``), lands
+                     on and keeps that field's table instead of extracting a
+                     value — see "Table-landing" below. Otherwise, a flat
+                     projection identical to ``"rows_here"``.
+                     ``"rows_here"`` — always the flat projection (one
+                     projected row per matched source row, keyed by that
+                     row's own key), even for wildcard/``->`` fields — use
+                     this to force value-extraction instead of table-landing.
                      ``"values"`` — columnar: one flat list per requested
                      field, in the same order as ``fields``. A row missing
                      a field contributes ``None`` at that field's position,
                      keeping all columns the same length.
 
-        **Wildcard fields and link hops ("->")**
+        **Wildcard fields and link hops ("->"), with ``returns="rows_here"``/``"values"``**
 
         A field can also be a table-anchored wildcard path, ``"table.?..."``
         — the first time ``select()`` looks past a single flat collection —
         optionally with a ``->`` hop across a declared ``link()``, same
-        syntax and semantics as ``filter()``'s. When any field is
-        wildcard-shaped, every field must be (mixing plain and wildcard
-        fields in one call raises ``ValueError``), and all wildcard fields
-        must share the same anchor table. The result is still flat, keyed by
-        each matched anchor row's own key — not nested under the table name::
+        syntax and semantics as ``filter()``'s. Every field must be
+        wildcard-shaped if any is (mixing plain and wildcard fields in one
+        call raises ``ValueError``), and all wildcard fields must share the
+        same anchor table. The result is flat, keyed by each matched anchor
+        row's own key — not nested under the table name::
 
             mn.link("orders.?.customer_id", "customers.?")
-            mn.select(["orders.?.customer_id->name", "orders.?.customer_id->email"])
+            mn.select(["orders.?.customer_id->name", "orders.?.customer_id->email"], returns="rows_here")
             # -> {order_pk: {"name": ..., "email": ...}, ...}
+
+        **Table-landing (default for wildcard/``->`` fields)**
+
+        With the default ``returns="rows"``, a table-anchored wildcard field
+        doesn't extract a value — it resolves to the table it refers to and
+        keeps that table's rows instead. A plain field (``"group_id"``, no
+        ``?``) resolves via a declared ``link()`` on the anchor table's FK
+        field, hopping to the target (multi-hop supported, chaining
+        ``follow()`` under the hood exactly like the manual ``keys=`` loop
+        shown on ``follow()``'s own docstring). A field with **no** ``->``
+        hop just contributes its own anchor table's current rows, unchanged.
+        Every field is resolved this way and the results are merged into one
+        ModDict — two fields landing on the same table get their rows
+        unioned together, not overwritten. The trailing part of a hop field
+        is still written (it's what identifies the hop chain — the same
+        path you'd use to extract that value with ``returns="rows_here"``),
+        just unused for this mode's output::
+
+            mn.link("workgroup.?.group_id", "user_group.?")
+            mn.select(["workgroup.?.group_id->name"])
+            # -> {"user_group": {100: {...}, 200: {...}}} -- "name" is unused here
+            mn.select(["workgroup.?.group_id->name", "workgroup.?.status"])
+            # -> {"user_group": {...}, "workgroup": {...}} -- mixed: one hops, one doesn't
+            mn.select(["workgroup.?.group_id->name"], returns="rows_here")
+            # -> {1: {"name": "Engineering"}, 2: {"name": "Sales"}, ...} -- force value-extraction instead
+
+        The result is chainable — since each landed table is shaped like an
+        anchored ``filter()`` result, a further ``.filter("user_group.?.field->...")``
+        or another ``.select(...)`` relays through to the root and
+        intersects, same as any other derived result this library produces.
+        Reverse traversal (landing back on a table that *references* the
+        current one, rather than one the current table's FK points to) is
+        not supported — only the direction a ``link()`` was actually
+        declared in.
 
         Examples::
 

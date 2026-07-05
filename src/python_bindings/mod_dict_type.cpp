@@ -478,9 +478,19 @@ static bool parse_link_pattern(const std::string& raw, std::vector<std::string>&
     return true;
 }
 
+// Runs a filter() call, relaying through the parent_ref chain first if
+// `owner` is a derived child (e.g. a prior filter()'s result) and `pattern`
+// hops across a declared link — defined after pattern_has_link_hop/
+// intersect_anchored below, forward-declared here so apply_filter (and
+// FB_between/FB_in_, which call owner->internal->filter() directly for
+// their own reasons) can all route through the same logic.
+static ModDict* filter_maybe_relay(ModDictObject* owner, const std::string& simple,
+                                    const std::vector<std::string>& pattern, bool wc,
+                                    FilterOp op, const ModValue& fv);
+
 static PyObject* apply_filter(ModDictObject* owner,const std::string& simple,const std::vector<std::string>& pattern,bool wc,FilterOp op,PyObject* val_obj){
     ModValue fv=ModValue::from_pyobject(val_obj);
-    ModDict* result=wc?owner->internal->filter(pattern,op,fv):owner->internal->filter(simple,op,fv);
+    ModDict* result=filter_maybe_relay(owner,simple,pattern,wc,op,fv);
     // A null result can mean a specific error (e.g. "->" hop with no
     // declared link) rather than allocation failure — don't clobber it with
     // a generic MemoryError via MOD_DICT_CHECK_ALLOC.
@@ -690,6 +700,48 @@ static void union_anchored_into(ModDict* dst, ModDict* src) {
         }
     }
 }
+// A filter()/select() result is a fresh ModDict holding only ONE table's
+// worth of pruned rows, with an empty `links` -- calling a "->" pattern on
+// it has nothing to resolve against (the OTHER table and the declared link
+// only exist on the original owner). Instead of threading parent-awareness
+// through every core resolution function, relay the WHOLE call to the
+// topmost ancestor (which has everything) and intersect its unrestricted
+// answer with `owner`'s own current rows for the pattern's anchor table --
+// reuses ModDict::filter()/filter_linked_eq() completely unchanged.
+static ModDict* filter_link_hop_via_root(ModDictObject* owner,
+                                          const std::vector<std::string>& pattern,
+                                          FilterOp op, const ModValue& fv) {
+    ModDictObject* root = owner;
+    while (root->parent_ref) root = (ModDictObject*)root->parent_ref;
+
+    PyObject* tmp = PyUnicode_FromStringAndSize(pattern[0].c_str(), pattern[0].size());
+    if (!tmp) return nullptr;
+    uint64_t anchor_hash = content_hash_pyobj(tmp);
+    Py_DECREF(tmp);
+
+    const OuterEntry* child_entry = owner->internal->outer.find(anchor_hash);
+    if (!child_entry || !child_entry->val_py || !PyDict_Check(child_entry->val_py))
+        return new ModDict();  // child doesn't restrict this table at all -> no match, not an error
+
+    ModDict* root_result = root->internal->filter(pattern, op, fv);
+    if (!root_result) return nullptr;  // PyErr already set (e.g. no link declared, even at the root)
+
+    // Wrap the child's own single-anchor entry as a matching-shaped ModDict
+    // and reuse intersect_anchored() (written for FB_between above) instead
+    // of duplicating the inner-dict intersection here.
+    ModDict* child_wrapper = new ModDict();
+    Py_XINCREF(child_entry->key_py); Py_XINCREF(child_entry->val_py);
+    child_wrapper->outer.insert(anchor_hash, {child_entry->key_py, child_entry->val_py, true});
+    child_wrapper->order.push_back(anchor_hash);
+    return intersect_anchored(child_wrapper, root_result);  // consumes both, returns the intersection
+}
+static ModDict* filter_maybe_relay(ModDictObject* owner, const std::string& simple,
+                                    const std::vector<std::string>& pattern, bool wc,
+                                    FilterOp op, const ModValue& fv) {
+    if (wc && owner->parent_ref && pattern_has_link_hop(pattern))
+        return filter_link_hop_via_root(owner, pattern, op, fv);
+    return wc ? owner->internal->filter(pattern, op, fv) : owner->internal->filter(simple, op, fv);
+}
 static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
     PyObject *lo,*hi; const char* ret="rows"; PyObject* vf_obj=nullptr;
     static const char* kwl[]={"lo","hi","returns","value_field",nullptr};
@@ -732,9 +784,9 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         // with no `links` of its own, so find_link() inside the second call
         // would fail. Compute GE/LE independently off the original owner and
         // intersect the two anchored results at the row level instead.
-        ModDict* ge = s->owner->internal->filter(pat, FilterOp::GE, ModValue::from_pyobject(lo));
+        ModDict* ge = filter_maybe_relay(s->owner, simple, pat, wc, FilterOp::GE, ModValue::from_pyobject(lo));
         if (!ge) return nullptr;
-        ModDict* le = s->owner->internal->filter(pat, FilterOp::LE, ModValue::from_pyobject(hi));
+        ModDict* le = filter_maybe_relay(s->owner, simple, pat, wc, FilterOp::LE, ModValue::from_pyobject(hi));
         if (!le) { delete ge; return nullptr; }
         ModDict* result = intersect_anchored(ge, le);
         MOD_DICT_CHECK_ALLOC(result);
@@ -777,7 +829,7 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
     for(Py_ssize_t i=0;i<n;i++){
         PyObject* item=PySequence_GetItem(seq,i); if(!item){delete merged;return nullptr;}
         ModValue mv=ModValue::from_pyobject(item); Py_DECREF(item);
-        ModDict* part=wc?s->owner->internal->filter(pat,FilterOp::EQ,mv):s->owner->internal->filter(simple,FilterOp::EQ,mv);
+        ModDict* part=filter_maybe_relay(s->owner,simple,pat,wc,FilterOp::EQ,mv);
         if(!part){delete merged;return nullptr;}
         if(wc && pattern_has_link_hop(pat)){
             // Every part shares the SAME single anchor hash (an anchored
@@ -1162,15 +1214,164 @@ static std::string default_select_label(const std::string& raw){
     }
     return dot==std::string::npos ? raw.substr(start) : raw.substr(dot+1);
 }
+// Mirrors filter_link_hop_via_root for select(): relay the whole
+// select_anchored() call to the topmost ancestor (unrestricted), then keep
+// only the entries whose key is present in `owner`'s own rows for the
+// shared anchor table. select()'s result is flat, keyed by the anchor row's
+// own key (not filter()'s nested {table:{...}}) -- a key-membership filter,
+// not an inner-dict intersection.
+static ModDict* select_link_hop_via_root(ModDictObject* owner,
+                                          const std::vector<std::vector<std::string>>& patterns,
+                                          const std::vector<std::string>& labels) {
+    ModDictObject* root = owner;
+    while (root->parent_ref) root = (ModDictObject*)root->parent_ref;
+
+    const std::string& anchor_table = patterns[0][0];
+    PyObject* tmp = PyUnicode_FromStringAndSize(anchor_table.c_str(), anchor_table.size());
+    if (!tmp) return nullptr;
+    uint64_t anchor_hash = content_hash_pyobj(tmp);
+    Py_DECREF(tmp);
+
+    const OuterEntry* child_entry = owner->internal->outer.find(anchor_hash);
+    if (!child_entry || !child_entry->val_py || !PyDict_Check(child_entry->val_py))
+        return new ModDict();  // child doesn't have this table at all -> no match, not an error
+
+    ModDict* root_result = root->internal->select_anchored(patterns, labels);
+    if (!root_result) return nullptr;
+
+    ModDict* result = new ModDict();
+    PyObject *k, *v; Py_ssize_t pos = 0;
+    while (PyDict_Next(child_entry->val_py, &pos, &k, &v)) {
+        uint64_t kh = content_hash_pyobj(k);
+        const OuterEntry* re = root_result->outer.find(kh);
+        if (!re || !re->val_py) continue;
+        Py_INCREF(re->key_py); Py_INCREF(re->val_py);
+        result->outer.insert(kh, {re->key_py, re->val_py, re->is_row});
+        result->order.push_back(kh);
+    }
+    delete root_result;
+    return result;
+}
+// Implements select(fields, returns="rows"): walks a "->" hop chain (the
+// same pattern shape parse_link_pattern already produces for ordinary
+// select()/filter() paths). Each path is resolved independently to a
+// (table, {pk:row}) pair — a path with one or more "->" hops lands on the
+// final hop's target table (chaining follow() calls, exactly the multi-hop
+// follow(keys=...) composition the .pyi docs already describe, automated);
+// a path with no hop at all just contributes its own anchor table's current
+// rows, unrestricted by any field it names (the field, if any, is only ever
+// used to identify which hop chain to walk, never to extract a value in
+// this mode). All per-path results are merged into ONE ModDict, unioning
+// rows together if two paths land on the same table. Built entirely from
+// already-public ModDict::find_link()/follow() — no core changes.
+static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::vector<std::string>>& patterns) {
+    ModDictObject* root = owner;
+    while (root->parent_ref) root = (ModDictObject*)root->parent_ref;
+
+    ModDict* combined = new ModDict();
+    for (auto& pattern : patterns) {
+        std::vector<std::vector<std::string>> groups;
+        {
+            std::vector<std::string> cur_group;
+            for (auto& seg : pattern) {
+                if (seg == "__follow_link__") { groups.push_back(std::move(cur_group)); cur_group.clear(); }
+                else cur_group.push_back(seg);
+            }
+            groups.push_back(std::move(cur_group));
+        }
+        size_t n_hops = groups.size() - 1;
+        std::string current_table = groups[0][0];
+
+        // Materialize this path's starting {pk:row} set: the caller's own
+        // current rows for the anchor table if it's a derived child (same
+        // restriction convention as filter_link_hop_via_root/
+        // select_link_hop_via_root), else every row of the anchor table.
+        PyObject* tmp = PyUnicode_FromStringAndSize(current_table.c_str(), current_table.size());
+        if (!tmp) { delete combined; return nullptr; }
+        uint64_t anchor_hash = content_hash_pyobj(tmp);
+        Py_DECREF(tmp);
+        const OuterEntry* anchor_entry = owner->parent_ref
+            ? owner->internal->outer.find(anchor_hash)
+            : root->internal->outer.find(anchor_hash);
+        if (!anchor_entry || !anchor_entry->val_py || !PyDict_Check(anchor_entry->val_py)) {
+            if (owner->parent_ref) continue;  // child doesn't restrict this table -> this path contributes nothing
+            delete combined;
+            PyErr_SetString(PyExc_ValueError, "select: anchor table not found");
+            return nullptr;
+        }
+        ModDict* last_result = new ModDict();
+        {
+            PyObject *k, *v; Py_ssize_t pos = 0;
+            while (PyDict_Next(anchor_entry->val_py, &pos, &k, &v)) {
+                uint64_t kh = content_hash_pyobj(k);
+                Py_INCREF(k); Py_INCREF(v);
+                last_result->outer.insert(kh, {k, v, true});
+                last_result->order.push_back(kh);
+            }
+        }
+
+        if (n_hops > 0) {
+            std::vector<uint64_t> current_keys;
+            for (uint64_t oh : last_result->order) current_keys.push_back(oh);
+            std::vector<std::string> src_pat = groups[0];
+            for (size_t i = 0; i < n_hops; i++) {
+                if (i > 0) src_pat = {current_table, "__pass_key__", groups[i][0]};
+                const LinkDecl* ld = root->internal->find_link(src_pat);
+                if (!ld) {
+                    delete last_result; delete combined;
+                    PyErr_SetString(PyExc_ValueError, "select: no link declared for this source_path - call mn.link() first");
+                    return nullptr;
+                }
+                ModDict* hop_result = root->internal->follow(src_pat, &current_keys, nullptr);
+                if (!hop_result) { delete last_result; delete combined; return nullptr; }
+                delete last_result;
+                last_result = hop_result;
+                current_table = ld->references_pattern[0];
+                current_keys.clear();
+                for (uint64_t oh : last_result->order) current_keys.push_back(oh);
+            }
+        }
+
+        // Merge (current_table, last_result) into combined -- new table
+        // entry, or union rows into an existing one from an earlier path.
+        PyObject* table_key = PyUnicode_FromStringAndSize(current_table.c_str(), current_table.size());
+        if (!table_key) { delete last_result; delete combined; return nullptr; }
+        uint64_t table_hash = content_hash_pyobj(table_key);
+        OuterEntry* existing = combined->outer.find(table_hash);
+        if (!existing) {
+            PyObject* inner = last_result->to_python_dict();
+            delete last_result;
+            if (!inner) { Py_DECREF(table_key); delete combined; return nullptr; }
+            if (PyDict_Size(inner) > 0) {
+                combined->outer.insert(table_hash, {table_key, inner, true});
+                combined->order.push_back(table_hash);
+            } else {
+                Py_DECREF(inner); Py_DECREF(table_key);
+            }
+        } else {
+            Py_DECREF(table_key);  // combined already owns a key for this table
+            for (auto& e : last_result->outer.occupied()) {
+                if (!e.value.val_py) continue;
+                if (!PyDict_Contains(existing->val_py, e.value.key_py))
+                    PyDict_SetItem(existing->val_py, e.value.key_py, e.value.val_py);
+            }
+            delete last_result;
+        }
+    }
+    return combined;
+}
 static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     PyObject* fo; const char* ret="rows";
     static const char* kwl[]={"fields","returns",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"O|s",const_cast<char**>(kwl),&fo,&ret)) return nullptr;
+    if(strcmp(ret,"rows")!=0 && strcmp(ret,"rows_here")!=0 && strcmp(ret,"values")!=0)
+        MOD_DICT_RAISE(PyExc_ValueError,"select: returns must be 'rows', 'rows_here', or 'values'");
 
     // fields is either a list of paths (result keyed by each path's default
     // last-segment label — collision raises) or a {label: path} dict (result
     // keyed by the given labels, collision-free by construction).
     std::vector<std::string> paths, labels;
+    bool has_labels=false;
     if(PyDict_Check(fo)){
         Py_ssize_t n=PyDict_Size(fo);
         paths.reserve((size_t)n); labels.reserve((size_t)n);
@@ -1189,11 +1390,7 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
             paths.emplace_back(PyUnicode_AsUTF8(it));
         }
         for(auto& p:paths) labels.push_back(default_select_label(p));
-        for(size_t i=0;i<labels.size();i++) for(size_t j=i+1;j<labels.size();j++)
-            if(labels[i]==labels[j]) MOD_DICT_RAISE_FMT(PyExc_ValueError,
-                "select: \"%s\" and \"%s\" both default to the result key \"%s\" - "
-                "use the {label: path} dict form to disambiguate",
-                paths[i].c_str(), paths[j].c_str(), labels[i].c_str());
+        has_labels=true;  // labels are auto-computed, defer collision check until we know if "rows" table-landing mode ignores them
     } else {
         MOD_DICT_RAISE(PyExc_TypeError,"select: fields must be a list of paths or a {label: path} dict");
     }
@@ -1212,6 +1409,18 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     if(any_wc && !all_wc) MOD_DICT_RAISE(PyExc_ValueError,
         "select: cannot mix wildcard paths (e.g. \"orders.?.customer_id\") with plain paths in one call");
 
+    // "rows" table-landing mode doesn't use labels at all (each path lands
+    // on a table, not a labeled value) — skip the auto-label collision
+    // check in that case; every other mode does use labels, so it applies.
+    bool table_landing = (any_wc && strcmp(ret,"rows")==0);
+    if(has_labels && !table_landing){
+        for(size_t i=0;i<labels.size();i++) for(size_t j=i+1;j<labels.size();j++)
+            if(labels[i]==labels[j]) MOD_DICT_RAISE_FMT(PyExc_ValueError,
+                "select: \"%s\" and \"%s\" both default to the result key \"%s\" - "
+                "use the {label: path} dict form to disambiguate",
+                paths[i].c_str(), paths[j].c_str(), labels[i].c_str());
+    }
+
     ModDict* result;
     if(any_wc){
         std::vector<std::vector<std::string>> patterns; patterns.reserve(paths.size());
@@ -1226,7 +1435,17 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
                 "select: wildcard paths must be a table-anchored path like \"table.?.field\"");
             patterns.push_back(std::move(pat));
         }
-        result=s->internal->select_anchored(patterns,labels);
+        if(table_landing){
+            result=select_rows_mode(s,patterns);
+        } else {
+            bool has_hop=false;
+            for(auto& p:patterns) if(pattern_has_link_hop(p)){ has_hop=true; break; }
+            if(has_hop && s->parent_ref){
+                result=select_link_hop_via_root(s,patterns,labels);
+            } else {
+                result=s->internal->select_anchored(patterns,labels);
+            }
+        }
     } else {
         result=s->internal->select(paths,labels);
     }
@@ -1259,7 +1478,16 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
         }
         delete result; return cols;
     }
-    return ModDict_wrap_owned(result);
+    // Keep parent_ref so a further "->" filter()/select() chained onto this
+    // result can relay up to the root — ModDict_wrap_owned leaves it null,
+    // which was fine before chaining existed (select()'s rows hold their own
+    // incremented refs, no use-after-free risk) but breaks the relay chain.
+    {
+        ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
+        if(!w){delete result;return nullptr;}
+        w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)s; Py_INCREF(s);
+        result->py_wrapper=w; return (PyObject*)w;
+    }
 }
 static PyObject* ModDict_sort_by(ModDictObject* s,PyObject* args,PyObject* kw){
     const char* field=nullptr; int rev=0; const char* ret="rows"; int inplace=0;
