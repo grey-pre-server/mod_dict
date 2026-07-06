@@ -60,7 +60,7 @@ backup = mn.copy()
 mn.at(0)    # first value
 mn.at(-1)   # last value
 
-# Binary serialization (full Python type set — date, bytes, Decimal, Path, …)
+# Binary serialization (full Python type set — date, bytes, bytearray, tuple, uuid, Decimal, Path, …)
 data = mn.serialize()
 mn2  = md.ModDict(); mn2.deserialize(data)
 
@@ -151,7 +151,8 @@ mn.sort_by("meta.details.rank", returns="values")       # → [val, ...]
 mn.select(["age", "name"])                              # → new ModDict, keyed by each path's last segment
 mn.select({"user_age": "age"})                          # explicit labels — also disambiguates collisions
 mn.select(["age", "meta.level"], returns="values")      # → [[age,...], [meta.level,...]] (columnar)
-mn.select(["orders.?.customer_id->name"])                # wildcard/"->" fields too — {order_pk: {"name": ...}}
+mn.select(["orders.?.customer_id->name"])                # wildcard/"->" default: lands on target table → {"customers": {100: {...}, ...}}
+mn.select(["orders.?.customer_id->name"], returns="rows_here")  # flat extraction instead → {order_pk: {"name": ...}}
 
 mn.group_by("active")                                   # → {value: ModDict, ...}
 mn.group_by("meta.level")
@@ -270,7 +271,7 @@ del mn["employees"][1]                                      # cascades to every 
 # JOIN in WHERE — "->" resolves a declared link mid-path, chainable across hops
 mn.filter("orders.?.customer_id->name").eq("Alice")         # orders whose customer's name is "Alice"
 mn.filter("orders.?.customer_id->company_id->name").eq("Acme")  # 2 hops
-mn.select(["orders.?.customer_id->name"])                   # {order_pk: {"name": ...}, ...}
+mn.select(["orders.?.customer_id->name"])                   # default returns="rows": lands on target table → {"customers": {100: {...}, ...}}
 ```
 
 `on_delete` is `"restrict"` *(default — refuses if still referenced)*,
@@ -291,8 +292,30 @@ skip_managers = mn.follow("employees.?.manager_id", keys=managers.keys()) # 2 ho
 `->`, by contrast, is for a *statically known* number of hops in one
 expression and works inside `filter()`/`select()` directly — `.eq()` is
 index-accelerated (no table scan); `.ne()/.lt()/.between()/.in_()/...` fall
-back to a scan of the anchor table. `returns="rows_here"`/`"values"` aren't
-supported on a `->` path (ambiguous once two tables are involved).
+back to a scan of the anchor table. `returns="rows_here"`/`"values"` report
+data from the **anchor** row (e.g. `orders`, not wherever the hop lands),
+one entry per matching anchor row, not deduplicated by target.
+
+`select()`'s default (`returns="rows"`) works differently from `filter()`'s:
+a wildcard/`->` field doesn't extract a value — it **lands on and keeps the
+table** the field resolves to (multi-hop chains `follow()` under the hood; a
+field with no `->` hop just keeps its own anchor table, unchanged). Fields
+resolve independently and merge into one ModDict — mixing hop and non-hop
+fields, or fields anchored on different tables, is fine:
+
+```python
+mn.select(["workgroup.?.group_id->name"])                              # → {"user_group": {100: {...}, ...}}
+mn.select(["workgroup.?.group_id->name", "workgroup.?.status"])        # → {"user_group": {...}, "workgroup": {...}}
+mn.select(["workgroup.?.group_id->name"], returns="rows_here")         # → {1: {"name": "Engineering"}, ...} (old flat extraction)
+```
+
+Both a `->`-containing `filter()` and a table-landing `select()` result are
+themselves chainable — a further `.filter("user_group.?.field->...")` or
+`.select(...)` call relays the whole call up to the root ModDict and
+intersects with the already-narrowed rows, so multi-step chains across
+tables work as expected. Reverse traversal (landing on a table that
+*references* the current one, rather than one it points to) isn't
+supported — only the direction a `link()` was declared in.
 
 ### Custom type converters
 
@@ -304,7 +327,30 @@ md.register_converter(MyType, lambda obj: obj.to_dict())
 mn["key"] = {"value": MyType(...)}   # → stored as dict, serializable
 ```
 
-Built-in converters for `shapely` geometry (WKB) and `geoalchemy2` (WKBElement) activate automatically when the library is installed.
+A type with no registered converter and no built-in support raises
+`TypeError` at `serialize()`/`dumps()` time — it's never silently dropped or
+turned into `None`.
+
+### Geometry (WKB) — shapely / geoalchemy2
+
+A `shapely` geometry or `geoalchemy2.WKBElement` value serializes as raw WKB
+bytes regardless of which library produced it. On the reading side, which
+library it reconstructs into is controlled by `md.set_geo_backend(...)`, not
+by which one wrote it:
+
+```python
+md.set_geo_backend("shapely")       # or "geoalchemy2", or None to clear
+```
+
+- Only one of the two libraries installed on the reading side → that one is
+  used automatically, no call needed.
+- Both installed → **required** — deserializing a geometry without calling
+  this first raises `ValueError` (ambiguous which to reconstruct into).
+- Neither installed → the raw WKB `bytes` come back instead, no data loss.
+
+`md.ShapelyWKB(raw_bytes)` / `md.GeoAlchemyWKB(raw_bytes)` let you tag raw
+WKB bytes for storage without either library installed on the writing side —
+same reconstruction rules apply on read.
 
 Full type stubs with docstrings are in `src/mod_dict.pyi` — visible in IDE on hover and via `help()`.
 

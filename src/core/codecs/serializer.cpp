@@ -3,9 +3,102 @@
 #include <cstring>
 #include <vector>
 
+// Defined in python_bindings/module.cpp - explicit WKB-wrapper classes for
+// tagging raw bytes without the real shapely/geoalchemy2 library installed
+// on the writing side. Their __module__ is "mod_dict", not "shapely"/
+// "geoalchemy2", so they need a direct type check, not the module-name
+// sniffing used for the real library objects below.
+extern PyTypeObject ShapelyWKB_Type;
+extern PyTypeObject GeoAlchemyWKB_Type;
+
 namespace Serializer {
 
 static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj);
+
+// ── WKB geometry deserialize backend preference ───────────────────────────────
+static std::string s_geo_backend;  // empty = unset (auto-detect)
+
+bool set_geo_backend(const char* name) {
+    if (!name) { s_geo_backend.clear(); return true; }
+    if (strcmp(name, "shapely") != 0 && strcmp(name, "geoalchemy2") != 0) {
+        PyErr_Format(PyExc_ValueError,
+            "set_geo_backend: name must be 'shapely' or 'geoalchemy2', got '%s'", name);
+        return false;
+    }
+    PyObject* mod = PyImport_ImportModule(name);
+    if (!mod) {
+        PyErr_Format(PyExc_ImportError,
+            "set_geo_backend: '%s' is not installed", name);
+        return false;
+    }
+    Py_DECREF(mod);
+    s_geo_backend = name;
+    return true;
+}
+
+const char* get_geo_backend() {
+    return s_geo_backend.empty() ? nullptr : s_geo_backend.c_str();
+}
+
+// Reconstruct a shapely geometry or geoalchemy2 WKBElement from raw WKB bytes.
+// Honors an explicit set_geo_backend() preference; otherwise auto-detects
+// among whichever of {shapely, geoalchemy2} is importable — falls back to
+// the raw bytes if neither is installed, raises if both are (ambiguous,
+// caller must disambiguate via set_geo_backend()).
+static PyObject* reconstruct_wkb(PyObject* wkb) {
+    bool has_shapely    = false;
+    bool has_geoalchemy = false;
+    {
+        PyObject* m = PyImport_ImportModule("shapely.wkb");
+        if (m) { has_shapely = true; Py_DECREF(m); } else PyErr_Clear();
+    }
+    {
+        PyObject* m = PyImport_ImportModule("geoalchemy2");
+        if (m) { has_geoalchemy = true; Py_DECREF(m); } else PyErr_Clear();
+    }
+
+    const char* pref = get_geo_backend();
+    bool want_shapely;
+    if (pref) {
+        want_shapely = (strcmp(pref, "shapely") == 0);
+        if (want_shapely && !has_shapely) {
+            PyErr_SetString(PyExc_ImportError,
+                "reconstruct WKB: geo backend set to 'shapely' but shapely is not installed");
+            return nullptr;
+        }
+        if (!want_shapely && !has_geoalchemy) {
+            PyErr_SetString(PyExc_ImportError,
+                "reconstruct WKB: geo backend set to 'geoalchemy2' but geoalchemy2 is not installed");
+            return nullptr;
+        }
+    } else {
+        if (has_shapely && has_geoalchemy) {
+            PyErr_SetString(PyExc_ValueError,
+                "reconstruct WKB: both shapely and geoalchemy2 are installed - call "
+                "md.set_geo_backend(\"shapely\") or md.set_geo_backend(\"geoalchemy2\") "
+                "to disambiguate which one to deserialize into");
+            return nullptr;
+        }
+        if (!has_shapely && !has_geoalchemy) {
+            Py_INCREF(wkb);
+            return wkb;  // neither installed - hand back the raw WKB bytes, no data loss
+        }
+        want_shapely = has_shapely;
+    }
+
+    PyObject* result = nullptr;
+    if (want_shapely) {
+        PyObject* sh = PyImport_ImportModule("shapely.wkb");
+        result = sh ? PyObject_CallMethod(sh, "loads", "O", wkb) : nullptr;
+        Py_XDECREF(sh);
+    } else {
+        PyObject* ga  = PyImport_ImportModule("geoalchemy2");
+        PyObject* cls = ga ? PyObject_GetAttrString(ga, "WKBElement") : nullptr;
+        result = cls ? PyObject_CallOneArg(cls, wkb) : nullptr;
+        Py_XDECREF(cls); Py_XDECREF(ga);
+    }
+    return result;
+}
 
 static void backfill_length(std::vector<uint8_t>& buf, size_t len_pos) {
     uint32_t len = (uint32_t)(buf.size() - len_pos - 4);
@@ -77,13 +170,37 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
         return;
     }
 
+    if (PyByteArray_Check(obj)) {
+        Py_ssize_t len = PyByteArray_GET_SIZE(obj);
+        buf.push_back(to_byte(TypeId::BYTEARRAY));
+        write_u32(buf, (uint32_t)len);
+        write_bytes(buf, (const uint8_t*)PyByteArray_AS_STRING(obj), (size_t)len);
+        return;
+    }
+
     if (PyList_Check(obj)) {
         buf.push_back(to_byte(TypeId::LIST));
         size_t lp = buf.size(); write_u32(buf, 0);
         size_t cp = buf.size(); write_u32(buf, 0);
         uint32_t count = (uint32_t)PyList_GET_SIZE(obj);
-        for (uint32_t i = 0; i < count; i++)
+        for (uint32_t i = 0; i < count; i++) {
             serialize_pyobj(buf, PyList_GET_ITEM(obj, i));
+            if (PyErr_Occurred()) return;
+        }
+        write_u32_at(buf, cp, count);
+        backfill_length(buf, lp);
+        return;
+    }
+
+    if (PyTuple_Check(obj)) {
+        buf.push_back(to_byte(TypeId::TUPLE));
+        size_t lp = buf.size(); write_u32(buf, 0);
+        size_t cp = buf.size(); write_u32(buf, 0);
+        uint32_t count = (uint32_t)PyTuple_GET_SIZE(obj);
+        for (uint32_t i = 0; i < count; i++) {
+            serialize_pyobj(buf, PyTuple_GET_ITEM(obj, i));
+            if (PyErr_Occurred()) return;
+        }
         write_u32_at(buf, cp, count);
         backfill_length(buf, lp);
         return;
@@ -97,11 +214,29 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
         PyObject *k, *v; Py_ssize_t pos = 0;
         while (PyDict_Next(obj, &pos, &k, &v)) {
             serialize_pyobj(buf, k);
+            if (PyErr_Occurred()) return;
             serialize_pyobj(buf, v);
+            if (PyErr_Occurred()) return;
             count++;
         }
         write_u32_at(buf, cp, count);
         backfill_length(buf, lp);
+        return;
+    }
+
+    if (PyObject_TypeCheck(obj, &ShapelyWKB_Type) || PyObject_TypeCheck(obj, &GeoAlchemyWKB_Type)) {
+        const char* attr = PyObject_TypeCheck(obj, &ShapelyWKB_Type) ? "wkb" : "data";
+        PyObject* b = PyObject_GetAttrString(obj, attr);
+        if (b && PyBytes_Check(b)) {
+            Py_ssize_t len = PyBytes_GET_SIZE(b);
+            buf.push_back(to_byte(TypeId::WKB));
+            write_u32(buf, (uint32_t)len);
+            write_bytes(buf, (const uint8_t*)PyBytes_AS_STRING(b), (size_t)len);
+        } else {
+            PyErr_Clear();
+            buf.push_back(to_byte(TypeId::NONE)); write_u32(buf, 0);
+        }
+        Py_XDECREF(b);
         return;
     }
 
@@ -117,6 +252,7 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
             while ((item = PyIter_Next(it))) {
                 serialize_pyobj(buf, item);
                 Py_DECREF(item);
+                if (PyErr_Occurred()) break;
                 count++;
             }
             Py_DECREF(it);
@@ -210,30 +346,33 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
             return;
         }
 
-        if (strncmp(mname, "shapely", 7) == 0) {
+        if (strcmp(mname, "uuid") == 0) {
             Py_DECREF(tp_mod);
-            PyObject* wkb = PyObject_GetAttrString(obj, "wkb");
-            if (wkb && PyBytes_Check(wkb)) {
-                Py_ssize_t len = PyBytes_GET_SIZE(wkb);
-                buf.push_back(to_byte(TypeId::GEOMETRY_SHAPELY));
-                write_u32(buf, (uint32_t)len);
-                write_bytes(buf, (const uint8_t*)PyBytes_AS_STRING(wkb), (size_t)len);
-            } else {
-                PyErr_Clear();
-                buf.push_back(to_byte(TypeId::NONE)); write_u32(buf, 0);
-            }
-            Py_XDECREF(wkb);
+            PyObject* sv = PyObject_Str(obj);
+            Py_ssize_t len = 0; const char* s = nullptr;
+            if (sv) s = PyUnicode_AsUTF8AndSize(sv, &len);
+            if (!s) { PyErr_Clear(); s = ""; len = 0; }
+            buf.push_back(to_byte(TypeId::UUID));
+            write_u32(buf, (uint32_t)len);
+            write_bytes(buf, (const uint8_t*)s, (size_t)len);
+            Py_XDECREF(sv);
             return;
         }
 
-        if (strncmp(mname, "geoalchemy2", 11) == 0) {
+        if (strncmp(mname, "shapely", 7) == 0 || strncmp(mname, "geoalchemy2", 11) == 0) {
+            bool is_shapely = strncmp(mname, "shapely", 7) == 0;
             Py_DECREF(tp_mod);
-            PyObject* desc = PyObject_GetAttrString(obj, "desc");
-            PyObject* wkb = desc ? PyObject_Bytes(desc) : nullptr;
-            Py_XDECREF(desc);
+            PyObject* wkb;
+            if (is_shapely) {
+                wkb = PyObject_GetAttrString(obj, "wkb");
+            } else {
+                PyObject* desc = PyObject_GetAttrString(obj, "desc");
+                wkb = desc ? PyObject_Bytes(desc) : nullptr;
+                Py_XDECREF(desc);
+            }
             if (wkb && PyBytes_Check(wkb)) {
                 Py_ssize_t len = PyBytes_GET_SIZE(wkb);
-                buf.push_back(to_byte(TypeId::GEOMETRY_GEOALCHEMY));
+                buf.push_back(to_byte(TypeId::WKB));
                 write_u32(buf, (uint32_t)len);
                 write_bytes(buf, (const uint8_t*)PyBytes_AS_STRING(wkb), (size_t)len);
             } else {
@@ -248,6 +387,16 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
     }
 
 fallback_none:
+    {
+        PyObject* tp_name = PyObject_GetAttrString((PyObject*)Py_TYPE(obj), "__qualname__");
+        const char* tn = tp_name ? PyUnicode_AsUTF8(tp_name) : nullptr;
+        PyErr_Format(PyExc_TypeError,
+            "cannot serialize value of type '%s' - register a converter via "
+            "md.register_converter(type, callable) or convert it to a supported "
+            "type first",
+            tn ? tn : Py_TYPE(obj)->tp_name);
+        Py_XDECREF(tp_name);
+    }
     buf.push_back(to_byte(TypeId::NONE));
     write_u32(buf, 0);
 }
@@ -369,28 +518,29 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
             break;
         }
 
-        case TypeId::GEOMETRY:
-            result = PyBytes_FromStringAndSize((const char*)ptr, (Py_ssize_t)length);
-            break;
-
-        case TypeId::GEOMETRY_SHAPELY: {
+        case TypeId::WKB: {
             PyObject* wkb = PyBytes_FromStringAndSize((const char*)ptr, (Py_ssize_t)length);
-            PyObject* sh  = wkb ? PyImport_ImportModule("shapely.wkb") : nullptr;
-            result = sh ? PyObject_CallMethod(sh, "loads", "O", wkb) : nullptr;
-            Py_XDECREF(sh); Py_XDECREF(wkb);
+            result = wkb ? reconstruct_wkb(wkb) : nullptr;
+            Py_XDECREF(wkb);
+            // Note: unlike the other cases here, a null result may carry a real
+            // pending exception (ambiguous backend, missing preferred library) -
+            // don't clear it, so it propagates instead of silently becoming None.
+            break;
+        }
+
+        case TypeId::UUID: {
+            PyObject* uuid_mod = PyImport_ImportModule("uuid");
+            PyObject* uuid_cls = uuid_mod ? PyObject_GetAttrString(uuid_mod, "UUID") : nullptr;
+            PyObject* sv = PyUnicode_FromStringAndSize((const char*)ptr, (Py_ssize_t)length);
+            result = (uuid_cls && sv) ? PyObject_CallOneArg(uuid_cls, sv) : nullptr;
+            Py_XDECREF(sv); Py_XDECREF(uuid_cls); Py_XDECREF(uuid_mod);
             if (!result) PyErr_Clear();
             break;
         }
 
-        case TypeId::GEOMETRY_GEOALCHEMY: {
-            PyObject* wkb = PyBytes_FromStringAndSize((const char*)ptr, (Py_ssize_t)length);
-            PyObject* ga  = wkb ? PyImport_ImportModule("geoalchemy2") : nullptr;
-            PyObject* cls = ga  ? PyObject_GetAttrString(ga, "WKBElement") : nullptr;
-            result = cls ? PyObject_CallOneArg(cls, wkb) : nullptr;
-            Py_XDECREF(cls); Py_XDECREF(ga); Py_XDECREF(wkb);
-            if (!result) PyErr_Clear();
+        case TypeId::BYTEARRAY:
+            result = PyByteArray_FromStringAndSize((const char*)ptr, (Py_ssize_t)length);
             break;
-        }
 
         case TypeId::LIST:
         case TypeId::SET:
@@ -413,6 +563,21 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
                 Py_DECREF(result);
                 result = fs ? fs : Py_None;
                 if (result == Py_None) Py_INCREF(result);
+            }
+            break;
+        }
+
+        case TypeId::TUPLE: {
+            if (length < 4) break;
+            uint32_t count = read_u32(ptr);
+            const uint8_t* col_end = data_end;
+            result = PyTuple_New((Py_ssize_t)count);
+            if (!result) { PyErr_Clear(); break; }
+            for (uint32_t i = 0; i < count && ptr < col_end; i++) {
+                ModValue mv = deserialize_value(ptr, col_end, nullptr);
+                PyObject* item = mv.obj ? mv.obj : Py_None;
+                Py_INCREF(item);
+                PyTuple_SET_ITEM(result, i, item);
             }
             break;
         }
@@ -440,7 +605,13 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
 
     ptr = data_end;
 
-    if (!result) {
+    // A null result usually just means "couldn't reconstruct, fall back to
+    // None" (e.g. optional lib missing for a best-effort case above) - but if
+    // it comes with a pending exception (e.g. ambiguous WKB backend), that's a
+    // real error: leave result null and don't clear it, so callers checking
+    // PyErr_Occurred() (or mv.obj == nullptr) see the failure instead of a
+    // silently-substituted None.
+    if (!result && !PyErr_Occurred()) {
         result = Py_None; Py_INCREF(result);
     }
 

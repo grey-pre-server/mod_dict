@@ -236,7 +236,7 @@ class ModDict:
     Prefer ModDict when you need:
     - Repeated ``filter`` / ``group_by`` / ``sort_by`` on large datasets (index pays off)
     - ``merge`` that updates specific nested fields across thousands of rows
-    - Serialization with full Python type set (date, bytes, Decimal, Path, …)
+    - Serialization with full Python type set (date, bytes, bytearray, tuple, uuid, Decimal, Path, …)
     - In-process cache shared across asyncio coroutines (zero-copy refs)
 
     Prefer plain dict when:
@@ -999,10 +999,14 @@ class ModDict:
         Serialize the entire ModDict to a compact binary format.
 
         The format preserves all supported types including datetime, date,
-        time, bytes, pathlib paths, set, frozenset, and Decimal.
+        time, bytes, bytearray, pathlib paths, set, frozenset, tuple, uuid.UUID,
+        Decimal, and WKB geometry (shapely / geoalchemy2 — see
+        ``set_geo_backend()``).
 
-        ``PYOBJECT`` values (arbitrary Python objects) are **not** serializable
-        and will raise ``TypeError``.
+        Any other type (arbitrary Python objects with no registered converter)
+        is **not** serializable and raises ``TypeError`` — register a
+        converter first via ``md.register_converter()``, or convert the value
+        to a supported type before storing/serializing it.
 
         Returns:
             Bytes object. Can be stored to disk or transferred over network.
@@ -1144,9 +1148,10 @@ class ShapelyWKB:
     Wrapper to explicitly tag raw WKB bytes as a Shapely geometry.
 
     Use when you want to store geometry data without having Shapely
-    installed on the writing side. On the reading side, if Shapely
-    is available, the value is reconstructed as a ``shapely`` geometry
-    object automatically.
+    installed on the writing side. On the reading side, reconstructs as a
+    ``shapely`` geometry object if Shapely is importable there — see
+    ``set_geo_backend()`` for what happens if both Shapely and GeoAlchemy2
+    are installed on the reading side, or neither is.
 
     Example::
 
@@ -1163,7 +1168,7 @@ class GeoAlchemyWKB:
     Wrapper to explicitly tag raw WKB bytes as a GeoAlchemy2 geometry.
 
     Analogous to ``ShapelyWKB`` but reconstructs as ``geoalchemy2.WKBElement``
-    when GeoAlchemy2 is available on the reading side.
+    — see ``set_geo_backend()`` for the reading-side reconstruction rules.
 
     Example::
 
@@ -1172,19 +1177,50 @@ class GeoAlchemyWKB:
     def __init__(self, data: bytes) -> None: ...
 
 
+def set_geo_backend(name: Literal["shapely", "geoalchemy2"] | None) -> None:
+    """
+    Choose which library a deserialized geometry reconstructs into.
+
+    A serialized geometry only ever remembers that it *is* WKB geometry data
+    — reconstructing it back into a ``shapely`` object or a
+    ``geoalchemy2.WKBElement`` depends on what's importable on the reading
+    side, regardless of which one wrote it:
+
+    - Only one of Shapely / GeoAlchemy2 installed: that one is used
+      automatically, no call to this function needed.
+    - Both installed: **required** — deserializing a geometry without
+      calling this first raises ``ValueError`` (ambiguous which to use).
+    - Neither installed: the raw WKB ``bytes`` are returned instead — no
+      data loss, just no reconstruction.
+
+    Raises ``ValueError`` if *name* isn't ``"shapely"``/``"geoalchemy2"``/
+    ``None``, or ``ImportError`` if that library isn't actually installed.
+    Pass ``None`` to clear a previously set preference.
+
+    Example::
+
+        md.set_geo_backend("shapely")   # both libs installed -> always shapely
+        mn2 = md.loads(md.dumps(mn))    # geometries come back as shapely objects
+    """
+    ...
+
+
 def dumps(obj: Any) -> bytes:
     """
     Serialize any supported object to bytes — not just a ModDict.
 
     A ``ModDict`` is serialized with its own container format (the same one
     ``ModDict.serialize()`` uses), so ``loads()`` reconstructs a ``ModDict``
-    back. Any other supported value (dict, list, str, int, float, bytes,
-    set, frozenset, datetime, Decimal, Path, …) uses a lighter single-value
-    format and round-trips back as itself.
+    back. Any other supported value (dict, list, tuple, str, int, float,
+    bytes, bytearray, set, frozenset, datetime, Decimal, Path, uuid.UUID, …)
+    uses a lighter single-value format and round-trips back as itself.
 
     There is **no** implicit ``ModDict`` → ``dict`` conversion — call
     ``mn.to_dict()`` first if you specifically want the plain-dict form
     serialized.
+
+    An unsupported type (no registered converter, not one of the above)
+    raises ``TypeError`` rather than silently losing data.
 
     Example::
 

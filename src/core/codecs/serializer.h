@@ -43,6 +43,14 @@ void     deserialize_dict_i (const uint8_t*& ptr, const uint8_t* end,
 std::vector<uint8_t> serialize_interned(const ModDict* dict);
 void                 deserialize_interned(const uint8_t* data, size_t len, ModDict* dict);
 
+// ── WKB geometry deserialize backend preference ───────────────────────────────
+// Controls which library a serialized shapely/geoalchemy2 geometry reconstructs
+// into on read. name must be "shapely" or "geoalchemy2"; raises (Python
+// exception set, returns false) if the name is invalid or that library isn't
+// importable. Passing nullptr clears the preference (back to auto-detect).
+bool        set_geo_backend(const char* name);
+const char* get_geo_backend();  // nullptr if unset
+
 } // namespace Serializer
 
 #endif

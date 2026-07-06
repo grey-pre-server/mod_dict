@@ -33,12 +33,13 @@ enum class TypeId : uint8_t {
     ENUM      = 17,
     NDARRAY   = 18,
     DATAFRAME = 19,
-    GEOMETRY   = 20,  // deprecated — при чтении десериализуется как BYTES
     STRING_REF          = 21,  // индекс в таблице строк (интернирование)
-    GEOMETRY_SHAPELY    = 22,  // WKB → shapely.wkb.loads
-    GEOMETRY_GEOALCHEMY = 23,  // WKB → geoalchemy2.WKBElement
     PATH_POSIX          = 24,  // UTF-8 → pathlib.PurePosixPath
     PATH_WINDOWS        = 25,  // UTF-8 → pathlib.PureWindowsPath
+    TUPLE               = 26,
+    BYTEARRAY           = 27,
+    WKB                 = 28,  // raw WKB bytes; shapely/geoalchemy2/ShapelyWKB/GeoAlchemyWKB
+                               // all converge here on write - see reconstruct_wkb() for read
 };
 
 static constexpr uint8_t INTERNED_MAGIC = 0x49;  // 'I'

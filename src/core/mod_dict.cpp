@@ -1807,7 +1807,9 @@ std::vector<uint8_t> ModDict::serialize() const {
         buf.push_back(e.value.is_row ? 1 : 0);
 
         Serializer::serialize_pyobject(buf, e.value.key_py);
+        if (PyErr_Occurred()) return buf;
         Serializer::serialize_pyobject(buf, e.value.val_py ? e.value.val_py : Py_None);
+        if (PyErr_Occurred()) return buf;
     }
     return buf;
 }
@@ -1852,10 +1854,10 @@ void ModDict::deserialize(const uint8_t* data, size_t len) {
             bool     is_row = (*ptr++ != 0);
 
             ModValue key_mv = Serializer::deserialize_value(ptr, end, nullptr);
-            if (!key_mv.obj) goto truncated;
+            if (!key_mv.obj) { if (PyErr_Occurred()) return; goto truncated; }
 
             ModValue val_mv = Serializer::deserialize_value(ptr, end, nullptr);
-            if (!val_mv.obj) goto truncated;
+            if (!val_mv.obj) { if (PyErr_Occurred()) return; goto truncated; }
 
             PyObject* k = key_mv.obj;
             PyObject* v = val_mv.obj;

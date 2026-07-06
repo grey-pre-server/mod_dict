@@ -13,10 +13,13 @@ extern PyTypeObject RowProxy_Type;
 /* ============================================================================
    ShapelyWKB / GeoAlchemyWKB — лёгкие обёртки для raw WKB bytes.
    Позволяют явно пометить байты как гео-тип без наличия библиотеки на стороне
-   записи. duck-typing в from_pyobject подхватит их по атрибутам.
+   записи. serializer.cpp матчит их напрямую по типу (PyObject_TypeCheck
+   против ShapelyWKB_Type/GeoAlchemyWKB_Type, объявленных extern там) —
+   не через __module__/duck-typing, обёртки живут в модуле "mod_dict", не
+   "shapely"/"geoalchemy2".
 
-   md.ShapelyWKB(raw_bytes)    → хранится как GEOMETRY_SHAPELY
-   md.GeoAlchemyWKB(raw_bytes) → хранится как GEOMETRY_GEOALCHEMY
+   md.ShapelyWKB(raw_bytes) / md.GeoAlchemyWKB(raw_bytes) → оба хранятся как
+   единый TypeId::WKB (см. reconstruct_wkb() в serializer.cpp для чтения).
    ============================================================================ */
 
 // ── ShapelyWKB ──────────────────────────────────────────────────────────────
@@ -41,15 +44,15 @@ static PyMemberDef ShapelyWKB_members[] = {
     {"wkb", T_OBJECT_EX, offsetof(ShapelyWKBObject, wkb), READONLY, "WKB bytes"},
     {nullptr}
 };
-static PyTypeObject ShapelyWKB_Type = {
+PyTypeObject ShapelyWKB_Type = {
     .ob_base      = PyVarObject_HEAD_INIT(nullptr, 0)
     .tp_name      = "mod_dict.ShapelyWKB",
     .tp_basicsize = sizeof(ShapelyWKBObject),
     .tp_dealloc   = (destructor)ShapelyWKB_dealloc,
     .tp_repr      = (reprfunc)ShapelyWKB_repr,
     .tp_flags     = Py_TPFLAGS_DEFAULT,
-    .tp_doc       = "Wrap raw WKB bytes to be stored and deserialized as a shapely geometry.\n"
-                    "Requires shapely on the reading side: pip install shapely",
+    .tp_doc       = "Wrap raw WKB bytes to be stored, serialized as WKB geometry data.\n"
+                    "Reconstruction on the reading side follows set_geo_backend() - see its docstring.",
     .tp_members   = ShapelyWKB_members,
     .tp_init      = (initproc)ShapelyWKB_init,
     .tp_new       = PyType_GenericNew,
@@ -73,27 +76,20 @@ static void GeoAlchemyWKB_dealloc(GeoAlchemyWKBObject* self) {
 static PyObject* GeoAlchemyWKB_repr(GeoAlchemyWKBObject* self) {
     return PyUnicode_FromFormat("GeoAlchemyWKB(<%zd bytes>)", PyBytes_GET_SIZE(self->data));
 }
-// .wkt нужен duck-typing'у geoalchemy2 — возвращаем None (атрибут существует)
-static PyObject* GeoAlchemyWKB_get_wkt(GeoAlchemyWKBObject*, void*) { Py_RETURN_NONE; }
 static PyMemberDef GeoAlchemyWKB_members[] = {
     {"data", T_OBJECT_EX, offsetof(GeoAlchemyWKBObject, data), READONLY, "WKB bytes"},
     {nullptr}
 };
-static PyGetSetDef GeoAlchemyWKB_getset[] = {
-    {"wkt", (getter)GeoAlchemyWKB_get_wkt, nullptr, "sentinel for duck-typing", nullptr},
-    {nullptr}
-};
-static PyTypeObject GeoAlchemyWKB_Type = {
+PyTypeObject GeoAlchemyWKB_Type = {
     .ob_base      = PyVarObject_HEAD_INIT(nullptr, 0)
     .tp_name      = "mod_dict.GeoAlchemyWKB",
     .tp_basicsize = sizeof(GeoAlchemyWKBObject),
     .tp_dealloc   = (destructor)GeoAlchemyWKB_dealloc,
     .tp_repr      = (reprfunc)GeoAlchemyWKB_repr,
     .tp_flags     = Py_TPFLAGS_DEFAULT,
-    .tp_doc       = "Wrap raw WKB bytes to be stored and deserialized as a geoalchemy2.WKBElement.\n"
-                    "Requires geoalchemy2 on the reading side: pip install geoalchemy2",
+    .tp_doc       = "Wrap raw WKB bytes to be stored, serialized as WKB geometry data.\n"
+                    "Reconstruction on the reading side follows set_geo_backend() - see its docstring.",
     .tp_members   = GeoAlchemyWKB_members,
-    .tp_getset    = GeoAlchemyWKB_getset,
     .tp_init      = (initproc)GeoAlchemyWKB_init,
     .tp_new       = PyType_GenericNew,
 };
@@ -115,6 +111,27 @@ static PyObject* py_register_converter(PyObject*, PyObject* args) {
         return nullptr;
     }
     converter_registry_register(type_obj, callable);
+    Py_RETURN_NONE;
+}
+
+/* ============================================================================
+   set_geo_backend — which library a deserialized shapely/geoalchemy2 geometry
+   reconstructs into. Required if both are installed (otherwise ambiguous),
+   optional (auto-detected) if only one is. Pass None to clear the preference.
+   ============================================================================ */
+
+static PyObject* py_set_geo_backend(PyObject*, PyObject* arg) {
+    if (arg == Py_None) {
+        Serializer::set_geo_backend(nullptr);
+        Py_RETURN_NONE;
+    }
+    if (!PyUnicode_Check(arg)) {
+        PyErr_SetString(PyExc_TypeError, "set_geo_backend: name must be a str or None");
+        return nullptr;
+    }
+    const char* name = PyUnicode_AsUTF8(arg);
+    if (!name) return nullptr;
+    if (!Serializer::set_geo_backend(name)) return nullptr;
     Py_RETURN_NONE;
 }
 
@@ -181,6 +198,14 @@ static PyMethodDef module_methods[] = {
     {"loads", py_loads, METH_VARARGS,
      "loads(data)->object\n"
      "Deserialize bytes produced by dumps() (or ModDict.serialize())."},
+    {"set_geo_backend", py_set_geo_backend, METH_O,
+     "set_geo_backend(name)\n"
+     "Which library a deserialized shapely/geoalchemy2 geometry reconstructs\n"
+     "into: \"shapely\" or \"geoalchemy2\". Required if both are installed\n"
+     "(deserializing a geometry otherwise raises ValueError, ambiguous);\n"
+     "optional (auto-detected) if only one is installed. Pass None to clear\n"
+     "the preference. Raises ValueError/ImportError immediately if the name\n"
+     "is invalid or that library isn't importable."},
     {nullptr, nullptr, 0, nullptr}
 };
 
