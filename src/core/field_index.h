@@ -55,6 +55,17 @@ public:
     bool is_wildcard = false;
     std::vector<std::string> pattern;     // wildcard: сегменты пути
 
+    // Set once by build_wildcard() — whether pattern[0] resolved to a real
+    // top-level ModDict key at build time (the "g1.?.field" anchor-path
+    // case). on_insert_row()/on_remove_row() must reuse this cached decision
+    // instead of re-deriving it per mutation: re-deriving via find_anchor()
+    // and bailing out when it comes back empty silently stops maintaining
+    // the index for the (much more common) unanchored case, e.g.
+    // create_index("meta.level") or create_index("orders.?.status") where
+    // pattern[0] is just an ordinary per-row field, not a table key.
+    bool     has_anchor  = false;
+    uint64_t anchor_hash = 0;
+
     // field_value_hash → [outer_key_hash, ...]
     // Для wildcard-паттернов один outer_key_hash может встречаться несколько раз
     // (по разу на каждый совпавший inner-ключ этой внешней строки).

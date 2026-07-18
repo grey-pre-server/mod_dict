@@ -161,13 +161,15 @@ void FieldIndex::build_wildcard(ModDict* owner, const std::vector<std::string>& 
     field_name  = "";
     clear();
 
-    uint64_t anchor_hash = 0;
-    const OuterEntry* anchor = (!pat.empty()) ? find_anchor(owner, pat[0], anchor_hash) : nullptr;
+    uint64_t ah = 0;
+    const OuterEntry* anchor = (!pat.empty()) ? find_anchor(owner, pat[0], ah) : nullptr;
+    has_anchor  = (anchor != nullptr);
+    anchor_hash = has_anchor ? ah : 0;
 
     if (anchor) {
         // Anchored path: only scan the one row matched by pat[0], start at depth=1
         std::vector<PyObject*> wc_path;
-        collect_wildcard(anchor->val_py, pat, 1, anchor_hash, this, wc_path);
+        collect_wildcard(anchor->val_py, pat, 1, ah, this, wc_path);
     } else {
         for (auto& e : owner->outer.occupied()) {
             if (!e.value.is_row || !e.value.val_py) continue;
@@ -231,22 +233,21 @@ void FieldIndex::on_insert_row(uint64_t oh, ModDict* owner) {
         if (!fv_obj) return;
         ModValue fv = ModValue::from_pyobject(fv_obj);
         on_insert(oh, fv);
-    } else {
+    } else if (has_anchor) {
         // Anchored pattern: only update index when the anchored row itself changes
-        if (!pattern.empty() && pattern[0] != "__pass_key__") {
-            uint64_t anchor_hash = 0;
-            const OuterEntry* anchor = find_anchor(owner, pattern[0], anchor_hash);
-            if (!anchor || oh != anchor_hash) return;
-            PyObject* row = owner->get_row_ref(oh);
-            if (!row) return;
-            std::vector<PyObject*> wc_path;
-            collect_wildcard(row, pattern, 1, oh, this, wc_path);
-        } else {
-            PyObject* row = owner->get_row_ref(oh);
-            if (!row) return;
-            std::vector<PyObject*> wc_path;
-            collect_wildcard(row, pattern, 0, oh, this, wc_path);
-        }
+        if (oh != anchor_hash) return;
+        PyObject* row = owner->get_row_ref(oh);
+        if (!row) return;
+        std::vector<PyObject*> wc_path;
+        collect_wildcard(row, pattern, 1, oh, this, wc_path);
+    } else {
+        // Unanchored pattern (the common case: pattern[0] is an ordinary
+        // per-row field, e.g. "meta.level" or "orders.?.status") — every row
+        // maintains its own slice of the index, scan from depth 0.
+        PyObject* row = owner->get_row_ref(oh);
+        if (!row) return;
+        std::vector<PyObject*> wc_path;
+        collect_wildcard(row, pattern, 0, oh, this, wc_path);
     }
 }
 
@@ -260,11 +261,7 @@ void FieldIndex::on_remove_row(uint64_t oh, ModDict* owner) {
         on_remove(oh, fv);
     } else {
         // Anchored pattern: only update index when the anchored row itself is removed
-        if (!pattern.empty() && pattern[0] != "__pass_key__") {
-            uint64_t anchor_hash = 0;
-            const OuterEntry* anchor = find_anchor(owner, pattern[0], anchor_hash);
-            if (!anchor || oh != anchor_hash) return;
-        }
+        if (has_anchor && oh != anchor_hash) return;
         // Full rebuild is simplest for wildcard remove
         PyObject* row = owner->get_row_ref(oh);
         if (!row) return;
