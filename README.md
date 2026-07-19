@@ -178,6 +178,7 @@ orders.insert(key, row)          # -> int | None (new_index)
 orders.delete(key)               # -> int | None (old_index)
 orders.update_row(key, changes)  # -> ((old_index, new_index), changed_fields)
 orders.insert_batch({key: row, ...})  # -> list[int|None], one write pass, one connect() event
+orders.insert_batch([row, ...], key="id")  # same, key= extracts each row's outer key instead of a pre-keyed dict
 orders.connect("insert" | "update" | "delete" | "reorder", callback)
 
 # Aliases
@@ -199,6 +200,7 @@ mn.at(-1)                                        # last inserted key's value
 # Build from a list of dicts
 md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}
 md.ModDict.from_row(row)                         # normalize Mapping → plain dict
+mn.load_rows(rows, key="id", path="users")       # writes into an EXISTING mn: mn["users"] = {r["id"]: r for r in rows}
 
 # Serialize
 mn.serialize() / mn.deserialize(data)          # data → self, returned for chaining
@@ -336,6 +338,50 @@ tables work as expected. Reverse traversal (landing on a table that
 *references* the current one, rather than one it points to) isn't
 supported — only the direction a `link()` was declared in.
 
+### Many-to-many via a junction table
+
+A junction table (`users_groups` below) is nothing special — just an
+ordinary table with two `link()` declarations on it instead of one:
+
+```python
+mn = md.ModDict({
+    "users": {
+        "u1": {"id": "u1", "name": "alice", "note": "vip"},
+        "u2": {"id": "u2", "name": "bob",   "note": "trial"},
+    },
+    "users_groups": {
+        1: {"user_id": "u1", "group_id": 1},
+        2: {"user_id": "u1", "group_id": 2},
+    },
+    "groups": {
+        1: {"name": "engineering"},
+        2: {"name": "support"},
+    },
+})
+mn.link("users_groups.?.user_id", "users.?")     # matches against users' own KEY ("u1") — "id" being equal is a convention, not a requirement
+mn.link("users_groups.?.group_id", "groups.?")
+
+# every group alice belongs to: filter narrows users_groups by a JOIN
+# through user_id, select projects each match's group name through group_id
+mn.filter("users_groups.?.user_id->name").eq("alice") \
+  .select(["users_groups.?.group_id->name"], returns="values")[0]
+# → ["engineering", "support"]
+
+# a different field, through the SAME hop the filter already used
+mn.filter("users_groups.?.user_id->name").eq("alice") \
+  .select(["users_groups.?.user_id->note"], returns="values")[0]
+# → ["vip", "vip"] — one per matching membership row, not deduplicated by user
+```
+
+`link()`'s pk-based form matches a foreign-key field against the target
+table's own **outer dict key** — the row's `id` field is a plain field the
+link never looks at directly, so it's free to duplicate the key (as above,
+matching SQL's `SELECT *` returning the id column too) or be entirely
+unrelated to it — mod_dict never strips or requires it. If your foreign
+key instead matches a non-pk field, `link()`'s second form covers that:
+`mn.link(..., "users.?.id")` would match against the `id` *field* instead
+of the key.
+
 ## Cursors (reactive views for GUI tables)
 
 A **cursor** is a live, mutation-aware `ModDict` handle anchored at an
@@ -379,6 +425,10 @@ positions = orders.insert_batch({"o4": {"amount": 5, "status": "new"},
 # given — one write pass, one connect() event, existing rows displaced by
 # the batch aren't individually reported (same reasoning as insert() above)
 
+# same effect from a plain list, key= extracts each row's own outer key —
+# saves building the {key: row} mapping yourself in a Python loop first
+orders.insert_batch([{"id": "o4", "amount": 5, "status": "new"}], key="id")
+
 orders.connect("insert", lambda new_index: qt_model.apply_insert(new_index))
 orders.connect("update", lambda payload: qt_model.apply_update(payload))
 orders.connect("delete", lambda old_index: qt_model.apply_delete(old_index))
@@ -416,10 +466,16 @@ the cursor's own state was immediately before the call.
 whole-collection operations (`link`, `follow`, `select`, `copy`, `serialize`,
 `group_by`, `keys`/`values`/`items`, `alias`, `pop`, ...) — these raise
 `NotImplementedError` on a cursor by design; a cursor is a live positional
-view for GUI backing, not a second full `ModDict`. `set_filter()`'s
-membership is tracked and diffed correctly but not yet composed into
-`len()`/iteration/`.at()` — those still show every row under the anchor
-regardless of filter state.
+view for GUI backing, not a second full `ModDict`.
+
+`set_filter()` is fully composed into reads: with an active filter,
+`len()`/iteration/`.at(i)` only see the passing rows, densely indexed
+(`.at(0)` is the first *visible* row, not necessarily the first row under
+the anchor) — and `insert()`/`update_row()`/`delete()`'s returned
+position(s) agree with that same numbering. Key-based access (`cursor[key]`,
+`in`, `del cursor[key]`) is unaffected by the filter either way — a
+filtered-out row is still fully present in the underlying data, just absent
+from the positional/iteration view.
 
 Full method docs (return shapes, event payloads, edge cases) are in
 `src/mod_dict.pyi`.

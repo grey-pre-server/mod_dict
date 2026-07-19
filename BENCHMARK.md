@@ -230,71 +230,108 @@ replaces) — every row below is measured against it, not in isolation.
 
 | Operation | list | cursor | ratio |
 |-----------|------|--------|-------|
-| `cursor()` creation (any anchor size, 1k–50k rows) | — | 1.7–2.0µs | constant, doesn't scan the table |
-| `bisect.insort` vs `insert()` (1 000 rows, sort active) | 2.1µs | 3.5µs | 0.61× (i.e. 1.7× slower) |
-| `bisect.insort` vs `insert()` (10 000 rows) | 4.8µs | 8.2µs | 0.59× (1.71× slower) |
-| `bisect.insort` vs `insert()` (50 000 rows) | 13.8µs | 19.7µs | 0.70× (1.43× slower) |
-| `bisect.insort` × 5 000 in a loop vs `append`+`sort()` once (list, its own batch strategy) | 9ms | 2ms | 5.57× faster |
-| `append`+`sort()` (list) vs `insert_batch()` (cursor), both batch-style | 2ms | 1ms | **2.59×** faster — cursor batch beats even list's own best strategy |
-| `insert()` × 5 000 in a loop vs `insert_batch()` once | 250ms | 1ms | **401×** faster |
-| `sorted(list)` vs `set_sort()` bootstrap (1k / 10k / 50k rows) | 0 / 2 / 10ms | 0 / 6 / 39ms | ~2.8–3.9× slower — see below |
-| list comprehension vs `set_filter()` bootstrap (1k / 10k / 50k rows) | 0 / 1 / 3ms | 0 / 2 / 15ms | ~3.7–5× slower — see below |
-| `list.sort(key=group)` vs `set_group()` bootstrap (1k / 10k / 50k rows) | 0 / 1 / 8ms | 0 / 4 / 26ms | ~2.1–3.2× slower — see below |
-| `insert()` with 0 / 1 / 5 / 20 sibling cursors registered (sort active) | — | 1.8µs / 1.1ms / 5.5ms / 22.3ms | scales linearly with live siblings |
-| per-row `mn[k]=v` × 20 000 into an indexed `ModDict` vs `mn.update()` (batched `FieldIndex` rebuild) | 237ms | 62ms | **3.83×** faster |
+| `cursor()` creation (any anchor size, 1k–100k rows) | — | 1.7–3.2µs | constant, doesn't scan the table |
+| `bisect.insort` vs `insert()` (1 000 rows, sort active) | 1.9µs | 5.8µs | 0.33× (i.e. 3× slower — small-n noise, both sides sub-6µs) |
+| `bisect.insort` vs `insert()` (10 000 rows) | 8.4µs | 10.4µs | 0.80× (1.25× slower) |
+| `bisect.insort` vs `insert()` (50 000 rows) | 17.3µs | 17.5µs | ~equal |
+| `bisect.insort` vs `insert()` (100 000 rows) | 27.3µs | 24.5µs | **1.12×** faster |
+| `bisect.insort` × 5 000 in a loop vs `append`+`sort()` once (list, its own batch strategy) | 13ms | 2ms | 6.20× faster |
+| `append`+`sort()` (list) vs `insert_batch()` (cursor), both batch-style | 2ms | 1ms | **2.14×** faster — cursor batch beats even list's own best strategy |
+| `insert()` × 5 000 in a loop vs `insert_batch()` once | 207ms | 1ms | **207×** faster |
+| `sorted(list)` vs `set_sort()` bootstrap (1k / 10k / 50k / 100k rows) | 0 / 2 / 15 / 29ms | 0 / 5 / 47 / 93ms | ~3.0–3.2× slower — see below |
+| list comprehension vs `set_filter()` bootstrap (1k / 10k / 50k / 100k rows) | 0 / 1 / 4 / 7ms | 0 / 3 / 31 / 60ms | ~3.8–8.3× slower — see below |
+| `list.sort(key=group)` vs `set_group()` bootstrap (1k / 10k / 50k / 100k rows) | 0 / 1 / 10 / 20ms | 0 / 3 / 22 / 50ms | ~1.7–2.6× slower — see below |
+| `insert()` with 0 / 1 / 5 / 20 sibling cursors registered (sort active) | — | 3.2µs / 1.4ms / 7.2ms / 28.2ms | scales linearly with live siblings |
+| find-by-key+`del` vs `delete()` under active sort (1k / 10k / 50k / 100k rows) | 32 / 460 / 4 039 / 8 677µs | 4 / 60 / 644 / 2 689µs | **3.2–8.6×** faster — see below |
+| find-by-key+`pop`+`insort` vs `update_row()` (sort field changes, 1k / 10k / 50k / 100k rows) | 46 / 375 / 3 997 / 8 577µs | 9 / 74 / 655 / 3 044µs | **2.8–6.1×** faster — see below |
+| `bisect.insort`+`set.add` vs `insert()` (sort **and** filter active, 1k / 10k / 50k / 100k rows) | 4.2 / 8.1 / 15.1 / 22.0µs | 5.3 / 15.6 / 29.8 / 41.1µs | ~1.25–1.96× slower — see below |
+| per-row `mn[k]=v` × 20 000 into an indexed `ModDict` vs `mn.update()` (batched `FieldIndex` rebuild) | 282ms | 86ms | **3.27×** faster |
 
-**`insert()` lands within ~1.4–1.7× of a bare Python list `bisect.insort`** —
-close to the theoretical floor once you account for what a cursor does that
-a list doesn't: write through to the parent's real dict, maintain a field
-index hook, and check for registered sibling cursors. Getting here took two
-rounds of fixing: a bisect fast path (`O(log n)` search + a pointer-only
-`vector::insert` shift, replacing an `O(n log n)` full re-sort per single
-insert), and then discovering the fast path *itself* was still reporting
-every row shifted by the insertion as an explicit `(old_index, new_index)`
-pair — cheap in C++, but each pair meant allocating 2 Python ints + a tuple,
-which dominated the cost at scale (~25 000 pairs for a single insert into
-50 000 rows). `insert()`/`delete()`/`insert_batch()` now report only the
-row(s) actually being written, not every sibling a GUI's own
-`beginInsertRows`/`beginRemoveRows` already re-numbers implicitly —
-`update_row()` is the one exception, returning both old and new index,
-because a field-driven move is a `beginMoveRows` and there's no way for the
-GUI to infer the "from" side on its own.
+**`insert()` catches up to and then overtakes `bisect.insort` as the table
+grows** — noticeably slower at 1 000 rows (both sides sub-6µs, mostly
+fixed-overhead noise), roughly at parity by 50 000, and **faster** than the
+list at 100 000. Both sides do an `O(log n)`
+position search followed by an `O(shift distance)` shift, but the list's
+shift is a Python-level `list.insert()` (moving `PyObject*` pointers one
+Python C-API call's worth of overhead at a time), while the cursor's shift
+is a raw `std::vector<PyObject*>::insert()` — a `memmove` in C++. The gap
+between those two shift implementations only starts to outweigh the
+cursor's fixed per-call overhead (write-through to the parent dict, field
+index hook, sibling-cursor check) once there's enough data being shifted,
+which is why the crossover shows up around 50k rows and not sooner. Getting
+this close took two rounds of fixing: a bisect fast path (`O(log n)`
+search + a pointer-only `vector::insert` shift, replacing an `O(n log n)`
+full re-sort per single insert), and then discovering the fast path
+*itself* was still reporting every row shifted by the insertion as an
+explicit `(old_index, new_index)` pair — cheap in C++, but each pair meant
+allocating 2 Python ints + a tuple, which dominated the cost at scale
+(~25 000 pairs for a single insert into 50 000 rows). `insert()`/`delete()`/
+`insert_batch()` now report only the row(s) actually being written, not
+every sibling a GUI's own `beginInsertRows`/`beginRemoveRows` already
+re-numbers implicitly — `update_row()` is the one exception, returning
+both old and new index, because a field-driven move is a `beginMoveRows`
+and there's no way for the GUI to infer the "from" side on its own.
 
 **`set_sort()` bootstrap was originally 20–33× slower than `list.sort()`,
-now ~2.8–3.9×.** The root cause wasn't "C++ vs Python" — it was that the
-sort comparator re-extracted and re-converted each row's field value from
-scratch on *every pairwise comparison* (`O(n log n)` extractions for a
-50 000-row sort — roughly 1.5 million dict/field lookups for the same
-50 000 values). Python's own `list.sort(key=...)` avoids exactly this via
-decorate-sort-undecorate: compute each element's key once, then sort the
-cheap precomputed keys. `rebuild_sort_index()` now does the same —
-precompute every row's sort/group `ModValue`s in one `O(n)` pass, then sort
-by the precomputed values. The remaining ~3–4× gap is real, inherent
-`ModValue`/`PyObject` comparison overhead a raw Python `sort(key=...)` never
-pays — no longer an avoidable algorithmic difference.
+now ~3.0–3.2×.** Three rounds of fixes got it here. First, precomputing
+each row's sort/group `ModValue` once (decorate-sort-undecorate, same as
+Python's own `list.sort(key=...)`) instead of the comparator re-extracting
+it on every pairwise comparison — was `O(n log n)` field lookups for a
+100 000-row sort instead of `O(n)`. Second, that extraction was computing a
+content hash (`content_hash_pyobj`) nobody reads — `compare()` never
+touches it, only `equals()`/`hash()` do — so a hash-skipping variant of
+value extraction was added for pure-comparison callers. Third, and the
+largest remaining win: field-path lookups went through
+`PyDict_GetItemString`, which allocates a fresh temporary `PyUnicode` from
+the C string on *every single call* — for a one-segment sort field that's
+one wasted allocation per row. The path segments are now pre-converted to
+`PyObject*` once (rebuilt only when `set_sort()`/`set_group()` changes the
+field) and looked up via `PyDict_GetItem` instead. The remaining gap is
+real, inherent `ModValue`/`PyObject` comparison overhead a raw Python
+`sort(key=...)` never pays — no longer an avoidable inefficiency.
 
-**`set_filter()` bootstrap is ~3.7–5× slower than a Python list
-comprehension** — every row's own predicate call (`PyObject_CallOneArg`
-into user Python code) plus a hash-map insert per surviving row is
-inherently heavier than an interpreter-level `if` inside a comprehension,
-and unlike sort there's no per-comparison redundancy to eliminate — each
-row is only ever evaluated once either way. Same "rare, explicit
-reconfigure" cost profile as `set_sort()`.
+**`set_filter()` bootstrap is ~3.8–8.3× slower than a Python list
+comprehension**, and didn't benefit from the sort-side fixes above — it
+doesn't sort or extract field values at all. Its cost is a Python predicate
+call (`PyObject_CallOneArg`, inherently as expensive as the same call
+inside a comprehension) plus a hash-set insert per surviving row, which a
+comprehension's plain `append` doesn't pay.
 
-**`set_group()` bootstrap is ~2.1–3.2× slower than `list.sort(key=group)`**
-— it shares `rebuild_sort_index()`'s precompute-then-sort path with
-`set_sort()` (group value takes priority in the comparator, sort value is
-the tiebreaker), so it benefited from the same optimization; the gap here
-is narrower than plain `set_sort()`'s because the benchmark's list-side
-comparator also does real work (a string comparison per element) rather
-than being a trivial no-op.
+**`set_group()` bootstrap is ~1.7–2.6× slower than `list.sort(key=group)`**
+— shares `rebuild_sort_index()` with `set_sort()`, so it benefited from all
+three fixes above.
 
 **Sibling notification cost is linear in the number of live cursors** on
 the same anchor with an active sort — each one gets its own full resync when
-a *different* cursor mutates the shared data (this also got faster from the
-`set_sort()` fix above, since resync uses the same `rebuild_sort_index()`).
-This is an accepted tradeoff, not a bug: a GUI backed by cursors typically
-has a handful of views on one table, not hundreds.
+a *different* cursor mutates the shared data (also faster now, since resync
+shares `rebuild_sort_index()`). This is an accepted tradeoff, not a bug: a
+GUI backed by cursors typically has a handful of views on one table, not
+hundreds.
+
+**`delete()`/`update_row()` under an active sort used to always pay a full
+`O(n log n)` `rebuild_sort_index()`** (re-extract and re-sort *every* row in
+the table) for a single-row mutation — the same cost as an explicit
+`set_sort()` reconfigure, paid silently on every delete or field edit.
+Fixed to erase/bisect-reinsert only the one row that actually moved;
+every other row's relative order is provably unaffected by a single row's
+removal or field change, so there's nothing to re-sort. The remaining cost
+is finding *which* position that one row currently holds — `sort_index` is
+ordered by field value, not by key, so locating a specific key is an `O(n)`
+scan (this is why the closest fair list analog isn't a plain `del`/`pop` by
+a known index, which a real GUI workflow never has either — it's a scan to
+find the row by identity first, exactly what a hand-rolled list-backed
+model would also have to do). With that scan priced in on both sides,
+`delete()` comes out **3.2–8.6×** faster and `update_row()` **2.8–6.1×**
+faster than the Python-level equivalent — the C-level scan (a compiled
+loop calling a hash function) is simply cheaper per element than a Python
+generator-expression scan, even though both are the same `O(n)` shape.
+
+**`insert()` under an active sort *and* filter used to also pay a full
+`rebuild_filter_membership()`** (re-run the predicate against *every* row)
+on top of the sort rebuild, for a single new row — fixed to evaluate the
+predicate for just that one row and update the membership set incrementally.
+`insert()` under sort+filter is now ~1.25–1.96× slower than a hand-rolled
+sorted-list-plus-`set` equivalent across the 1k–100k range.
 
 ---
 
@@ -321,8 +358,10 @@ has a handful of views on one table, not hundreds.
 | `dumps`/`loads` (any object, not just ModDict) | see dedicated section — comparable to `serialize()`/`deserialize()` |
 | `follow()` (declared link, resolve every source row) | **ModDict** — **1.4×** faster than a manual join |
 | `filter("...->field").eq(x)` (JOIN in WHERE) | **ModDict** — O(matches) via index, not O(table size) — **1000×+** faster at low selectivity |
-| Cursor `insert()` vs `bisect.insort` on a sorted list | **~equal** — within 1.4–1.7× at 1k–50k rows |
-| Cursor `insert_batch()` vs list `append`+`sort()` | **cursor** — **2.59×** faster |
-| Cursor `set_sort()` bootstrap vs `list.sort()` | list — ~2.8–3.9× faster, but a rare one-time cost, not per-mutation |
-| Cursor `set_filter()` bootstrap vs list comprehension | list — ~3.7–5× faster, but a rare one-time cost, not per-mutation |
-| Cursor `set_group()` bootstrap vs `list.sort(key=group)` | list — ~2.1–3.2× faster, but a rare one-time cost, not per-mutation |
+| Cursor `insert()` vs `bisect.insort` on a sorted list | **cursor** — roughly equal by 50k rows, **1.12× faster** at 100k |
+| Cursor `insert_batch()` vs list `append`+`sort()` | **cursor** — **2.14×** faster |
+| Cursor `delete()`/`update_row()` under active sort vs find-by-key + list mutation | **cursor** — **2.8–8.6×** faster (C-level scan beats a Python-level one) |
+| Cursor `insert()` under active sort+filter vs `bisect.insort`+`set.add` | list — ~1.25–1.96× faster |
+| Cursor `set_sort()` bootstrap vs `list.sort()` | list — ~3.0–3.2× faster, but a rare one-time cost, not per-mutation |
+| Cursor `set_filter()` bootstrap vs list comprehension | list — ~3.8–8.3× faster, but a rare one-time cost, not per-mutation |
+| Cursor `set_group()` bootstrap vs `list.sort(key=group)` | list — ~1.7–2.6× faster, but a rare one-time cost, not per-mutation |

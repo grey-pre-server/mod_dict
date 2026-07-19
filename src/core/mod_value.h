@@ -68,6 +68,8 @@ struct ModValue {
 
     // pool param kept for backward compat with callsites — ignored.
     static ModValue from_pyobject(PyObject* obj, ElasticPool* pool = nullptr);
+    // Skips hash_val — only valid for callers that exclusively call compare().
+    static ModValue from_pyobject_for_compare(PyObject* obj);
     PyObject* to_pyobject() const;
     void destroy(ElasticPool* pool = nullptr) {
         Py_XDECREF(obj); obj = nullptr; hash_val = 0; type = ValueType::NONE;

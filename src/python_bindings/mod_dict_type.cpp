@@ -23,11 +23,9 @@ struct ModDictObject {
     PyObject* weakreflist;  // required for PyWeakref_NewRef() — live-cursor registry holds weak refs
 };
 
-// Raises NotImplementedError and returns (from the enclosing PyObject*-
-// returning function) if `s` is a cursor. For every method that reads/writes
-// outer/order/links directly and has no cursor-aware reimplementation —
-// explicit failure instead of silently operating on a cursor's always-empty
-// outer/order and returning an empty-but-not-erroring result.
+// Raises NotImplementedError and returns if `s` is a cursor — for methods
+// that read/write outer/order/links directly with no cursor-aware
+// reimplementation, instead of silently operating on an always-empty outer.
 #define MOD_DICT_NO_CURSOR(s, name) do { \
     if ((s)->internal->root) MOD_DICT_RAISE(PyExc_NotImplementedError, name " is not supported on a cursor"); \
 } while(0)
@@ -38,11 +36,9 @@ struct ModDictObject {
     if (!(s)->internal->root) MOD_DICT_RAISE(PyExc_NotImplementedError, name " is only supported on a cursor — call .cursor(path) first"); \
 } while(0)
 
-// index_diff_to_pylist() lives in mod_dict.cpp (core) — declared in
-// mod_dict_binding.h — since ModDict::IndexDiff is a core type and the
-// conversion is needed both here (set_sort/set_filter/set_group,
-// insert/update_row/delete/insert_batch) and in core's own
-// notify_live_cursors() (firing the "reorder" event on sibling cursors).
+// index_diff_to_pylist() lives in mod_dict.cpp (core, declared in
+// mod_dict_binding.h) since it's also needed by core's own
+// notify_live_cursors() for the "reorder" event.
 
 /* helpers */
 static ModDict* pyobj_to_moddict_temp(PyObject* obj) {
@@ -317,9 +313,8 @@ static PyObject*  RowProxy_getattro(RowProxyObject* s, PyObject* name) {
 /* getitem/setitem/contains/len */
 static PyObject* ModDict_getitem(ModDictObject* s,PyObject* key) {
     if (s->internal->root) {
-        // Cursor mode: no RowProxy wrapping (yet) — cursor-scoped field
-        // indices/reindex-on-write aren't wired until create_index() is
-        // made anchor-aware (tracked alongside the flag work).
+        // Cursor mode: no RowProxy wrapping — cursor-scoped field indices
+        // aren't wired until create_index() is made anchor-aware.
         PyObject* d = s->internal->resolve_cursor_dict();
         if (!d) return nullptr;
         PyObject* v = PyDict_GetItem(d, key);  // borrowed
@@ -354,11 +349,8 @@ static int ModDict_setitem(ModDictObject* s,PyObject* key,PyObject* value) {
         } else if (PyDict_SetItem(d, key, value) != 0) {
             return -1;
         }
-        // Keep the root's own field-indices (if any exist on the anchored
-        // row's other fields) consistent, and — once wired in a later step —
-        // this is also where notify_live_cursors() will fire for sibling
-        // cursors on the same anchor. Mirrors what RowProxy already does for
-        // root-level nested writes.
+        // Keep the root's own field-indices consistent, same as RowProxy
+        // does for root-level nested writes.
         s->internal->true_root()->reindex_row_no_validate(s->internal->cached_top_hash);
         return 0;
     }
@@ -383,6 +375,7 @@ static Py_ssize_t ModDict_len(ModDictObject* s){
     if (s->internal->root) {
         PyObject* d = s->internal->resolve_cursor_dict();
         if (!d) return -1;
+        if (s->internal->filter_predicate) return (Py_ssize_t)s->internal->visible_index.size();
         return PyDict_Size(d);
     }
     return (Py_ssize_t)s->internal->len();
@@ -439,12 +432,9 @@ static PyObject* ModDict_update(ModDictObject* s,PyObject* args,PyObject* kwargs
         ModDict* tmp=nullptr; ModDict* src=nullptr;
         if(PyObject_TypeCheck(to,&ModDict_Type)) src=((ModDictObject*)to)->internal;
         else { tmp=pyobj_to_moddict_temp(to); if(!tmp) return nullptr; src=tmp; }
-        // skip_field_index=true: per-row on_insert_row()/on_remove_row() would
-        // be an O(n) sorted_index shift each — for a k-row batch into an
-        // already-indexed field that's O(n*k). Defer to one full rebuild()
-        // per existing index after the loop instead — O(n log n) total,
-        // reusing build()/build_wildcard() verbatim (no new indexing logic).
-        // Both the skip and the rebuild loop are no-ops when no index exists.
+        // skip_field_index=true defers indexing to one rebuild() per existing
+        // index after the loop — O(n log n) total instead of O(n*k) from a
+        // per-row shift into an already-indexed field.
         for(auto& e : src->outer.occupied()){
             if(!e.value.key_py) continue;
             ModValue mk=ModValue::from_pyobject(e.value.key_py);
@@ -1008,7 +998,12 @@ static PyObject* ModDict_iter(ModDictObject* s){
     if (s->internal->root) {
         PyObject* d = s->internal->resolve_cursor_dict();
         if (!d) { Py_DECREF(it); return nullptr; }
-        if (s->internal->has_derived_order) {
+        if (s->internal->filter_predicate) {
+            auto& order = s->internal->visible_index;
+            it->snapshot = PyList_New((Py_ssize_t)order.size());
+            if (!it->snapshot) { Py_DECREF(it); return nullptr; }
+            for (size_t i = 0; i < order.size(); i++) { Py_INCREF(order[i]); PyList_SET_ITEM(it->snapshot, (Py_ssize_t)i, order[i]); }
+        } else if (s->internal->has_derived_order) {
             auto& order = s->internal->sort_index;
             it->snapshot = PyList_New((Py_ssize_t)order.size());
             if (!it->snapshot) { Py_DECREF(it); return nullptr; }
@@ -1093,10 +1088,9 @@ static PyObject* ModDict_deserialize(ModDictObject* s,PyObject* args){
 
 /* Index */
 static PyObject* ModDict_create_index(ModDictObject* s,PyObject* args){
-    // TODO(step 8): the indices.by_field storage redirect (mod_dict.h) makes
-    // sharing automatic, but build()/build_wildcard() still scan owner->outer
-    // directly, which is always empty for a cursor — needs an anchor-aware
-    // scan before this can work correctly, not just guard-removal.
+    // Sharing indices.by_field with the root is automatic (mod_dict.h), but
+    // build()/build_wildcard() still scan owner->outer directly, which is
+    // always empty for a cursor — needs an anchor-aware scan to support this.
     MOD_DICT_NO_CURSOR(s, "create_index()");
     PyObject* a; if(!PyArg_ParseTuple(args,"O",&a)) return nullptr;
     std::string simple; std::vector<std::string> pat; bool wc;
@@ -1256,16 +1250,52 @@ static PyObject* ModDict_cursor_delete(ModDictObject* s, PyObject* args) {
     return payload;
 }
 
-static PyObject* ModDict_cursor_insert_batch(ModDictObject* s, PyObject* args) {
+static PyObject* ModDict_cursor_insert_batch(ModDictObject* s, PyObject* args, PyObject* kw) {
     MOD_DICT_REQUIRE_CURSOR(s, "insert_batch()");
-    PyObject* rows;
-    if (!PyArg_ParseTuple(args, "O", &rows)) return nullptr;
-    if (!PyDict_Check(rows)) MOD_DICT_RAISE(PyExc_TypeError, "insert_batch: rows must be a dict of {key: row}");
-    PyObject *rk, *rv; Py_ssize_t rpos = 0;
-    while (PyDict_Next(rows, &rpos, &rk, &rv)) {
-        if (!PyDict_Check(rv)) MOD_DICT_RAISE(PyExc_TypeError, "insert_batch: every value must be a dict (a row)");
+    PyObject* rows; PyObject* key_obj = nullptr;
+    static const char* kwl[]={"rows","key",nullptr};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "O|O", (char**)kwl, &rows, &key_obj)) return nullptr;
+
+    PyObject* rows_dict;
+    bool built_rows_dict = false;
+    if (PyDict_Check(rows)) {
+        if (key_obj) MOD_DICT_RAISE(PyExc_TypeError, "insert_batch: key= is only used when rows is a list, not a dict");
+        rows_dict = rows;
+        PyObject *rk, *rv; Py_ssize_t rpos = 0;
+        while (PyDict_Next(rows_dict, &rpos, &rk, &rv)) {
+            if (!PyDict_Check(rv)) MOD_DICT_RAISE(PyExc_TypeError, "insert_batch: every value must be a dict (a row)");
+        }
+    } else {
+        // rows is a list (or other iterable) of plain row dicts — key=
+        // names the field each row's own outer key is extracted from,
+        // building {row[key]: row} in one C-level pass instead of requiring
+        // the caller to build that mapping themselves in a Python loop.
+        if (!key_obj) MOD_DICT_RAISE(PyExc_TypeError, "insert_batch: rows is not a dict — pass key= to extract each row's identifier from its own field");
+        rows_dict = PyDict_New();
+        if (!rows_dict) return nullptr;
+        built_rows_dict = true;
+        PyObject* iter = PyObject_GetIter(rows);
+        if (!iter) { Py_DECREF(rows_dict); return nullptr; }
+        PyObject* row;
+        while ((row = PyIter_Next(iter))) {
+            if (!PyDict_Check(row)) {
+                PyErr_SetString(PyExc_TypeError, "insert_batch: every row must be a dict");
+                Py_DECREF(row); Py_DECREF(iter); Py_DECREF(rows_dict); return nullptr;
+            }
+            PyObject* pk = PyDict_GetItem(row, key_obj);  // borrowed
+            if (!pk) {
+                PyErr_SetObject(PyExc_KeyError, key_obj);
+                Py_DECREF(row); Py_DECREF(iter); Py_DECREF(rows_dict); return nullptr;
+            }
+            PyDict_SetItem(rows_dict, pk, row);  // SetItem INCREFs both itself
+            Py_DECREF(row);
+        }
+        Py_DECREF(iter);
+        if (PyErr_Occurred()) { Py_DECREF(rows_dict); return nullptr; }
     }
-    auto positions = s->internal->cursor_insert_batch(rows);
+
+    auto positions = s->internal->cursor_insert_batch(rows_dict);
+    if (built_rows_dict) Py_DECREF(rows_dict);
     if (PyErr_Occurred()) return nullptr;
     PyObject* payload = py_index_list(positions);
     if (!payload) return nullptr;
@@ -1425,6 +1455,62 @@ static PyObject* ModDict_from_rows(PyObject* cls, PyObject* args, PyObject* kw){
     Py_DECREF(iter);
     if(PyErr_Occurred()){ Py_DECREF(s); return nullptr; }
     return (PyObject*)s;
+}
+
+// Instance method — writes {row[key]: row for row in rows} into self at
+// `path` (a single top-level key), same effect as
+// `self[path] = {row[key]: row for row in rows}`. from_rows() above can't
+// do this itself: it's a classmethod, so even `md.from_rows(...)` binds
+// `cls` to the type, never to the instance it was called through.
+static PyObject* ModDict_load_rows(ModDictObject* s, PyObject* args, PyObject* kw){
+    PyObject* rows; PyObject* key_obj; PyObject* path_obj;
+    static const char* kwl[]={"rows","key","path",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"OOO",(char**)kwl,&rows,&key_obj,&path_obj)) return nullptr;
+    if(!PyUnicode_Check(path_obj)){ PyErr_SetString(PyExc_TypeError,"path must be a str"); return nullptr; }
+
+    PyObject* built = PyDict_New();
+    if(!built) return nullptr;
+    PyObject* iter=PyObject_GetIter(rows);
+    if(!iter){ Py_DECREF(built); return nullptr; }
+    PyObject* row;
+    while((row=PyIter_Next(iter))){
+        // support dict and Mapping-like objects (row[key]) — same as from_rows()
+        PyObject* pk=nullptr;
+        if(PyDict_Check(row)) pk=PyDict_GetItem(row,key_obj);   // borrowed
+        else                  pk=PyObject_GetItem(row,key_obj);  // new ref — need DECREF
+        if(!pk){
+            if(!PyErr_Occurred()) PyErr_SetObject(PyExc_KeyError, key_obj);  // PyDict_GetItem doesn't set one itself
+            Py_DECREF(row); Py_DECREF(iter); Py_DECREF(built); return nullptr;
+        }
+
+        PyObject* row_dict = PyDict_Check(row) ? row : nullptr;
+        bool own_row_dict = false;
+        if(!row_dict){
+            row_dict = PyDict_New();
+            own_row_dict = true;
+            PyObject* items = PyMapping_Items(row);
+            if(items){
+                for(Py_ssize_t i=0;i<PyList_Size(items);i++){
+                    PyObject* pair=PyList_GET_ITEM(items,i);
+                    PyDict_SetItem(row_dict,PyTuple_GET_ITEM(pair,0),PyTuple_GET_ITEM(pair,1));
+                }
+                Py_DECREF(items);
+            }
+        }
+
+        bool borrowed_pk = PyDict_Check(row);
+        PyDict_SetItem(built, pk, row_dict);  // SetItem INCREFs pk/row_dict itself
+        if(own_row_dict) Py_DECREF(row_dict);
+        if(!borrowed_pk) Py_DECREF(pk);
+        Py_DECREF(row);
+    }
+    Py_DECREF(iter);
+    if(PyErr_Occurred()){ Py_DECREF(built); return nullptr; }
+
+    ModValue mk = ModValue::from_pyobject(path_obj);
+    s->internal->insert_row(mk, built);
+    Py_DECREF(built);
+    Py_RETURN_NONE;
 }
 
 static PyObject* ModDict_from_row(PyObject* cls, PyObject* arg){
@@ -1790,7 +1876,7 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     }
 }
 static PyObject* ModDict_sort_by(ModDictObject* s,PyObject* args,PyObject* kw){
-    MOD_DICT_NO_CURSOR(s, "sort_by()");  // TODO(step 8): cursor's own set_sort()/sort_index supersede this
+    MOD_DICT_NO_CURSOR(s, "sort_by()");  // cursor's own set_sort()/sort_index supersede this
     const char* field=nullptr; int rev=0; const char* ret="rows"; int inplace=0;
     static const char* kwl[]={"field","reverse","returns","inplace",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"s|psp",const_cast<char**>(kwl),&field,&rev,&ret,&inplace)) return nullptr;
@@ -1891,6 +1977,16 @@ static PyObject* ModDict_at(ModDictObject* s, PyObject* args){
     if (s->internal->root) {
         PyObject* d = s->internal->resolve_cursor_dict();
         if (!d) return nullptr;
+        if (s->internal->filter_predicate) {
+            auto& order = s->internal->visible_index;
+            Py_ssize_t n = (Py_ssize_t)order.size();
+            Py_ssize_t idx = i; if (idx < 0) idx += n;
+            if (idx < 0 || idx >= n) { PyErr_SetString(PyExc_IndexError,"index out of range"); return nullptr; }
+            PyObject* v = PyDict_GetItem(d, order[idx]);  // borrowed
+            if (!v) { PyErr_SetString(PyExc_IndexError,"index out of range"); return nullptr; }
+            Py_INCREF(v);
+            return v;
+        }
         if (s->internal->has_derived_order) {
             auto& order = s->internal->sort_index;
             Py_ssize_t n = (Py_ssize_t)order.size();
@@ -1971,11 +2067,12 @@ static PyMethodDef ModDict_methods[]={
     {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->int|None — new_index; cursor only"},
     {"update_row",(PyCFunction)ModDict_cursor_update_row,METH_VARARGS,"update_row(key,changes)->((old_index|None,new_index|None),changed_fields) — cursor only"},
     {"delete",(PyCFunction)ModDict_cursor_delete,METH_VARARGS,"delete(key)->int|None — old_index; cursor only"},
-    {"insert_batch",(PyCFunction)ModDict_cursor_insert_batch,METH_VARARGS,"insert_batch(rows_dict)->list[int|None] — new_index per row, in rows' iteration order; cursor only; fires one 'insert' event for the whole batch"},
+    {"insert_batch",(PyCFunction)ModDict_cursor_insert_batch,METH_VARARGS|METH_KEYWORDS,"insert_batch(rows,key=None)->list[int|None] — rows: dict[key,row], or list[dict] with key= naming the field to extract each row's key from; new_index per row, in rows' iteration order; cursor only; fires one 'insert' event for the whole batch"},
     {"from_dict",(PyCFunction)ModDict_from_dict,METH_O|METH_CLASS,"from_dict(d)->ModDict"},
     {"from_json",(PyCFunction)ModDict_from_json,METH_O|METH_CLASS,"from_json(s)->ModDict"},
     {"from_rows",(PyCFunction)ModDict_from_rows,METH_VARARGS|METH_KEYWORDS|METH_CLASS,"from_rows(rows,key)->ModDict"},
     {"from_row",(PyCFunction)ModDict_from_row,METH_O|METH_CLASS,"from_row(row)->dict"},
+    {"load_rows",(PyCFunction)ModDict_load_rows,METH_VARARGS|METH_KEYWORDS,"load_rows(rows,key,path)->None — writes self[path]={row[key]:row for row in rows}"},
     {"to_dict",(PyCFunction)ModDict_to_dict,METH_NOARGS,"to_dict()->dict — shallow copy as plain dict, bypasses RowProxy"},
     {"serialize",(PyCFunction)ModDict_serialize,METH_NOARGS,"serialize()->bytes"},
     {"deserialize",(PyCFunction)ModDict_deserialize,METH_VARARGS,"deserialize(data)->ModDict — mutates self in place, returns self for chaining"},

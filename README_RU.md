@@ -177,6 +177,7 @@ orders.insert(key, row)          # -> int | None (новая позиция)
 orders.delete(key)               # -> int | None (прежняя позиция)
 orders.update_row(key, changes)  # -> ((old_index, new_index), changed_fields)
 orders.insert_batch({key: row, ...})  # -> list[int|None], одна запись, одно событие connect()
+orders.insert_batch([row, ...], key="id")  # то же, key= извлекает ключ строки вместо готового {key: row}
 orders.connect("insert" | "update" | "delete" | "reorder", callback)
 
 # Алиасы
@@ -198,6 +199,7 @@ mn.at(-1)                                        # значение послед
 # Построение из списка словарей
 md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}
 md.ModDict.from_row(row)                         # нормализует Mapping → обычный dict
+mn.load_rows(rows, key="id", path="users")       # пишет в СУЩЕСТВУЮЩИЙ mn: mn["users"] = {r["id"]: r for r in rows}
 
 # Сериализация
 mn.serialize() / mn.deserialize(data)          # data → self, возвращает self для чейнинга
@@ -340,6 +342,49 @@ chainable: дальнейший вызов `.filter("user_group.?.field->...")` 
 на текущую, а не на ту, куда она указывает) не поддерживается — только то
 направление, в котором был объявлен `link()`.
 
+### Многие-ко-многим через связующую таблицу
+
+Связующая таблица (`users_groups` ниже) — ничего особенного, обычная
+таблица с двумя объявлениями `link()` вместо одного:
+
+```python
+mn = md.ModDict({
+    "users": {
+        "u1": {"id": "u1", "name": "alice", "note": "vip"},
+        "u2": {"id": "u2", "name": "bob",   "note": "trial"},
+    },
+    "users_groups": {
+        1: {"user_id": "u1", "group_id": 1},
+        2: {"user_id": "u1", "group_id": 2},
+    },
+    "groups": {
+        1: {"name": "engineering"},
+        2: {"name": "support"},
+    },
+})
+mn.link("users_groups.?.user_id", "users.?")     # сверяется с собственным КЛЮЧОМ users ("u1") — совпадение с "id" это соглашение, а не требование
+mn.link("users_groups.?.group_id", "groups.?")
+
+# все группы alice: filter сужает users_groups через JOIN по user_id,
+# select проецирует имя группы каждого совпадения через group_id
+mn.filter("users_groups.?.user_id->name").eq("alice") \
+  .select(["users_groups.?.group_id->name"], returns="values")[0]
+# → ["engineering", "support"]
+
+# другое поле через ТОТ ЖЕ хоп, что уже использовал filter
+mn.filter("users_groups.?.user_id->name").eq("alice") \
+  .select(["users_groups.?.user_id->note"], returns="values")[0]
+# → ["vip", "vip"] — по одному на совпавшую строку членства, без дедупликации по пользователю
+```
+
+pk-based форма `link()` сверяет поле внешнего ключа с собственным **внешним
+ключом словаря** целевой таблицы — поле `id` у строки связь напрямую вообще
+не смотрит, так что оно вольно дублировать ключ (как выше, аналогично
+`SELECT *` в SQL, который возвращает и колонку id тоже) или вовсе с ним не
+совпадать — mod_dict его не срезает и не требует. Если внешний ключ у вас
+сверяется не с pk, а с другим полем — для этого вторая форма `link()`:
+`mn.link(..., "users.?.id")` сверялась бы с полем `id`, а не с ключом.
+
 ## Курсоры (реактивные виды для GUI-таблиц)
 
 **Курсор** — живой, реагирующий на мутации handle типа `ModDict`,
@@ -382,6 +427,10 @@ positions = orders.insert_batch({"o4": {"amount": 5, "status": "new"},
 # запись, одно событие connect(), сдвинутые существующие строки поштучно
 # не репортятся (та же логика, что у insert() выше)
 
+# тот же эффект из обычного list, key= извлекает собственный ключ каждой
+# строки — не нужно самому собирать {key: row} в цикле на Python
+orders.insert_batch([{"id": "o4", "amount": 5, "status": "new"}], key="id")
+
 orders.connect("insert", lambda new_index: qt_model.apply_insert(new_index))
 orders.connect("update", lambda payload: qt_model.apply_update(payload))
 orders.connect("delete", lambda old_index: qt_model.apply_delete(old_index))
@@ -422,9 +471,15 @@ grid_view.insert("o9", {"amount": 5, "status": "new"})
 `serialize`, `group_by`, `keys`/`values`/`items`, `alias`, `pop`, ...) — эти
 методы намеренно кидают `NotImplementedError` на курсоре: курсор — это
 живой позиционный вид для GUI, а не второй полноценный `ModDict`.
-Принадлежность `set_filter()` корректно отслеживается и диффится, но пока
-не влияет на `len()`/итерацию/`.at()` — они по-прежнему показывают все
-строки под anchor'ом независимо от состояния фильтра.
+
+`set_filter()` полностью учитывается в чтениях: при активном фильтре
+`len()`/итерация/`.at(i)` видят только проходящие строки, плотно
+проиндексированные (`.at(0)` — первая *видимая* строка, не обязательно
+первая строка под anchor'ом) — и позиции, возвращаемые
+`insert()`/`update_row()`/`delete()`, согласованы с этой же нумерацией.
+Доступ по ключу (`cursor[key]`, `in`, `del cursor[key]`) от фильтра не
+зависит в любом случае — отфильтрованная строка всё ещё полностью
+присутствует в данных, просто отсутствует в позиционном/итерационном виде.
 
 Полная документация методов (формы возврата, payload событий, крайние
 случаи) — в `src/mod_dict.pyi`.

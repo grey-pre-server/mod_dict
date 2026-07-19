@@ -362,6 +362,36 @@ class ModDict:
         """
         ...
 
+    def load_rows(self, rows: list[dict], key: Any, path: str) -> None:
+        """
+        Write a list of row dicts into this ModDict as a new table, keyed by one field.
+
+        Same effect as ``self[path] = {row[key]: row for row in rows}``, but
+        does the indexing in one C-level pass rather than a Python loop.
+        Unlike ``from_rows()`` (a classmethod that always builds a brand-new
+        top-level ModDict — even called as ``mn.from_rows(...)`` it can't see
+        ``mn`` itself, only its type), this writes into an *existing*
+        instance at a chosen key, for populating one table at a time in a
+        multi-table ModDict.
+
+        The field named by `key` is not removed from the stored rows — a row
+        keeps every field it came with, including the one now duplicated as
+        the outer key (same as a SQL `SELECT *`, which returns the id column
+        too even though it's what you looked the row up by).
+
+        Args:
+            rows: Iterable of dicts (or Mapping-like objects).
+            key:  Field name whose value becomes each row's outer key.
+            path: The top-level key to write the resulting table under.
+
+        Example::
+
+            mn = ModDict()
+            mn.load_rows(user_rows, key="id", path="users")
+            # same effect as: mn["users"] = {r["id"]: r for r in user_rows}
+        """
+        ...
+
     # ──────────────────────────────────────────────────
     # Dict protocol
     # ──────────────────────────────────────────────────
@@ -403,11 +433,19 @@ class ModDict:
         ...
 
     def __len__(self) -> int:
-        """Return the number of records (rows + scalars)."""
+        """Return the number of records (rows + scalars).
+
+        On a cursor with an active ``set_filter()``, counts only the rows
+        currently passing the filter, not every row under the anchor.
+        """
         ...
 
     def __iter__(self) -> Iterator[Any]:
-        """Iterate over keys (same order as insertion)."""
+        """Iterate over keys (same order as insertion, or as set_sort()/set_group() if active).
+
+        On a cursor with an active ``set_filter()``, only visits keys of
+        rows currently passing the filter.
+        """
         ...
 
     def __repr__(self) -> str: ...
@@ -1146,11 +1184,13 @@ class ModDict:
         tracked as excluded — maintained incrementally afterward, same as
         ``set_sort()``/``set_group()``.
 
-        Filter membership is currently tracked and diffed correctly, but is
-        **not yet composed into ``len()``/iteration/``at()``** — those still
-        reflect every row under the anchor regardless of filter state. Only
-        the diff returned here (and the payload delivered to a matching
-        mutation's ``connect()`` event) currently reflects visibility.
+        Filter membership is composed into ``len()``/iteration/``at()``: with
+        an active filter, they only see the passing rows, densely indexed
+        (position 0 is the first *visible* row, not necessarily the first
+        row under the anchor). ``insert()``/``update_row()``/``delete()``'s
+        returned position(s) agree with this — they report where a row
+        landed among the *visible* rows, not its raw position among every
+        row under the anchor.
 
         Args:
             predicate: Callable taking a row dict, returning truthy to keep
@@ -1251,22 +1291,28 @@ class ModDict:
         be both redundant and, at scale, far more expensive than the actual
         O(log n) position search + pointer-only vector shift underneath (a
         real, benchmark-measured cost this return shape avoids: a single
-        insert into a 50 000-row sorted cursor is ~16us, on par with
+        insert into a 50 000-row sorted cursor is ~17us, on par with
         ``bisect.insort`` on a plain list — a full-diff-list return of every
         shifted sibling cost over 100x more, almost entirely in marshaling
-        that list to Python objects nobody needed).
+        that list to Python objects nobody needed). An overwrite of an
+        existing key is repositioned the same way (erase + bisect-reinsert),
+        not a full re-sort of every row — see ``update_row()``.
 
         A row that an active filter rejects still gets written (it's still
         in the underlying data — see ``set_filter()``) but has no defined
         position, so this returns ``None`` for it and fires no event at all.
+        When the row IS visible, the returned position is among the
+        currently-*visible* rows (matching what ``len()``/``.at()`` mean
+        under that same filter), not its raw position among every row under
+        the anchor.
 
         Args:
             key: The row's key within the anchored table.
             row: The row dict to store.
 
         Returns:
-            The row's new position (``int``), or ``None`` if an active
-            filter excludes it.
+            The row's new position (``int``) among currently-visible rows,
+            or ``None`` if an active filter excludes it.
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``.
@@ -1297,6 +1343,11 @@ class ModDict:
         no way for the GUI to infer where a specific row moved *from* and
         *to* on its own.
 
+        Only this one row is re-sorted (erase + bisect-reinsert) — a field
+        change can't move any *other* row's relative order, so the rest of
+        the cursor's presentation order is left untouched rather than
+        re-extracting and re-sorting every row from scratch.
+
         Args:
             key:     The row's key within the anchored table. Raises
                      ``KeyError`` if not found.
@@ -1308,7 +1359,9 @@ class ModDict:
             - ``(old_index, new_index)`` — either may be ``None`` if the row
               wasn't visible before / isn't visible after (an active filter
               excludes it); both are the same non-``None`` value if the
-              change didn't move the row at all.
+              change didn't move the row at all. Non-``None`` values are
+              positions among currently-visible rows (same convention as
+              ``insert()``), not raw positions among every row under the anchor.
             - ``changed_fields`` — the subset of `changes`' keys whose value
               actually differs from what was there before (not just "was
               present in `changes`" — a value written as identical to what
@@ -1341,15 +1394,18 @@ class ModDict:
         of every remaining row that shifted as a result. A GUI's
         ``beginRemoveRows(parent, pos, pos)`` already implies that shift for
         everything after `pos` — same reasoning as ``insert()``, see there
-        for the benchmark numbers behind this shape.
+        for the benchmark numbers behind this shape. Removing this one row
+        doesn't change any other row's relative order, so only this row is
+        located and erased — not a full re-sort of the remaining rows.
 
         Args:
             key: The row's key within the anchored table. Raises
                  ``KeyError`` if not found.
 
         Returns:
-            The row's former position (``int``), or ``None`` if it wasn't
-            visible under an active filter at the time of deletion.
+            The row's former position (``int``) among rows that were visible
+            at the time (same convention as ``insert()``), or ``None`` if it
+            wasn't visible under an active filter at the time of deletion.
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``.
@@ -1361,7 +1417,7 @@ class ModDict:
         """
         ...
 
-    def insert_batch(self, rows: dict[Any, dict]) -> list[int | None]:
+    def insert_batch(self, rows: dict[Any, dict] | list[dict], key: Any = None) -> list[int | None]:
         """
         Insert (or overwrite) many rows through a cursor in one call.
 
@@ -1371,12 +1427,22 @@ class ModDict:
         cursors and fires a single ``"insert"`` ``connect()`` event covering
         every inserted row.
 
+        `rows` can be a pre-keyed ``{key: row_dict, ...}`` mapping (the
+        original form), or a plain ``list[dict]`` together with `key` naming
+        the field each row's own outer key should be extracted from —
+        ``{row[key]: row for row in rows}`` is built in one C-level pass
+        instead of requiring the caller to build that mapping themselves in
+        a Python loop first. `key` is only meaningful (and required) when
+        `rows` is a list; passing it alongside a dict raises ``TypeError``.
+
         Returns only the NEW rows' own landing positions — same "don't
         enumerate shifted siblings" reasoning as ``insert()``, extended to a
         batch. Existing rows displaced by the batch aren't reported.
 
         Args:
-            rows: ``{key: row_dict, ...}`` — every value must be a dict.
+            rows: ``{key: row_dict, ...}``, or a list of row dicts (with `key` set).
+            key:  Field name to extract each row's outer key from — only
+                  used, and required, when `rows` is a list.
 
         Returns:
             ``list[int | None]``, one entry per row in `rows` (in the same
@@ -1393,6 +1459,12 @@ class ModDict:
                 "o10": {"amount": 5,  "status": "new"},
                 "o11": {"amount": 40, "status": "new"},
             })
+
+            # equivalent, from a plain list of rows:
+            positions = orders.insert_batch([
+                {"id": "o10", "amount": 5,  "status": "new"},
+                {"id": "o11", "amount": 40, "status": "new"},
+            ], key="id")
         """
         ...
 
@@ -1473,6 +1545,12 @@ class ModDict:
 
         Supports negative indices (``-1`` = last inserted).
         Raises ``IndexError`` if out of range.
+
+        On a cursor, "position" follows whatever presentation is currently
+        active: insertion/natural order by default, ``set_sort()``/
+        ``set_group()``'s order if active, and with ``set_filter()`` also
+        active, dense positions over only the *visible* rows (position 0 is
+        the first visible row, not necessarily the first row under the anchor).
 
         Example::
 

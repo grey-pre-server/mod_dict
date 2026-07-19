@@ -114,6 +114,19 @@ ModValue ModValue::from_pyobject(PyObject* obj, ElasticPool*) {
     return mv;
 }
 
+// Like from_pyobject(), but skips content_hash_pyobj() — compare() never
+// reads hash_val, only equals()/hash() do. For callers that only ever call
+// compare() (e.g. cursor sort/group), this avoids hashing a value nobody
+// looks at (an FNV1a64 scan for strings, a repr() call for exotic types).
+ModValue ModValue::from_pyobject_for_compare(PyObject* obj) {
+    ModValue mv;
+    if (!obj) obj = Py_None;
+    Py_INCREF(obj);
+    mv.obj  = obj;
+    mv.type = detect_type(obj);
+    return mv;
+}
+
 PyObject* ModValue::to_pyobject() const {
     PyObject* o = obj ? obj : Py_None;
     Py_INCREF(o);
@@ -150,6 +163,14 @@ int ModValue::compare(const ModValue& other, bool* ok) const {
         double a = (type == ValueType::FLOAT) ? PyFloat_AsDouble(obj)       : (double)PyLong_AsLongLong(obj);
         double b = (other.type == ValueType::FLOAT) ? PyFloat_AsDouble(other.obj) : (double)PyLong_AsLongLong(other.obj);
         return (a < b) ? -1 : (a > b) ? 1 : 0;
+    }
+    // One direct call instead of the two generic PyObject_RichCompareBool
+    // dispatches (LT then GT) below — PyUnicode_Compare returns -1/0/1 and
+    // only sets an exception on a genuine decode error (rare malformed data).
+    if (type == ValueType::STRING && other.type == ValueType::STRING) {
+        int c = PyUnicode_Compare(obj, other.obj);
+        if (c == -1 && PyErr_Occurred()) { PyErr_Clear(); if (ok) *ok = false; return 0; }
+        return (c < 0) ? -1 : (c > 0) ? 1 : 0;
     }
     PyObject* ao = obj       ? obj       : Py_None;
     PyObject* bo = other.obj ? other.obj : Py_None;
