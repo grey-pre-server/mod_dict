@@ -1,6 +1,6 @@
 # mod_dict
 
-A Python extension (C++) that stores nested dictionaries by reference and provides indexed filtering, sorting, grouping and merging — without converting to a DataFrame or a database.
+A Python extension (C++) that stores nested dictionaries by reference and provides indexed filtering, sorting, grouping and merging — without converting to a DataFrame or a database. Also provides live, mutation-aware **cursors** for backing reactive GUI tables (Qt or otherwise) without hand-rolling index bookkeeping.
 
 ```python
 import mod_dict as md
@@ -33,6 +33,13 @@ mn.select(["meta.details.rank", "score"])
 mn.link("orders.?.customer_id", "customers.?")
 mn.follow("orders.?.customer_id")                # → ModDict of resolved customers
 mn.filter("orders.?.customer_id->name").eq("Alice")  # JOIN in WHERE, chainable ("->name->city")
+
+# Cursors — live, mutation-aware views backing a reactive GUI table
+# (anchored at an existing nested {key: row} table — see "Cursors" below)
+orders = mn.cursor("some_table")
+orders.set_sort("amount")
+new_index = orders.insert("o9", {"amount": 15})  # → int | None — its landing position
+orders.connect("insert", lambda i: qt_model.apply_insert(i))
 
 # Update from another collection
 mn.update(other)                                 # bulk insert (like dict.update)
@@ -79,12 +86,15 @@ mn["alice"]["age"]              # outer hash → PyObject* → PyDict_GetItemStr
 
 On top of the outer hash table, a **FieldIndex** per field powers O(1) equality and O(log n) range queries. Indices are built automatically on the first `filter()` / `sort_by()` / `group_by()` call and reused after.
 
+A **cursor** (`mn.cursor(path)`) is a `ModDict` instance anchored at an existing nested table inside another `ModDict`'s storage — it has no storage of its own; every read/write routes straight through to the parent's raw dict. It exists to back reactive GUI tables: stateful sort/filter/group flags maintained incrementally on each mutation, point-mutation methods (`insert`/`update_row`/`delete`/`insert_batch`) that return exactly the diff a GUI needs, and a framework-agnostic `connect()` for push-based reactivity. See [Cursors](#cursors-reactive-views-for-gui-tables) below.
+
 ## When it fits
 
 - Collection of records with a fixed (or semi-fixed) schema.
 - You need indexed filter, sort, group, or field-level merge without pandas/SQL.
 - Write once, query many times.
 - In-process cache shared across asyncio coroutines — zero-copy, no GC pressure on reads.
+- Backing a GUI table (Qt or otherwise) that needs to react to inserts/updates/deletes without hand-rolled index/order bookkeeping — see [Cursors](#cursors-reactive-views-for-gui-tables).
 
 ## When it does not fit
 
@@ -160,6 +170,15 @@ mn.group_by("meta.level")
 # Links between rows (self-references allowed) — see "Links between rows" below
 mn.link("orders.?.customer_id", "customers.?", on_delete="restrict")  # restrict|cascade|set_null
 mn.follow("orders.?.customer_id")                        # → ModDict of resolved target rows
+
+# Cursors — live views for GUI tables, see "Cursors" below
+orders = mn.cursor("u1.orders")                          # anchor must already exist
+orders.set_sort("amount") / orders.set_filter(pred) / orders.set_group("status")
+orders.insert(key, row)          # -> int | None (new_index)
+orders.delete(key)               # -> int | None (old_index)
+orders.update_row(key, changes)  # -> ((old_index, new_index), changed_fields)
+orders.insert_batch({key: row, ...})  # -> list[int|None], one write pass, one connect() event
+orders.connect("insert" | "update" | "delete" | "reorder", callback)
 
 # Aliases
 mn.alias(key, alias)                     # create alias (1 per key)
@@ -316,6 +335,94 @@ intersects with the already-narrowed rows, so multi-step chains across
 tables work as expected. Reverse traversal (landing on a table that
 *references* the current one, rather than one it points to) isn't
 supported — only the direction a `link()` was declared in.
+
+## Cursors (reactive views for GUI tables)
+
+A **cursor** is a live, mutation-aware `ModDict` handle anchored at an
+*existing* nested table — built to back a reactive GUI table (a Qt model,
+or anything else) without hand-rolling index/order bookkeeping. It has no
+storage of its own: every read and write routes straight through to the
+parent's raw dict, zero-copy.
+
+```python
+mn = md.ModDict()
+mn["u1"] = {"orders": {
+    "o1": {"amount": 30, "status": "shipped"},
+    "o2": {"amount": 10, "status": "pending"},
+}}
+
+orders = mn.cursor("u1.orders")      # anchor must already exist — raises otherwise
+orders["o1"]["amount"]                # 30 — plain dict protocol, no copy
+len(orders)                           # 2
+
+orders.set_sort("amount")             # maintained incrementally from here on
+orders.set_group("status")            # rows grouped, sorted by amount within each group
+
+new_index = orders.insert("o3", {"amount": 20, "status": "new"})
+# → int | None — just THIS row's own landing position, not a list of every
+#   sibling that shifted. Feed it straight into Qt's beginInsertRows(pos,
+#   pos) — Qt's own downstream stack (selection, persistent indices) already
+#   knows everything after `pos` moved, no explicit list needed. None means
+#   an active filter excludes the row (it's still written, just not visible).
+
+(old_index, new_index), changed_fields = orders.update_row("o1", {"amount": 99})
+# unlike insert/delete, BOTH endpoints are returned — a field-driven move is
+# a Qt beginMoveRows(old, new), and there's no way to infer "from where" on
+# the GUI side the way an insert/remove's implicit shift can be inferred.
+# changed_fields: only fields whose value actually changed.
+
+old_index = orders.delete("o2")       # → int | None — the row's former position
+
+positions = orders.insert_batch({"o4": {"amount": 5, "status": "new"},
+                                  "o5": {"amount": 40, "status": "new"}})
+# → list[int | None], one per new row, in the same order the batch was
+# given — one write pass, one connect() event, existing rows displaced by
+# the batch aren't individually reported (same reasoning as insert() above)
+
+orders.connect("insert", lambda new_index: qt_model.apply_insert(new_index))
+orders.connect("update", lambda payload: qt_model.apply_update(payload))
+orders.connect("delete", lambda old_index: qt_model.apply_delete(old_index))
+orders.connect("reorder", lambda diff: qt_model.apply_reorder(diff))
+# "reorder" is the one event that DOES carry a full list[(old,new)] diff —
+# it fires on a SIBLING cursor reacting to someone else's mutation, and
+# that sibling has no way to know which single row triggered the change.
+```
+
+Multiple independent cursors can point at the same anchor — each keeps its
+own private sort/filter/group state and its own `connect()` listeners, but
+they all see the same live data and notify each other on mutation:
+
+```python
+grid_view = mn.cursor("u1.orders")
+grid_view.set_sort("amount")
+
+summary_view = mn.cursor("u1.orders")
+summary_view.set_group("status")
+
+grid_view.insert("o9", {"amount": 5, "status": "new"})
+# summary_view gets a "reorder" event too — it doesn't know insert() caused
+# it, only that its own view changed
+```
+
+**What a cursor supports:** the plain dict protocol (`cursor[key]`,
+`cursor[key] = row`, `del cursor[key]`, `in`, `len()`, iteration, `.at(i)`),
+`set_sort()`/`set_filter()`/`set_group()`, `connect()`, and the point-mutation
+methods `insert()`/`update_row()`/`delete()`/`insert_batch()` shown above —
+each returns exactly the diff a GUI model needs, computed against whatever
+the cursor's own state was immediately before the call.
+
+**What a cursor does not (yet) support:** field-indexing (`create_index`,
+`filter`, `sort_by` — call these on the root `ModDict` instead) and most
+whole-collection operations (`link`, `follow`, `select`, `copy`, `serialize`,
+`group_by`, `keys`/`values`/`items`, `alias`, `pop`, ...) — these raise
+`NotImplementedError` on a cursor by design; a cursor is a live positional
+view for GUI backing, not a second full `ModDict`. `set_filter()`'s
+membership is tracked and diffed correctly but not yet composed into
+`len()`/iteration/`.at()` — those still show every row under the anchor
+regardless of filter state.
+
+Full method docs (return shapes, event payloads, edge cases) are in
+`src/mod_dict.pyi`.
 
 ### Custom type converters
 

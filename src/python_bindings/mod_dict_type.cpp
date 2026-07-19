@@ -2,9 +2,11 @@
 #include "../core/field_index.h"
 #include "converter_registry.h"
 #include "error_handling.h"
+#include "mod_dict_binding.h"
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstddef>
 #ifdef _WIN32
 #  define portable_strdup _strdup
 #else
@@ -18,7 +20,29 @@ struct ModDictObject {
     ModDict* internal;
     bool owns_internal;
     PyObject* parent_ref;
+    PyObject* weakreflist;  // required for PyWeakref_NewRef() — live-cursor registry holds weak refs
 };
+
+// Raises NotImplementedError and returns (from the enclosing PyObject*-
+// returning function) if `s` is a cursor. For every method that reads/writes
+// outer/order/links directly and has no cursor-aware reimplementation —
+// explicit failure instead of silently operating on a cursor's always-empty
+// outer/order and returning an empty-but-not-erroring result.
+#define MOD_DICT_NO_CURSOR(s, name) do { \
+    if ((s)->internal->root) MOD_DICT_RAISE(PyExc_NotImplementedError, name " is not supported on a cursor"); \
+} while(0)
+
+// Inverse guard for methods that only make sense on a cursor (set_sort/
+// set_filter/set_group/connect/insert/update_row/delete/insert_batch).
+#define MOD_DICT_REQUIRE_CURSOR(s, name) do { \
+    if (!(s)->internal->root) MOD_DICT_RAISE(PyExc_NotImplementedError, name " is only supported on a cursor — call .cursor(path) first"); \
+} while(0)
+
+// index_diff_to_pylist() lives in mod_dict.cpp (core) — declared in
+// mod_dict_binding.h — since ModDict::IndexDiff is a core type and the
+// conversion is needed both here (set_sort/set_filter/set_group,
+// insert/update_row/delete/insert_batch) and in core's own
+// notify_live_cursors() (firing the "reorder" event on sibling cursors).
 
 /* helpers */
 static ModDict* pyobj_to_moddict_temp(PyObject* obj) {
@@ -58,7 +82,7 @@ PyObject* ModDict_wrap_owned(ModDict* internal) {
     if (!internal) Py_RETURN_NONE;
     ModDictObject* w = PyObject_New(ModDictObject,&ModDict_Type);
     if (!w) return nullptr;
-    w->internal=internal; w->owns_internal=true; w->parent_ref=nullptr;
+    w->internal=internal; w->owns_internal=true; w->parent_ref=nullptr; w->weakreflist=nullptr;
     internal->py_wrapper=w;
     return (PyObject*)w;
 }
@@ -68,10 +92,11 @@ static PyObject* ModDict_new(PyTypeObject* type,PyObject*,PyObject*) {
     ModDictObject* s=(ModDictObject*)type->tp_alloc(type,0);
     MOD_DICT_CHECK_ALLOC(s);
     s->internal=new ModDict(); MOD_DICT_CHECK_ALLOC(s->internal);
-    s->internal->py_wrapper=s; s->owns_internal=true; s->parent_ref=nullptr;
+    s->internal->py_wrapper=s; s->owns_internal=true; s->parent_ref=nullptr; s->weakreflist=nullptr;
     return (PyObject*)s;
 }
 static void ModDict_dealloc(ModDictObject* s) {
+    if (s->weakreflist) PyObject_ClearWeakRefs((PyObject*)s);
     if (s->internal) { s->internal->py_wrapper=nullptr; if(s->owns_internal) delete s->internal; }
     Py_XDECREF(s->parent_ref);
     Py_TYPE(s)->tp_free((PyObject*)s);
@@ -291,6 +316,17 @@ static PyObject*  RowProxy_getattro(RowProxyObject* s, PyObject* name) {
 
 /* getitem/setitem/contains/len */
 static PyObject* ModDict_getitem(ModDictObject* s,PyObject* key) {
+    if (s->internal->root) {
+        // Cursor mode: no RowProxy wrapping (yet) — cursor-scoped field
+        // indices/reindex-on-write aren't wired until create_index() is
+        // made anchor-aware (tracked alongside the flag work).
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        PyObject* v = PyDict_GetItem(d, key);  // borrowed
+        if (!v) { PyErr_SetObject(PyExc_KeyError, key); return nullptr; }
+        Py_INCREF(v);
+        return v;
+    }
     uint64_t oh=content_hash_pyobj(key);
     auto* e=s->internal->outer.find(oh);
     if(!e){PyErr_SetObject(PyExc_KeyError,key);return nullptr;}
@@ -310,6 +346,22 @@ static PyObject* ModDict_getitem(ModDictObject* s,PyObject* key) {
     Py_INCREF(e->val_py); return e->val_py;
 }
 static int ModDict_setitem(ModDictObject* s,PyObject* key,PyObject* value) {
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return -1;
+        if (!value) {  // del cursor[key]
+            if (PyDict_DelItem(d, key) != 0) return -1;
+        } else if (PyDict_SetItem(d, key, value) != 0) {
+            return -1;
+        }
+        // Keep the root's own field-indices (if any exist on the anchored
+        // row's other fields) consistent, and — once wired in a later step —
+        // this is also where notify_live_cursors() will fire for sibling
+        // cursors on the same anchor. Mirrors what RowProxy already does for
+        // root-level nested writes.
+        s->internal->true_root()->reindex_row_no_validate(s->internal->cached_top_hash);
+        return 0;
+    }
     ModValue mk=ModValue::from_pyobject(key);
     if (!value) {  // del mn[key]
         if (!s->internal->remove(mk)) { PyErr_SetObject(PyExc_KeyError,key); return -1; }
@@ -320,11 +372,28 @@ static int ModDict_setitem(ModDictObject* s,PyObject* key,PyObject* value) {
     return 0;
 }
 static int ModDict_contains(ModDictObject* s,PyObject* key) {
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return -1;
+        return PyDict_Contains(d, key);
+    }
     return s->internal->outer.find(content_hash_pyobj(key)) ? 1 : 0;
 }
-static Py_ssize_t ModDict_len(ModDictObject* s){return (Py_ssize_t)s->internal->len();}
+static Py_ssize_t ModDict_len(ModDictObject* s){
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return -1;
+        return PyDict_Size(d);
+    }
+    return (Py_ssize_t)s->internal->len();
+}
 
 static PyObject* ModDict_repr(ModDictObject* s){
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        return PyObject_Repr(d);
+    }
     PyObject* d=s->internal->to_python_dict(); if(!d) return nullptr;
     PyObject* r=PyObject_Repr(d); Py_DECREF(d); return r;
 }
@@ -360,6 +429,7 @@ static std::vector<const char*> parse_merge_path(PyObject* obj,std::vector<std::
     std::vector<const char*> r; for(size_t i=base;i<st.size();i++) r.push_back(st[i].c_str()); return r;
 }
 static PyObject* ModDict_update(ModDictObject* s,PyObject* args,PyObject* kwargs){
+    MOD_DICT_NO_CURSOR(s, "update()");
     PyObject *to; PyObject *os=nullptr,*ot=nullptr; const char* cs="keep_right";
     static const char* kw[]={"target","from_path","to_path","conflict",NULL};
     if(!PyArg_ParseTupleAndKeywords(args,kwargs,"O|OOs",(char**)kw,&to,&os,&ot,&cs)) return nullptr;
@@ -369,12 +439,19 @@ static PyObject* ModDict_update(ModDictObject* s,PyObject* args,PyObject* kwargs
         ModDict* tmp=nullptr; ModDict* src=nullptr;
         if(PyObject_TypeCheck(to,&ModDict_Type)) src=((ModDictObject*)to)->internal;
         else { tmp=pyobj_to_moddict_temp(to); if(!tmp) return nullptr; src=tmp; }
+        // skip_field_index=true: per-row on_insert_row()/on_remove_row() would
+        // be an O(n) sorted_index shift each — for a k-row batch into an
+        // already-indexed field that's O(n*k). Defer to one full rebuild()
+        // per existing index after the loop instead — O(n log n) total,
+        // reusing build()/build_wildcard() verbatim (no new indexing logic).
+        // Both the skip and the rebuild loop are no-ops when no index exists.
         for(auto& e : src->outer.occupied()){
             if(!e.value.key_py) continue;
             ModValue mk=ModValue::from_pyobject(e.value.key_py);
-            if(e.value.is_row && e.value.val_py) s->internal->insert_row(mk,e.value.val_py);
+            if(e.value.is_row && e.value.val_py) s->internal->insert_row(mk,e.value.val_py,true);
             else if(e.value.val_py){ ModValue mv=ModValue::from_pyobject(e.value.val_py); s->internal->insert(mk,mv); }
         }
+        for (auto& fi : s->internal->indices.by_field.occupied()) fi.value->rebuild(s->internal);
         delete tmp;
         Py_RETURN_NONE;
     }
@@ -497,7 +574,7 @@ static PyObject* apply_filter(ModDictObject* owner,const std::string& simple,con
     if(!result) return nullptr;
     ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
     if(!w){delete result;return nullptr;}
-    w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)owner; Py_INCREF(owner);
+    w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)owner; Py_INCREF(owner); w->weakreflist=nullptr;
     result->py_wrapper=w; return (PyObject*)w;
 }
 static FilterOp parse_op(const char* s){
@@ -795,7 +872,7 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         // would leave parent_ref null, risking a use-after-free.
         ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
         if(!w){delete result;return nullptr;}
-        w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)s->owner; Py_INCREF(s->owner);
+        w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)s->owner; Py_INCREF(s->owner); w->weakreflist=nullptr;
         result->py_wrapper=w; return (PyObject*)w;
     }
     PyObject* r1=apply_filter(s->owner,simple,pat,wc,FilterOp::GE,lo); if(!r1) return nullptr;
@@ -843,7 +920,7 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         delete part;
     }
     ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type); if(!w){delete merged;return nullptr;}
-    w->internal=merged;w->owns_internal=true;w->parent_ref=(PyObject*)s->owner;Py_INCREF(s->owner);merged->py_wrapper=w;
+    w->internal=merged;w->owns_internal=true;w->parent_ref=(PyObject*)s->owner;Py_INCREF(s->owner);w->weakreflist=nullptr;merged->py_wrapper=w;
     return (PyObject*)w;
 }
 static PyMethodDef FB_methods[]={
@@ -882,10 +959,12 @@ static PyObject* FilterBuilder_new_obj(ModDictObject* owner,PyObject* fo){
 }
 
 static PyObject* ModDict_filter(ModDictObject* s,PyObject* args){
+    MOD_DICT_NO_CURSOR(s, "filter()");
     PyObject* fo; if(!PyArg_ParseTuple(args,"O",&fo)) return nullptr;
     return FilterBuilder_new_obj(s,fo);
 }
 static PyObject* ModDict_filter_legacy(ModDictObject* s,PyObject* args,PyObject* kw){
+    MOD_DICT_NO_CURSOR(s, "filter()");
     PyObject *on,*val; const char* op_s; static const char* kwl[]={"on","op","value",NULL};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"OsO",(char**)kwl,&on,&op_s,&val)) return nullptr;
     std::string simple; std::vector<std::string> pattern; bool wc;
@@ -895,9 +974,19 @@ static PyObject* ModDict_filter_legacy(ModDictObject* s,PyObject* args,PyObject*
 }
 
 /* Iterator */
-struct ModDictIterObject{PyObject_HEAD ModDictObject* owner; size_t position;};
-static void ModDictIter_dealloc(ModDictIterObject* s){Py_XDECREF(s->owner);Py_TYPE(s)->tp_free((PyObject*)s);}
+// snapshot: nullptr in root mode (walks owner->internal->outer's slots
+// directly, as before). In cursor mode, a PyList snapshot of the anchored
+// dict's keys taken at iterator-creation time — simpler and safer than a
+// live PyDict_Next walk (mutating a dict mid-iteration is undefined
+// behavior in Python regardless, so a snapshot costs nothing extra there).
+struct ModDictIterObject{PyObject_HEAD ModDictObject* owner; size_t position; PyObject* snapshot;};
+static void ModDictIter_dealloc(ModDictIterObject* s){Py_XDECREF(s->owner);Py_XDECREF(s->snapshot);Py_TYPE(s)->tp_free((PyObject*)s);}
 static PyObject* ModDictIter_next(ModDictIterObject* s){
+    if (s->snapshot) {
+        if (s->position >= (size_t)PyList_GET_SIZE(s->snapshot)) { PyErr_SetNone(PyExc_StopIteration); return nullptr; }
+        PyObject* k = PyList_GET_ITEM(s->snapshot, s->position++);
+        Py_INCREF(k); return k;
+    }
     const auto& outer = s->owner->internal->outer;
     while(s->position < outer.capacity()){
         const auto* slot = outer.begin() + s->position++;
@@ -915,11 +1004,25 @@ PyTypeObject ModDictIter_Type={
 static PyObject* ModDict_iter(ModDictObject* s){
     ModDictIterObject* it=PyObject_New(ModDictIterObject,&ModDictIter_Type);
     if(!it){PyErr_NoMemory();return nullptr;}
-    it->owner=s; Py_INCREF(s); it->position=0;
+    it->owner=s; Py_INCREF(s); it->position=0; it->snapshot=nullptr;
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) { Py_DECREF(it); return nullptr; }
+        if (s->internal->has_derived_order) {
+            auto& order = s->internal->sort_index;
+            it->snapshot = PyList_New((Py_ssize_t)order.size());
+            if (!it->snapshot) { Py_DECREF(it); return nullptr; }
+            for (size_t i = 0; i < order.size(); i++) { Py_INCREF(order[i]); PyList_SET_ITEM(it->snapshot, (Py_ssize_t)i, order[i]); }
+        } else {
+            it->snapshot = PyDict_Keys(d);
+            if (!it->snapshot) { Py_DECREF(it); return nullptr; }
+        }
+    }
     return (PyObject*)it;
 }
 
 static PyObject* ModDict_keys(ModDictObject* s,PyObject*){
+    MOD_DICT_NO_CURSOR(s, "keys()");
     const auto& ord=s->internal->order;
     PyObject* list=PyList_New((Py_ssize_t)ord.size()); if(!list) return nullptr;
     Py_ssize_t idx=0;
@@ -930,6 +1033,7 @@ static PyObject* ModDict_keys(ModDictObject* s,PyObject*){
     return list;
 }
 static PyObject* ModDict_values(ModDictObject* s,PyObject*){
+    MOD_DICT_NO_CURSOR(s, "values()");
     const auto& ord=s->internal->order;
     PyObject* list=PyList_New((Py_ssize_t)ord.size()); if(!list) return nullptr;
     Py_ssize_t idx=0;
@@ -941,6 +1045,7 @@ static PyObject* ModDict_values(ModDictObject* s,PyObject*){
     return list;
 }
 static PyObject* ModDict_items(ModDictObject* s,PyObject*){
+    MOD_DICT_NO_CURSOR(s, "items()");
     const auto& ord=s->internal->order;
     PyObject* list=PyList_New((Py_ssize_t)ord.size()); if(!list) return nullptr;
     Py_ssize_t idx=0;
@@ -954,6 +1059,7 @@ static PyObject* ModDict_items(ModDictObject* s,PyObject*){
     return list;
 }
 static PyObject* ModDict_aliases(ModDictObject* s,PyObject*){
+    MOD_DICT_NO_CURSOR(s, "aliases()");
     PyObject* d=PyDict_New(); if(!d) return nullptr;
     for(auto& e:s->internal->alias_to_orig.occupied()){
         OuterEntry* ae  = s->internal->outer.find(e.key);
@@ -966,15 +1072,18 @@ static PyObject* ModDict_aliases(ModDictObject* s,PyObject*){
 }
 
 static PyObject* ModDict_to_dict(ModDictObject* s,PyObject*){
+    MOD_DICT_NO_CURSOR(s, "to_dict()");
     return s->internal->to_python_dict();
 }
 
 /* Serialization */
 static PyObject* ModDict_serialize(ModDictObject* s,PyObject*){
+    MOD_DICT_NO_CURSOR(s, "serialize()");
     std::vector<uint8_t> data=s->internal->serialize(); if(PyErr_Occurred()) return nullptr;
     return PyBytes_FromStringAndSize((const char*)data.data(),(Py_ssize_t)data.size());
 }
 static PyObject* ModDict_deserialize(ModDictObject* s,PyObject* args){
+    MOD_DICT_NO_CURSOR(s, "deserialize()");
     const char* data; Py_ssize_t len;
     if(!PyArg_ParseTuple(args,"y#",&data,&len)) return nullptr;
     s->internal->deserialize((const uint8_t*)data,(size_t)len);
@@ -984,6 +1093,11 @@ static PyObject* ModDict_deserialize(ModDictObject* s,PyObject* args){
 
 /* Index */
 static PyObject* ModDict_create_index(ModDictObject* s,PyObject* args){
+    // TODO(step 8): the indices.by_field storage redirect (mod_dict.h) makes
+    // sharing automatic, but build()/build_wildcard() still scan owner->outer
+    // directly, which is always empty for a cursor — needs an anchor-aware
+    // scan before this can work correctly, not just guard-removal.
+    MOD_DICT_NO_CURSOR(s, "create_index()");
     PyObject* a; if(!PyArg_ParseTuple(args,"O",&a)) return nullptr;
     std::string simple; std::vector<std::string> pat; bool wc;
     if(!parse_field_or_pattern(a,simple,pat,wc)){PyErr_SetString(PyExc_TypeError,"create_index: str or tuple required");return nullptr;}
@@ -991,6 +1105,7 @@ static PyObject* ModDict_create_index(ModDictObject* s,PyObject* args){
     Py_RETURN_NONE;
 }
 static PyObject* ModDict_drop_index(ModDictObject* s,PyObject* args){
+    MOD_DICT_NO_CURSOR(s, "drop_index()");
     PyObject* a; if(!PyArg_ParseTuple(args,"O",&a)) return nullptr;
     std::string simple; std::vector<std::string> pat; bool wc;
     if(!parse_field_or_pattern(a,simple,pat,wc)){PyErr_SetString(PyExc_TypeError,"drop_index: str or tuple required");return nullptr;}
@@ -998,10 +1113,165 @@ static PyObject* ModDict_drop_index(ModDictObject* s,PyObject* args){
     Py_RETURN_NONE;
 }
 static PyObject* ModDict_has_index(ModDictObject* s,PyObject* args){
+    MOD_DICT_NO_CURSOR(s, "has_index()");
     PyObject* a; if(!PyArg_ParseTuple(args,"O",&a)) return nullptr;
     std::string simple; std::vector<std::string> pat; bool wc;
     if(!parse_field_or_pattern(a,simple,pat,wc)){PyErr_SetString(PyExc_TypeError,"has_index: str or tuple required");return nullptr;}
     return PyBool_FromLong(wc?s->internal->has_index(pat):s->internal->has_index(simple));
+}
+
+/* Cursor flags: set_sort/set_filter/set_group */
+static PyObject* ModDict_set_sort(ModDictObject* s, PyObject* args, PyObject* kw) {
+    MOD_DICT_REQUIRE_CURSOR(s, "set_sort()");
+    PyObject* fo; int rev = 0;
+    static const char* kwl[] = {"field", "reverse", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "O|p", (char**)kwl, &fo, &rev)) return nullptr;
+    std::string simple; std::vector<std::string> pattern; bool wc = false;
+    if (!parse_field_or_pattern(fo, simple, pattern, wc)) MOD_DICT_RAISE(PyExc_TypeError, "set_sort: field must be str or tuple");
+    std::vector<std::string> field = wc ? pattern : std::vector<std::string>{simple};
+    auto diff = s->internal->set_sort(field, (bool)rev);
+    if (PyErr_Occurred()) return nullptr;
+    return index_diff_to_pylist(diff);
+}
+static PyObject* ModDict_set_group(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "set_group()");
+    PyObject* fo;
+    if (!PyArg_ParseTuple(args, "O", &fo)) return nullptr;
+    std::vector<std::string> field;
+    if (fo != Py_None) {
+        std::string simple; std::vector<std::string> pattern; bool wc = false;
+        if (!parse_field_or_pattern(fo, simple, pattern, wc)) MOD_DICT_RAISE(PyExc_TypeError, "set_group: field must be str, tuple, or None");
+        field = wc ? pattern : std::vector<std::string>{simple};
+    }
+    auto diff = s->internal->set_group(field);
+    if (PyErr_Occurred()) return nullptr;
+    return index_diff_to_pylist(diff);
+}
+static PyObject* ModDict_set_filter(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "set_filter()");
+    PyObject* pred;
+    if (!PyArg_ParseTuple(args, "O", &pred)) return nullptr;
+    if (pred == Py_None) pred = nullptr;
+    else if (!PyCallable_Check(pred)) MOD_DICT_RAISE(PyExc_TypeError, "set_filter: predicate must be callable or None");
+    auto diff = s->internal->set_filter(pred);
+    if (PyErr_Occurred()) return nullptr;
+    return index_diff_to_pylist(diff);
+}
+
+/* Cursor observability: connect() + point-mutation API */
+static PyObject* ModDict_connect(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "connect()");
+    const char* event; PyObject* cb;
+    if (!PyArg_ParseTuple(args, "sO", &event, &cb)) return nullptr;
+    if (!PyCallable_Check(cb)) MOD_DICT_RAISE(PyExc_TypeError, "connect: callback must be callable");
+    if (!s->internal->live_connect_listeners) {
+        s->internal->live_connect_listeners = PyDict_New();
+        if (!s->internal->live_connect_listeners) return nullptr;
+    }
+    PyObject* key = PyUnicode_FromString(event);
+    if (!key) return nullptr;
+    PyObject* listeners = PyDict_GetItem(s->internal->live_connect_listeners, key);  // borrowed
+    if (!listeners) {
+        listeners = PyList_New(0);
+        if (!listeners) { Py_DECREF(key); return nullptr; }
+        if (PyDict_SetItem(s->internal->live_connect_listeners, key, listeners) != 0) {
+            Py_DECREF(key); Py_DECREF(listeners); return nullptr;
+        }
+        Py_DECREF(listeners);  // the dict now holds the owning reference
+    }
+    Py_DECREF(key);
+    if (PyList_Append(listeners, cb) != 0) return nullptr;
+    Py_RETURN_NONE;
+}
+
+static PyObject* ModDict_cursor_insert(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "insert()");
+    PyObject *key, *row;
+    if (!PyArg_ParseTuple(args, "OO", &key, &row)) return nullptr;
+    if (!PyDict_Check(row)) MOD_DICT_RAISE(PyExc_TypeError, "insert: row must be a dict");
+    Py_ssize_t new_pos = s->internal->cursor_insert(key, row);
+    if (PyErr_Occurred()) return nullptr;
+    PyObject* payload = py_index_or_none(new_pos);
+    if (!payload) return nullptr;
+    s->internal->dispatch_event("insert", payload);
+    if (PyErr_Occurred()) { Py_DECREF(payload); return nullptr; }
+    return payload;
+}
+
+static PyObject* ModDict_cursor_update_row(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "update_row()");
+    PyObject *key, *changes;
+    if (!PyArg_ParseTuple(args, "OO", &key, &changes)) return nullptr;
+    if (!PyDict_Check(changes)) MOD_DICT_RAISE(PyExc_TypeError, "update_row: changes must be a dict");
+
+    PyObject* d = s->internal->resolve_cursor_dict();
+    if (!d) return nullptr;
+    PyObject* old_row = PyDict_GetItem(d, key);  // borrowed
+    if (!old_row) { PyErr_SetObject(PyExc_KeyError, key); return nullptr; }
+    PyObject* old_snapshot = PyDict_Copy(old_row);  // shallow — just for changed_fields comparison below
+    if (!old_snapshot) return nullptr;
+
+    auto pos_pair = s->internal->cursor_update_row(key, changes);
+    if (PyErr_Occurred()) { Py_DECREF(old_snapshot); return nullptr; }
+
+    // changed_fields: keys in `changes` whose value actually differs from
+    // what was there before the write (not just "was present in `changes`").
+    PyObject* changed_fields = PyList_New(0);
+    if (!changed_fields) { Py_DECREF(old_snapshot); return nullptr; }
+    PyObject *ck, *cv; Py_ssize_t pos = 0;
+    while (PyDict_Next(changes, &pos, &ck, &cv)) {
+        PyObject* prev = PyDict_GetItem(old_snapshot, ck);  // borrowed, NULL = field didn't exist before
+        int eq = prev ? PyObject_RichCompareBool(prev, cv, Py_EQ) : 0;
+        if (eq < 0) { Py_DECREF(old_snapshot); Py_DECREF(changed_fields); return nullptr; }
+        if (!eq && PyList_Append(changed_fields, ck) != 0) { Py_DECREF(old_snapshot); Py_DECREF(changed_fields); return nullptr; }
+    }
+    Py_DECREF(old_snapshot);
+
+    PyObject* old_i = py_index_or_none(pos_pair.first);
+    if (!old_i) { Py_DECREF(changed_fields); return nullptr; }
+    PyObject* new_i = py_index_or_none(pos_pair.second);
+    if (!new_i) { Py_DECREF(old_i); Py_DECREF(changed_fields); return nullptr; }
+    PyObject* index_part = PyTuple_Pack(2, old_i, new_i);
+    Py_DECREF(old_i); Py_DECREF(new_i);
+    if (!index_part) { Py_DECREF(changed_fields); return nullptr; }
+    PyObject* result = PyTuple_Pack(2, index_part, changed_fields);
+    Py_DECREF(index_part); Py_DECREF(changed_fields);
+    if (!result) return nullptr;
+
+    s->internal->dispatch_event("update", result);
+    if (PyErr_Occurred()) { Py_DECREF(result); return nullptr; }
+    return result;
+}
+
+static PyObject* ModDict_cursor_delete(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "delete()");
+    PyObject* key;
+    if (!PyArg_ParseTuple(args, "O", &key)) return nullptr;
+    Py_ssize_t old_pos = s->internal->cursor_delete(key);
+    if (PyErr_Occurred()) return nullptr;
+    PyObject* payload = py_index_or_none(old_pos);
+    if (!payload) return nullptr;
+    s->internal->dispatch_event("delete", payload);
+    if (PyErr_Occurred()) { Py_DECREF(payload); return nullptr; }
+    return payload;
+}
+
+static PyObject* ModDict_cursor_insert_batch(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "insert_batch()");
+    PyObject* rows;
+    if (!PyArg_ParseTuple(args, "O", &rows)) return nullptr;
+    if (!PyDict_Check(rows)) MOD_DICT_RAISE(PyExc_TypeError, "insert_batch: rows must be a dict of {key: row}");
+    PyObject *rk, *rv; Py_ssize_t rpos = 0;
+    while (PyDict_Next(rows, &rpos, &rk, &rv)) {
+        if (!PyDict_Check(rv)) MOD_DICT_RAISE(PyExc_TypeError, "insert_batch: every value must be a dict (a row)");
+    }
+    auto positions = s->internal->cursor_insert_batch(rows);
+    if (PyErr_Occurred()) return nullptr;
+    PyObject* payload = py_index_list(positions);
+    if (!payload) return nullptr;
+    s->internal->dispatch_event("insert", payload);  // one event for the whole batch, same as a single insert()
+    if (PyErr_Occurred()) { Py_DECREF(payload); return nullptr; }
+    return payload;
 }
 
 /* Links */
@@ -1012,6 +1282,7 @@ static bool parse_on_delete(const char* s, LinkOnDelete& out) {
     return false;
 }
 static PyObject* ModDict_link(ModDictObject* s,PyObject* args,PyObject* kw){
+    MOD_DICT_NO_CURSOR(s, "link()");
     PyObject *src,*ref; const char* on_del="restrict";
     static const char* kwl[]={"source_path","references_path","on_delete",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"OO|s",(char**)kwl,&src,&ref,&on_del)) return nullptr;
@@ -1034,6 +1305,7 @@ static PyObject* ModDict_link(ModDictObject* s,PyObject* args,PyObject* kw){
     Py_RETURN_NONE;
 }
 static PyObject* ModDict_follow(ModDictObject* s,PyObject* args,PyObject* kw){
+    MOD_DICT_NO_CURSOR(s, "follow()");
     PyObject *src,*keys_seq=nullptr,*values_seq=nullptr;
     static const char* kwl[]={"source_path","keys","values",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"O|OO",(char**)kwl,&src,&keys_seq,&values_seq)) return nullptr;
@@ -1088,7 +1360,7 @@ static PyObject* ModDict_from_dict(PyObject* cls,PyObject* arg){
     if(!PyDict_Check(arg)){PyErr_SetString(PyExc_TypeError,"argument must be a dict");return nullptr;}
     ModDictObject* s=(ModDictObject*)((PyTypeObject*)cls)->tp_alloc((PyTypeObject*)cls,0);
     if(!s) return nullptr;
-    s->internal=new ModDict(); s->owns_internal=true; s->internal->py_wrapper=s; s->parent_ref=nullptr;
+    s->internal=new ModDict(); s->owns_internal=true; s->internal->py_wrapper=s; s->parent_ref=nullptr; s->weakreflist=nullptr;
     PyObject *k,*v; Py_ssize_t pos=0;
     while(PyDict_Next(arg,&pos,&k,&v)){ModValue mk=ModValue::from_pyobject(k);if(PyDict_Check(v))s->internal->insert_row(mk,v);else{ModValue mv=ModValue::from_pyobject(v);s->internal->insert(mk,mv);}}
     return (PyObject*)s;
@@ -1101,7 +1373,7 @@ static PyObject* ModDict_from_json(PyObject* cls,PyObject* arg){
     if(!PyDict_Check(parsed)){PyErr_SetString(PyExc_TypeError,"JSON must be an object");Py_DECREF(parsed);return nullptr;}
     ModDictObject* s=(ModDictObject*)((PyTypeObject*)cls)->tp_alloc((PyTypeObject*)cls,0);
     if(!s){Py_DECREF(parsed);return nullptr;}
-    s->internal=new ModDict(); s->owns_internal=true; s->internal->py_wrapper=s; s->parent_ref=nullptr;
+    s->internal=new ModDict(); s->owns_internal=true; s->internal->py_wrapper=s; s->parent_ref=nullptr; s->weakreflist=nullptr;
     PyObject *k,*v; Py_ssize_t pos=0;
     while(PyDict_Next(parsed,&pos,&k,&v)){ModValue mk=ModValue::from_pyobject(k);if(PyDict_Check(v))s->internal->insert_row(mk,v);else{ModValue mv=ModValue::from_pyobject(v);s->internal->insert(mk,mv);}}
     Py_DECREF(parsed); return (PyObject*)s;
@@ -1115,7 +1387,7 @@ static PyObject* ModDict_from_rows(PyObject* cls, PyObject* args, PyObject* kw){
 
     ModDictObject* s=(ModDictObject*)((PyTypeObject*)cls)->tp_alloc((PyTypeObject*)cls,0);
     if(!s) return nullptr;
-    s->internal=new ModDict(); s->owns_internal=true; s->internal->py_wrapper=s; s->parent_ref=nullptr;
+    s->internal=new ModDict(); s->owns_internal=true; s->internal->py_wrapper=s; s->parent_ref=nullptr; s->weakreflist=nullptr;
 
     PyObject* iter=PyObject_GetIter(rows);
     if(!iter){ Py_DECREF(s); return nullptr; }
@@ -1170,8 +1442,35 @@ static PyObject* ModDict_from_row(PyObject* cls, PyObject* arg){
     return d;
 }
 
+/* cursor */
+static PyObject* ModDict_cursor(ModDictObject* s, PyObject* args) {
+    PyObject* arg;
+    if (!PyArg_ParseTuple(args, "O", &arg)) return nullptr;
+    std::string simple; std::vector<std::string> pattern; bool wc=false;
+    if (!parse_field_or_pattern(arg, simple, pattern, wc)) {
+        PyErr_SetString(PyExc_TypeError, "cursor: path must be a string or tuple/list of segments");
+        return nullptr;
+    }
+    std::vector<std::string> path = wc ? pattern : std::vector<std::string>{simple};
+
+    ModDict* result = s->internal->cursor(path);
+    if (!result) return nullptr;  // PyErr already set (empty/wildcard path, or not found)
+
+    ModDictObject* w = PyObject_New(ModDictObject, &ModDict_Type);
+    if (!w) { delete result; return nullptr; }
+    w->internal = result; w->owns_internal = true; w->parent_ref = (PyObject*)s; Py_INCREF(s); w->weakreflist = nullptr;
+    result->py_wrapper = w;
+
+    PyObject* wr = PyWeakref_NewRef((PyObject*)w, nullptr);
+    if (!wr) { Py_DECREF(w); return nullptr; }
+    result->register_live_cursor(wr);
+
+    return (PyObject*)w;
+}
+
 /* group_by/select/sort_by */
 static PyObject* ModDict_group_by(ModDictObject* s,PyObject* args){
+    MOD_DICT_NO_CURSOR(s, "group_by()");
     const char* field; if(!PyArg_ParseTuple(args,"s",&field)) return nullptr;
     auto groups=s->internal->group_by(std::string(field)); if(PyErr_Occurred()) return nullptr;
     PyObject* result=PyDict_New(); if(!result) return nullptr;
@@ -1179,7 +1478,7 @@ static PyObject* ModDict_group_by(ModDictObject* s,PyObject* args){
         PyObject* key=fv.to_pyobject(); if(!key){Py_DECREF(result);return nullptr;}
         ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
         if(!w){Py_DECREF(key);Py_DECREF(result);return nullptr;}
-        w->internal=gd;w->owns_internal=true;w->parent_ref=(PyObject*)s;Py_INCREF(s);gd->py_wrapper=w;
+        w->internal=gd;w->owns_internal=true;w->parent_ref=(PyObject*)s;Py_INCREF(s);w->weakreflist=nullptr;gd->py_wrapper=w;
         PyDict_SetItem(result,key,(PyObject*)w);Py_DECREF(key);Py_DECREF((PyObject*)w);
     }
     return result;
@@ -1361,6 +1660,7 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
     return combined;
 }
 static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
+    MOD_DICT_NO_CURSOR(s, "select()");
     PyObject* fo; const char* ret="rows";
     static const char* kwl[]={"fields","returns",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"O|s",const_cast<char**>(kwl),&fo,&ret)) return nullptr;
@@ -1485,11 +1785,12 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     {
         ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type);
         if(!w){delete result;return nullptr;}
-        w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)s; Py_INCREF(s);
+        w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)s; Py_INCREF(s); w->weakreflist=nullptr;
         result->py_wrapper=w; return (PyObject*)w;
     }
 }
 static PyObject* ModDict_sort_by(ModDictObject* s,PyObject* args,PyObject* kw){
+    MOD_DICT_NO_CURSOR(s, "sort_by()");  // TODO(step 8): cursor's own set_sort()/sort_index supersede this
     const char* field=nullptr; int rev=0; const char* ret="rows"; int inplace=0;
     static const char* kwl[]={"field","reverse","returns","inplace",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"s|psp",const_cast<char**>(kwl),&field,&rev,&ret,&inplace)) return nullptr;
@@ -1540,6 +1841,7 @@ static PyObject* ModDict_sort_by(ModDictObject* s,PyObject* args,PyObject* kw){
 
 
 static PyObject* ModDict_reindex(ModDictObject* s, PyObject* args) {
+    MOD_DICT_NO_CURSOR(s, "reindex()");  // ambiguous on a cursor (key relative to root or to the anchor?) — undefined for now
     PyObject* key;
     if (!PyArg_ParseTuple(args,"O",&key)) return nullptr;
     s->internal->reindex_row(content_hash_pyobj(key));
@@ -1548,6 +1850,7 @@ static PyObject* ModDict_reindex(ModDictObject* s, PyObject* args) {
 }
 
 static PyObject* ModDict_alias(ModDictObject* s, PyObject* args) {
+    MOD_DICT_NO_CURSOR(s, "alias()");
     PyObject* key_obj; PyObject* alias_obj;
     if (!PyArg_ParseTuple(args, "OO", &key_obj, &alias_obj)) return nullptr;
 
@@ -1585,6 +1888,30 @@ static PyObject* ModDict_alias(ModDictObject* s, PyObject* args) {
 
 static PyObject* ModDict_at(ModDictObject* s, PyObject* args){
     Py_ssize_t i; if(!PyArg_ParseTuple(args,"n",&i)) return nullptr;
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        if (s->internal->has_derived_order) {
+            auto& order = s->internal->sort_index;
+            Py_ssize_t n = (Py_ssize_t)order.size();
+            Py_ssize_t idx = i; if (idx < 0) idx += n;
+            if (idx < 0 || idx >= n) { PyErr_SetString(PyExc_IndexError,"index out of range"); return nullptr; }
+            PyObject* v = PyDict_GetItem(d, order[idx]);  // borrowed
+            if (!v) { PyErr_SetString(PyExc_IndexError,"index out of range"); return nullptr; }
+            Py_INCREF(v);
+            return v;
+        }
+        PyObject* keys = PyDict_Keys(d);
+        if (!keys) return nullptr;
+        Py_ssize_t n = PyList_GET_SIZE(keys);
+        Py_ssize_t idx = i; if (idx < 0) idx += n;
+        if (idx < 0 || idx >= n) { Py_DECREF(keys); PyErr_SetString(PyExc_IndexError,"index out of range"); return nullptr; }
+        PyObject* v = PyDict_GetItem(d, PyList_GET_ITEM(keys, idx));  // borrowed
+        Py_DECREF(keys);
+        if (!v) { PyErr_SetString(PyExc_IndexError,"index out of range"); return nullptr; }
+        Py_INCREF(v);
+        return v;
+    }
     uint64_t oh;
     if(!s->internal->at(i,oh)){ PyErr_SetString(PyExc_IndexError,"index out of range"); return nullptr; }
     const OuterEntry* e=s->internal->outer.find(oh);
@@ -1594,12 +1921,14 @@ static PyObject* ModDict_at(ModDictObject* s, PyObject* args){
 }
 
 static PyObject* ModDict_copy(ModDictObject* s, PyObject*){
+    MOD_DICT_NO_CURSOR(s, "copy()");
     ModDict* c = s->internal->deep_copy();
     if(!c){ PyErr_NoMemory(); return nullptr; }
     return ModDict_wrap_owned(c);
 }
 
 static PyObject* ModDict_pop(ModDictObject* s, PyObject* args){
+    MOD_DICT_NO_CURSOR(s, "pop()");
     PyObject* key; PyObject* def = nullptr;
     if(!PyArg_ParseTuple(args,"O|O",&key,&def)) return nullptr;
     PyObject* val = ModDict_getitem(s, key);
@@ -1634,6 +1963,15 @@ static PyMethodDef ModDict_methods[]={
     {"sort_by",(PyCFunction)ModDict_sort_by,METH_VARARGS|METH_KEYWORDS,"sort_by(field,reverse=False,returns='rows',inplace=False)->list|None"},
     {"select",(PyCFunction)ModDict_select,METH_VARARGS|METH_KEYWORDS,"select(fields,returns='rows')->ModDict|list"},
     {"group_by",(PyCFunction)ModDict_group_by,METH_VARARGS,"group_by(field)->dict"},
+    {"cursor",(PyCFunction)ModDict_cursor,METH_VARARGS,"cursor(path)->ModDict — live handle anchored at an existing nested table; path must already exist"},
+    {"set_sort",(PyCFunction)(PyCFunctionWithKeywords)ModDict_set_sort,METH_VARARGS|METH_KEYWORDS,"set_sort(field,reverse=False)->list[(old_index|None,new_index)] — cursor only"},
+    {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(field_or_None)->list[(old_index|None,new_index)] — cursor only"},
+    {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(predicate_or_None)->list[(old_index|None,new_index)] — cursor only"},
+    {"connect",(PyCFunction)ModDict_connect,METH_VARARGS,"connect(event_type,callback)->None — cursor only; events: insert/update/delete/reorder"},
+    {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->int|None — new_index; cursor only"},
+    {"update_row",(PyCFunction)ModDict_cursor_update_row,METH_VARARGS,"update_row(key,changes)->((old_index|None,new_index|None),changed_fields) — cursor only"},
+    {"delete",(PyCFunction)ModDict_cursor_delete,METH_VARARGS,"delete(key)->int|None — old_index; cursor only"},
+    {"insert_batch",(PyCFunction)ModDict_cursor_insert_batch,METH_VARARGS,"insert_batch(rows_dict)->list[int|None] — new_index per row, in rows' iteration order; cursor only; fires one 'insert' event for the whole batch"},
     {"from_dict",(PyCFunction)ModDict_from_dict,METH_O|METH_CLASS,"from_dict(d)->ModDict"},
     {"from_json",(PyCFunction)ModDict_from_json,METH_O|METH_CLASS,"from_json(s)->ModDict"},
     {"from_rows",(PyCFunction)ModDict_from_rows,METH_VARARGS|METH_KEYWORDS|METH_CLASS,"from_rows(rows,key)->ModDict"},
@@ -1661,5 +1999,6 @@ PyTypeObject ModDict_Type={
     .tp_str=(reprfunc)ModDict_repr,
     .tp_flags=Py_TPFLAGS_DEFAULT|Py_TPFLAGS_BASETYPE,
     .tp_doc="ModDict — nested dictionary with indexed field queries (C++ backed).",
+    .tp_weaklistoffset=offsetof(ModDictObject,weakreflist),
     .tp_iter=(getiterfunc)ModDict_iter,.tp_methods=ModDict_methods,
     .tp_init=(initproc)ModDict_init,.tp_new=ModDict_new};

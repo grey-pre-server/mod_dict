@@ -102,16 +102,23 @@ static PyObject* deep_copy_pyobj(PyObject* obj) {
 
 // ── Constructor / Destructor ─────────────────────────────────────────────────
 
-ModDict::ModDict() {}
+ModDict::ModDict() : indices(own_indices) {}
+
+ModDict::ModDict(ModDict* anchor_root, std::vector<std::string> path)
+    : indices(anchor_root->indices), root(anchor_root), anchor_path(std::move(path)) {}
 
 ModDict::~ModDict() {
     for (auto& e : outer.occupied()) {
         Py_XDECREF(e.value.key_py);
         Py_XDECREF(e.value.val_py);
     }
-    for (auto& fi : indices.by_field.occupied()) delete fi.value;
+    // A cursor's `indices` aliases root->indices — only the true owner frees.
+    if (!root) for (auto& fi : indices.by_field.occupied()) delete fi.value;
     Py_XDECREF(on_change_cb);
     Py_XDECREF(on_merge_cb);
+    Py_XDECREF(filter_predicate);
+    Py_XDECREF(live_connect_listeners);
+    for (PyObject* k : sort_index) Py_XDECREF(k);
 }
 
 
@@ -146,7 +153,7 @@ bool ModDict::insert(const ModValue& key, const ModValue& value) {
     return is_new;
 }
 
-void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj) {
+void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj, bool skip_field_index) {
     uint64_t oh = outer_key.hash_val;
     OuterEntry* existing = outer.find(oh);
 
@@ -161,8 +168,9 @@ void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj) {
     PyObject* row_v = converter_registry_convert_deep(dict_obj);
 
     if (existing) {
-        for (auto& fi : indices.by_field.occupied())
-            fi.value->on_remove_row(oh, this);
+        if (!skip_field_index)
+            for (auto& fi : indices.by_field.occupied())
+                fi.value->on_remove_row(oh, this);
         Py_XDECREF(existing->val_py);
         existing->val_py = row_v;
         existing->is_row = true;
@@ -180,8 +188,11 @@ void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj) {
         order.push_back(oh);
     }
 
-    for (auto& fi : indices.by_field.occupied())
-        fi.value->on_insert_row(oh, this);
+    if (!skip_field_index)
+        for (auto& fi : indices.by_field.occupied())
+            fi.value->on_insert_row(oh, this);
+
+    true_root()->notify_live_cursors(oh);
 }
 
 // ── Read ─────────────────────────────────────────────────────────────────────
@@ -249,13 +260,18 @@ PyObject* ModDict::get_subrow(uint64_t oh, const std::string& prefix) const {
 
 // ── Reindex one row (after in-place field write via RowProxy) ────────────────
 
-void ModDict::reindex_row_no_validate(uint64_t oh) {
+void ModDict::reindex_row_no_validate(uint64_t oh, ModDict* originator) {
     // if accessed via alias, reindex the original key so the index stays correct
     if (const uint64_t* orig = alias_to_orig.find(oh)) oh = *orig;
     for (auto& fi : indices.by_field.occupied()) {
         fi.value->remove_outer_key(oh);
         fi.value->on_insert_row(oh, this);
     }
+    // Covers reindex_row() too (it delegates here first) — single hook, no
+    // double-notification. Fires even if reindex_row()'s later link
+    // validation raises: the data write already happened and indices
+    // already reflect it, independent of whether that raises afterward.
+    true_root()->notify_live_cursors(oh, originator);
 }
 
 void ModDict::reindex_row(uint64_t oh) {
@@ -316,6 +332,7 @@ bool ModDict::remove(const ModValue& key) {
             outer.erase(orig_h);
         }
         erase_order(orig_h);
+        true_root()->notify_live_cursors(orig_h);
         return true;
     }
 
@@ -337,6 +354,7 @@ bool ModDict::remove(const ModValue& key) {
     e->key_py = nullptr; e->val_py = nullptr;
     outer.erase(h);
     erase_order(h);
+    true_root()->notify_live_cursors(h);
     return true;
 }
 
@@ -1389,6 +1407,572 @@ static const OuterEntry* resolve_table(const ModDict* self, const std::string& s
     Py_DECREF(tmp);
     const OuterEntry* e = self->outer.find(out_hash);
     return (e && e->val_py && e->is_row) ? e : nullptr;
+}
+
+// Literal (no-wildcard) multi-segment path resolution, for cursor anchors.
+// path[0] must be a real top-level outer key (resolved the same way
+// resolve_table() does) — its OWN row value is the target when path has
+// only one segment (e.g. cursor("users") -> self["users"]'s value). Every
+// further segment is a literal PyDict_GetItemString descent into nested raw
+// dicts (e.g. cursor("u1.orders") -> self["u1"]["orders"]). Returns the
+// final (borrowed) PyObject*, or nullptr if any segment is missing / an
+// intermediate segment isn't dict-shaped. out_top_hash receives path[0]'s
+// outer hash (needed by callers to key the live-cursor notification
+// registry against the top-level row that, if it changes, could affect
+// this anchor). Does NOT require the final result to be dict-shaped itself
+// — callers that need a {pk:row}-shaped target (cursor()) check that themselves.
+static PyObject* resolve_anchor_path(const ModDict* self,
+                                      const std::vector<std::string>& path,
+                                      uint64_t& out_top_hash) {
+    if (path.empty()) return nullptr;
+    const OuterEntry* top = resolve_table(self, path[0], out_top_hash);
+    if (!top || !top->val_py) return nullptr;
+    PyObject* cur = top->val_py;
+    for (size_t i = 1; i < path.size(); i++) {
+        if (!PyDict_Check(cur)) return nullptr;
+        PyObject* next = PyDict_GetItemString(cur, path[i].c_str());  // borrowed
+        if (!next) return nullptr;
+        cur = next;
+    }
+    return cur;
+}
+
+ModDict* ModDict::cursor(const std::vector<std::string>& path) const {
+    if (path.empty()) { PyErr_SetString(PyExc_ValueError, "cursor: path must not be empty"); return nullptr; }
+    for (auto& seg : path) {
+        if (seg == "__pass_key__" || seg == "__scan_key__") {
+            PyErr_SetString(PyExc_ValueError, "cursor: path must be fully literal (no '?'/'*' wildcard segments)");
+            return nullptr;
+        }
+    }
+    ModDict* actual_root = true_root();
+    std::vector<std::string> full_path = anchor_path;  // prefix from `this` (empty if this is itself a root)
+    full_path.insert(full_path.end(), path.begin(), path.end());
+
+    uint64_t top_hash = 0;
+    PyObject* target = resolve_anchor_path(actual_root, full_path, top_hash);
+    if (!target || !PyDict_Check(target)) {
+        PyErr_SetString(PyExc_ValueError, "cursor: path does not resolve to an existing table");
+        return nullptr;
+    }
+    return new ModDict(actual_root, std::move(full_path));
+}
+
+PyObject* ModDict::resolve_cursor_dict() {
+    uint64_t top_hash = 0;
+    PyObject* cur = resolve_anchor_path(root, anchor_path, top_hash);
+    if (!cur || !PyDict_Check(cur)) {
+        PyErr_SetString(PyExc_RuntimeError, "cursor: anchored table no longer exists");
+        return nullptr;
+    }
+    cached_top_hash = top_hash;
+    if (cur != cached_anchor_dict) {
+        // Wholesale rebind (data["u1"]["orders"]=new_dict) bypasses every
+        // mutation hook that would otherwise keep sort_index/filter_membership
+        // in sync — detected here via identity mismatch instead.
+        cached_anchor_dict = cur;
+        if (has_derived_order) rebuild_sort_index();
+        if (filter_predicate) { rebuild_filter_membership(); if (PyErr_Occurred()) return nullptr; }
+    }
+    return cur;
+}
+
+void ModDict::register_live_cursor(PyObject* weakref) {
+    ModDict* actual_root = true_root();
+    std::string key = pattern_key(anchor_path);
+    auto* bucket = actual_root->live_cursors.find(key);
+    if (bucket) bucket->push_back(weakref);
+    else actual_root->live_cursors.insert(key, {weakref});
+}
+
+// Walks a literal dotted path (already split into segments) from `row`,
+// returning the final (borrowed) PyObject*, or nullptr if any segment is
+// missing / an intermediate value isn't dict-shaped. Used by set_sort/
+// set_group to read a field's current value for comparison — cursor sort/
+// group fields are always literal paths within one row, no "?" wildcard.
+static PyObject* read_field_path(PyObject* row, const std::vector<std::string>& segs) {
+    PyObject* cur = row;
+    for (auto& seg : segs) {
+        if (!PyDict_Check(cur)) return nullptr;
+        PyObject* next = PyDict_GetItemString(cur, seg.c_str());  // borrowed
+        if (!next) return nullptr;
+        cur = next;
+    }
+    return cur;
+}
+
+std::vector<PyObject*> ModDict::current_presentation_order(PyObject* d) const {
+    if (has_derived_order) return sort_index;  // copy of borrowed pointers
+    std::vector<PyObject*> keys;
+    PyObject *k, *v; Py_ssize_t pos = 0;
+    while (PyDict_Next(d, &pos, &k, &v)) keys.push_back(k);
+    return keys;
+}
+
+bool ModDict::less_by_values(const ModValue& ga, const ModValue& gb,
+                              const ModValue& sa, const ModValue& sb) const {
+    if (!group_field.empty()) {
+        bool ok = true;
+        int c = ga.compare(gb, &ok);
+        if (!ok) {
+            if (ga.obj && !gb.obj) return true;
+            if (!ga.obj && gb.obj) return false;
+            c = 0;
+        }
+        if (c != 0) return c < 0;
+    }
+    if (!sort_field.empty()) {
+        bool ok = true;
+        int c = sa.compare(sb, &ok);
+        if (!ok) {
+            if (sa.obj && !sb.obj) return !sort_reverse;
+            if (!sa.obj && sb.obj) return sort_reverse;
+            return false;
+        }
+        return sort_reverse ? c > 0 : c < 0;
+    }
+    return false;
+}
+
+bool ModDict::sort_index_less(PyObject* a, PyObject* b) const {
+    PyObject* d = cached_anchor_dict;
+    auto value_of = [&](PyObject* key, const std::vector<std::string>& path) -> ModValue {
+        PyObject* row = PyDict_GetItem(d, key);  // borrowed
+        PyObject* fv = row ? read_field_path(row, path) : nullptr;
+        return fv ? ModValue::from_pyobject(fv) : ModValue();
+    };
+    ModValue ga = !group_field.empty() ? value_of(a, group_field) : ModValue();
+    ModValue gb = !group_field.empty() ? value_of(b, group_field) : ModValue();
+    ModValue sa = !sort_field.empty()  ? value_of(a, sort_field)  : ModValue();
+    ModValue sb = !sort_field.empty()  ? value_of(b, sort_field)  : ModValue();
+    return less_by_values(ga, gb, sa, sb);
+}
+
+void ModDict::rebuild_sort_index() {
+    for (PyObject* k : sort_index) Py_XDECREF(k);
+    sort_index.clear();
+    has_derived_order = true;
+    if (!cached_anchor_dict) return;
+
+    bool need_group = !group_field.empty();
+    bool need_sort  = !sort_field.empty();
+
+    if (!need_group && !need_sort) {
+        // No comparator needed at all — natural PyDict order, nothing to precompute.
+        PyObject *k, *v; Py_ssize_t pos = 0;
+        while (PyDict_Next(cached_anchor_dict, &pos, &k, &v)) { Py_INCREF(k); sort_index.push_back(k); }
+        return;
+    }
+
+    // Precompute each row's sort-relevant field value(s) ONCE — O(n) field
+    // reads/ModValue conversions — then sort by the precomputed values:
+    // O(n log n) CHEAP comparisons with no repeated dict/path lookups. The
+    // same decorate-sort-undecorate strategy Python's own
+    // list.sort(key=...) uses internally. The naive alternative (call
+    // sort_index_less(), which looks values up fresh, as std::sort's
+    // comparator) redundantly re-extracts+re-converts the same field value
+    // O(n log n) times instead of O(n) — this was the dominant, benchmark-
+    // measured cost behind set_sort() being 20-30x slower than list.sort()
+    // at 10k-50k rows; this fixes that specifically (set_sort()'s absolute
+    // cost is still higher than a bare list.sort() — ModValue/PyObject
+    // comparisons aren't free — just no longer asymptotically worse in the
+    // number of times a field gets extracted).
+    struct Entry { PyObject* key; ModValue group_val; ModValue sort_val; };
+    std::vector<Entry> entries;
+    PyObject *k, *v; Py_ssize_t pos = 0;
+    while (PyDict_Next(cached_anchor_dict, &pos, &k, &v)) {
+        Entry e; e.key = k;
+        if (need_group) {
+            PyObject* fv = read_field_path(v, group_field);
+            e.group_val = fv ? ModValue::from_pyobject(fv) : ModValue();
+        }
+        if (need_sort) {
+            PyObject* fv = read_field_path(v, sort_field);
+            e.sort_val = fv ? ModValue::from_pyobject(fv) : ModValue();
+        }
+        entries.push_back(std::move(e));
+    }
+
+    std::sort(entries.begin(), entries.end(), [&](const Entry& x, const Entry& y) {
+        return less_by_values(x.group_val, y.group_val, x.sort_val, y.sort_val);
+    });
+
+    for (auto& e : entries) { Py_INCREF(e.key); sort_index.push_back(e.key); }
+}
+
+bool ModDict::try_bisect_insert_sort_index(PyObject* key, Py_ssize_t& out_new_pos) {
+    if (!has_derived_order || filter_predicate || !cached_anchor_dict) return false;
+    if (!PyDict_GetItem(cached_anchor_dict, key)) return false;  // caller wrote it already; defensive
+
+    auto it = std::lower_bound(sort_index.begin(), sort_index.end(), key,
+        [&](PyObject* a, PyObject* b) { return sort_index_less(a, b); });
+    out_new_pos = (Py_ssize_t)(it - sort_index.begin());
+    Py_INCREF(key);
+    sort_index.insert(it, key);
+    return true;
+}
+
+Py_ssize_t ModDict::find_sort_index_position(PyObject* key) const {
+    if (!has_derived_order) return -1;
+    uint64_t h = content_hash_pyobj(key);
+    for (size_t i = 0; i < sort_index.size(); i++)
+        if (content_hash_pyobj(sort_index[i]) == h) return (Py_ssize_t)i;
+    return -1;
+}
+
+void ModDict::rebuild_filter_membership() {
+    filter_membership = FlatHashMap<uint64_t, char>();
+    if (!filter_predicate || !cached_anchor_dict) return;
+    PyObject *k, *v; Py_ssize_t pos = 0;
+    while (PyDict_Next(cached_anchor_dict, &pos, &k, &v)) {
+        PyObject* res = PyObject_CallOneArg(filter_predicate, v);
+        if (!res) return;  // PyErr set — caller must check
+        int truthy = PyObject_IsTrue(res);
+        Py_DECREF(res);
+        if (truthy < 0) return;  // PyErr set
+        if (truthy) filter_membership.insert(content_hash_pyobj(k), 1);
+    }
+}
+
+ModDict::IndexDiff ModDict::set_sort(const std::vector<std::string>& field, bool reverse) {
+    IndexDiff diff;
+    PyObject* d = resolve_cursor_dict();
+    if (!d) return diff;  // PyErr already set
+
+    std::vector<PyObject*> old_order = current_presentation_order(d);
+    FlatHashMap<uint64_t, Py_ssize_t> old_pos;
+    for (size_t i = 0; i < old_order.size(); i++) old_pos.insert(content_hash_pyobj(old_order[i]), (Py_ssize_t)i);
+
+    sort_field = field;
+    sort_reverse = reverse;
+    rebuild_sort_index();
+
+    for (size_t i = 0; i < sort_index.size(); i++) {
+        uint64_t h = content_hash_pyobj(sort_index[i]);
+        const Py_ssize_t* op = old_pos.find(h);
+        diff.emplace_back(op ? *op : (Py_ssize_t)-1, (Py_ssize_t)i);
+    }
+    return diff;
+}
+
+ModDict::IndexDiff ModDict::set_group(const std::vector<std::string>& group_by_field) {
+    IndexDiff diff;
+    PyObject* d = resolve_cursor_dict();
+    if (!d) return diff;
+
+    std::vector<PyObject*> old_order = current_presentation_order(d);
+    FlatHashMap<uint64_t, Py_ssize_t> old_pos;
+    for (size_t i = 0; i < old_order.size(); i++) old_pos.insert(content_hash_pyobj(old_order[i]), (Py_ssize_t)i);
+
+    group_field = group_by_field;
+    rebuild_sort_index();
+
+    for (size_t i = 0; i < sort_index.size(); i++) {
+        uint64_t h = content_hash_pyobj(sort_index[i]);
+        const Py_ssize_t* op = old_pos.find(h);
+        diff.emplace_back(op ? *op : (Py_ssize_t)-1, (Py_ssize_t)i);
+    }
+    return diff;
+}
+
+ModDict::IndexDiff ModDict::set_filter(PyObject* predicate) {
+    IndexDiff diff;
+    PyObject* d = resolve_cursor_dict();
+    if (!d) return diff;
+
+    std::vector<PyObject*> old_order = current_presentation_order(d);
+    FlatHashMap<uint64_t, Py_ssize_t> old_pos;
+    for (size_t i = 0; i < old_order.size(); i++) old_pos.insert(content_hash_pyobj(old_order[i]), (Py_ssize_t)i);
+    // old *visible* positions only — rows the previous filter (if any) excluded
+    // don't get an old_pos entry, matching "old=-1 means newly appeared".
+    // FlatHashMap has no copy ctor (see flat_hash_map.h) — move it out; it's
+    // about to be discarded/rebuilt below regardless.
+    FlatHashMap<uint64_t, char> old_membership = std::move(filter_membership);
+    bool had_filter = (filter_predicate != nullptr);
+
+    Py_XDECREF(filter_predicate);
+    Py_XINCREF(predicate);
+    filter_predicate = predicate;
+    if (filter_predicate) {
+        rebuild_filter_membership();
+        if (PyErr_Occurred()) return diff;
+    } else {
+        filter_membership = FlatHashMap<uint64_t, char>();
+    }
+
+    // Compose: iterate the current full row set in its current presentation
+    // order (old_order — unaffected by the filter change itself, since
+    // set_filter never touches sort_index/has_derived_order), keep only rows
+    // passing the new filter (or all, if now inactive); "new" positions are
+    // dense over survivors. old_index is only defined for rows that were
+    // ALSO visible under the OLD filter (or unconditionally, if there wasn't one).
+    Py_ssize_t new_i = 0;
+    for (PyObject* key : old_order) {
+        uint64_t h = content_hash_pyobj(key);
+        bool passes_new = !filter_predicate || filter_membership.find(h);
+        if (!passes_new) continue;
+        bool visible_old = !had_filter || old_membership.find(h);
+        const Py_ssize_t* op = old_pos.find(h);
+        diff.emplace_back(visible_old && op ? *op : (Py_ssize_t)-1, new_i++);
+    }
+    return diff;
+}
+
+ModDict::IndexDiff ModDict::resync_and_diff() {
+    IndexDiff diff;
+    if (!cached_anchor_dict) return diff;
+
+    // Hash old_order's keys UP FRONT and never dereference the raw pointers
+    // again after this point — rebuild_sort_index() below DECREFs
+    // sort_index's old entries, and if a row was just deleted (its ONLY
+    // other reference, the dict's own, already dropped via PyDict_DelItem),
+    // that DECREF can be the one that actually frees it. A hash computed
+    // now stays valid; the pointer itself might not.
+    std::vector<PyObject*> old_order = current_presentation_order(cached_anchor_dict);
+    FlatHashMap<uint64_t, Py_ssize_t> old_pos;
+    std::vector<uint64_t> old_hashes;
+    old_hashes.reserve(old_order.size());
+    for (size_t i = 0; i < old_order.size(); i++) {
+        uint64_t h = content_hash_pyobj(old_order[i]);
+        old_hashes.push_back(h);
+        old_pos.insert(h, (Py_ssize_t)i);
+    }
+    bool had_filter = (filter_predicate != nullptr);
+    FlatHashMap<uint64_t, char> old_membership = had_filter ? std::move(filter_membership) : FlatHashMap<uint64_t, char>();
+
+    if (has_derived_order) rebuild_sort_index();
+    if (had_filter) {
+        rebuild_filter_membership();
+        if (PyErr_Occurred()) return diff;
+    }
+
+    std::vector<PyObject*> new_order = current_presentation_order(cached_anchor_dict);
+    FlatHashMap<uint64_t, Py_ssize_t> new_pos;
+    std::vector<uint64_t> new_hashes;
+    new_hashes.reserve(new_order.size());
+    for (size_t i = 0; i < new_order.size(); i++) {
+        uint64_t h = content_hash_pyobj(new_order[i]);
+        new_hashes.push_back(h);
+        new_pos.insert(h, (Py_ssize_t)i);
+    }
+
+    // Union of "was visible old" and "is visible new" hashes, deduped — a
+    // plain removal or a filter-caused disappearance both need a
+    // (old_index, -1) entry even though the row isn't in new_order at all.
+    FlatHashMap<uint64_t, char> seen;
+    auto consider = [&](uint64_t h) {
+        if (seen.find(h)) return;
+        seen.insert(h, 1);
+        bool visible_old = !had_filter || old_membership.find(h);
+        bool visible_new = !filter_predicate || filter_membership.find(h);
+        const Py_ssize_t* op = old_pos.find(h);
+        const Py_ssize_t* np = new_pos.find(h);
+        Py_ssize_t oi = (visible_old && op) ? *op : (Py_ssize_t)-1;
+        Py_ssize_t ni = (visible_new && np) ? *np : (Py_ssize_t)-1;
+        if (oi == -1 && ni == -1) return;  // never visible on either side
+        if (oi == ni) return;              // unchanged position, nothing to report
+        diff.emplace_back(oi, ni);
+    };
+    for (uint64_t h : old_hashes) consider(h);
+    for (uint64_t h : new_hashes) consider(h);
+    return diff;
+}
+
+PyObject* index_diff_to_pylist(const ModDict::IndexDiff& diff) {
+    PyObject* result = PyList_New((Py_ssize_t)diff.size());
+    if (!result) return nullptr;
+    for (size_t i = 0; i < diff.size(); i++) {
+        Py_ssize_t old_i = diff[i].first, new_i = diff[i].second;
+        PyObject* ko;
+        if (old_i < 0) { Py_INCREF(Py_None); ko = Py_None; }
+        else { ko = PyLong_FromSsize_t(old_i); if (!ko) { Py_DECREF(result); return nullptr; } }
+        PyObject* vo = PyLong_FromSsize_t(new_i);
+        if (!vo) { Py_DECREF(ko); Py_DECREF(result); return nullptr; }
+        PyObject* tup = PyTuple_Pack(2, ko, vo);
+        Py_DECREF(ko); Py_DECREF(vo);
+        if (!tup) { Py_DECREF(result); return nullptr; }
+        PyList_SET_ITEM(result, i, tup);  // steals the reference
+    }
+    return result;
+}
+
+PyObject* py_index_or_none(Py_ssize_t idx) {
+    if (idx < 0) Py_RETURN_NONE;
+    return PyLong_FromSsize_t(idx);
+}
+
+PyObject* py_index_list(const std::vector<Py_ssize_t>& positions) {
+    PyObject* result = PyList_New((Py_ssize_t)positions.size());
+    if (!result) return nullptr;
+    for (size_t i = 0; i < positions.size(); i++) {
+        PyObject* v = py_index_or_none(positions[i]);
+        if (!v) { Py_DECREF(result); return nullptr; }
+        PyList_SET_ITEM(result, i, v);  // steals the reference
+    }
+    return result;
+}
+
+void ModDict::dispatch_event(const char* event_type, PyObject* payload) {
+    if (!live_connect_listeners) return;
+    PyObject* key = PyUnicode_FromString(event_type);
+    if (!key) return;
+    PyObject* listeners = PyDict_GetItem(live_connect_listeners, key);  // borrowed
+    Py_DECREF(key);
+    if (!listeners) return;
+    Py_ssize_t n = PyList_Size(listeners);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject* cb = PyList_GetItem(listeners, i);  // borrowed
+        PyObject* res = PyObject_CallOneArg(cb, payload);
+        if (!res) return;  // listener raised — propagate (fail loud), stop this dispatch
+        Py_DECREF(res);
+    }
+}
+
+void ModDict::notify_live_cursors(uint64_t changed_top_hash, ModDict* originator) {
+    ModDict* actual_root = true_root();
+    for (auto& bucket : actual_root->live_cursors.occupied()) {
+        auto& weakrefs = bucket.value;
+        for (size_t i = 0; i < weakrefs.size(); ) {
+            PyObject* wr = weakrefs[i];
+            PyObject* target = PyWeakref_GetObject(wr);  // borrowed; Py_None if dead
+            if (!target || target == Py_None) {
+                Py_DECREF(wr);
+                weakrefs.erase(weakrefs.begin() + (long)i);
+                continue;
+            }
+            ModDict* cur = ModDict_unwrap(target);
+            if (cur && cur != originator && !cur->anchor_path.empty()) {
+                PyObject* tmp = PyUnicode_FromStringAndSize(cur->anchor_path[0].c_str(), cur->anchor_path[0].size());
+                uint64_t seg0_hash = tmp ? content_hash_pyobj(tmp) : 0;
+                Py_XDECREF(tmp);
+                if (tmp && seg0_hash == changed_top_hash) {
+                    // Ensures cached_anchor_dict is populated (a never-yet-
+                    // read sibling cursor starts with it null) before diffing.
+                    if (!cur->resolve_cursor_dict()) { PyErr_Clear(); i++; continue; }
+                    IndexDiff diff = cur->resync_and_diff();
+                    if (PyErr_Occurred()) { PyErr_Clear(); i++; continue; }  // don't let one bad cursor abort the broadcast
+                    PyObject* payload = index_diff_to_pylist(diff);
+                    if (payload) { cur->dispatch_event("reorder", payload); Py_DECREF(payload); }
+                    if (PyErr_Occurred()) PyErr_Clear();  // a listener's exception shouldn't abort the broadcast either
+                }
+            }
+            i++;
+        }
+    }
+}
+
+Py_ssize_t ModDict::cursor_insert(PyObject* key, PyObject* row) {
+    PyObject* d = resolve_cursor_dict();
+    if (!d) return -1;
+    // Bootstrap sort_index as a maintained snapshot (natural order if no
+    // sort/group field set) BEFORE the write — without this, a fallback
+    // rebuild below would have nothing meaningful to distinguish "before"
+    // from "after". Only matters on first use; a no-op once already active.
+    if (!has_derived_order) rebuild_sort_index();
+    // Checked BEFORE the write: try_bisect_insert_sort_index() is only valid
+    // for a genuinely new key (see its own comment) — an overwrite of an
+    // existing key can move that row's sort position, which the O(log n)
+    // bisect path doesn't handle, so it must fall back to a full rebuild.
+    bool is_new_key = !PyDict_Contains(d, key);
+    if (PyDict_SetItem(d, key, row) != 0) return -1;
+    // Notifies siblings (excluding `this`, via originator) — reindex_row_no_
+    // validate() already does this; a second explicit call here would
+    // re-notify the same siblings a second time for nothing (their state
+    // is already resynced by the first call, so the second finds no
+    // further change and fires an empty, redundant event).
+    true_root()->reindex_row_no_validate(cached_top_hash, this);
+
+    Py_ssize_t new_pos = -1;
+    if (is_new_key && try_bisect_insert_sort_index(key, new_pos)) return new_pos;
+
+    // Fallback (filter active, or an existing key overwritten): a full
+    // rebuild is still needed for correctness — this row's sort position
+    // could move by an arbitrary amount, or filter visibility could flip —
+    // but only THIS row's own resulting position needs reporting (see the
+    // class-level comment on cursor_insert's declaration).
+    if (has_derived_order) rebuild_sort_index();
+    if (filter_predicate) {
+        rebuild_filter_membership();
+        if (PyErr_Occurred()) return -1;
+        if (!filter_membership.find(content_hash_pyobj(key))) return -1;
+    }
+    return find_sort_index_position(key);
+}
+
+std::pair<Py_ssize_t,Py_ssize_t> ModDict::cursor_update_row(PyObject* key, PyObject* changes) {
+    PyObject* d = resolve_cursor_dict();
+    if (!d) return {-1, -1};
+    PyObject* row = PyDict_GetItem(d, key);  // borrowed
+    if (!row) { PyErr_SetObject(PyExc_KeyError, key); return {-1, -1}; }
+    if (!has_derived_order) rebuild_sort_index();  // see cursor_insert() comment
+
+    Py_ssize_t old_pos = find_sort_index_position(key);
+    bool was_visible = !filter_predicate || filter_membership.find(content_hash_pyobj(key));
+    if (!was_visible) old_pos = -1;
+
+    if (PyDict_Update(row, changes) != 0) return {-1, -1};
+    true_root()->reindex_row_no_validate(cached_top_hash, this);  // notifies siblings — see cursor_insert() comment
+
+    if (has_derived_order) rebuild_sort_index();
+    Py_ssize_t new_pos = find_sort_index_position(key);
+    if (filter_predicate) {
+        rebuild_filter_membership();
+        if (PyErr_Occurred()) return {old_pos, -1};
+        if (!filter_membership.find(content_hash_pyobj(key))) new_pos = -1;
+    }
+    return {old_pos, new_pos};
+}
+
+Py_ssize_t ModDict::cursor_delete(PyObject* key) {
+    PyObject* d = resolve_cursor_dict();
+    if (!d) return -1;
+    if (!PyDict_Contains(d, key)) { PyErr_SetObject(PyExc_KeyError, key); return -1; }
+    if (!has_derived_order) rebuild_sort_index();  // see cursor_insert() comment
+
+    Py_ssize_t old_pos = find_sort_index_position(key);
+    bool was_visible = !filter_predicate || filter_membership.find(content_hash_pyobj(key));
+    if (!was_visible) old_pos = -1;
+
+    if (PyDict_DelItem(d, key) != 0) return -1;
+    true_root()->reindex_row_no_validate(cached_top_hash, this);  // notifies siblings — see cursor_insert() comment
+
+    if (has_derived_order) rebuild_sort_index();
+    if (filter_predicate) {
+        rebuild_filter_membership();
+        if (PyErr_Occurred()) return old_pos;
+    }
+    return old_pos;
+}
+
+std::vector<Py_ssize_t> ModDict::cursor_insert_batch(PyObject* rows) {
+    std::vector<Py_ssize_t> positions;
+    PyObject* d = resolve_cursor_dict();
+    if (!d) return positions;
+    if (!has_derived_order) rebuild_sort_index();
+    if (PyDict_Update(d, rows) != 0) return positions;  // merges every {key: row} pair in one call
+    true_root()->reindex_row_no_validate(cached_top_hash, this);
+
+    if (has_derived_order) rebuild_sort_index();
+    if (filter_predicate) {
+        rebuild_filter_membership();
+        if (PyErr_Occurred()) return positions;
+    }
+
+    // A hash->position map built ONCE (O(n)) — an O(n) find_sort_index_
+    // position() call per batch row would be O(n*k) for a k-row batch.
+    FlatHashMap<uint64_t, Py_ssize_t> pos_by_hash;
+    if (has_derived_order)
+        for (size_t i = 0; i < sort_index.size(); i++)
+            pos_by_hash.insert(content_hash_pyobj(sort_index[i]), (Py_ssize_t)i);
+
+    PyObject *k, *v; Py_ssize_t pos = 0;
+    while (PyDict_Next(rows, &pos, &k, &v)) {
+        uint64_t h = content_hash_pyobj(k);
+        if (filter_predicate && !filter_membership.find(h)) { positions.push_back(-1); continue; }
+        const Py_ssize_t* p = pos_by_hash.find(h);
+        positions.push_back(p ? *p : -1);
+    }
+    return positions;
 }
 
 // Validates that every current row matching ld.source_pattern resolves to a

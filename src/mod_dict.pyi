@@ -42,7 +42,7 @@ Path strings (used by filter/sort_by/group_by/select/update/create_index/...):
   field literally named ``"geo.city"``, not nesting into ``geo`` then ``city``.
 """
 from __future__ import annotations
-from typing import Any, Iterator, Literal, Sequence, overload
+from typing import Any, Callable, Iterator, Literal, Sequence, overload
 
 
 class FilterBuilder:
@@ -987,6 +987,412 @@ class ModDict:
 
             # Group by nested field
             by_region = mn.group_by("meta.details.region")
+        """
+        ...
+
+    # ──────────────────────────────────────────────────
+    # Cursors — live, mutation-aware views for reactive GUI tables
+    # ──────────────────────────────────────────────────
+
+    def cursor(self, path: str | tuple[str, ...]) -> ModDict:
+        """
+        Return a live cursor anchored at an existing nested table.
+
+        A cursor is a ``ModDict`` instance whose data lives in the *parent's*
+        storage — reads and writes route straight through to the anchored
+        raw dict (``PyDict``-level, no copy). It is the backing primitive for
+        reactive GUI tables (Qt models, etc.): stateful ``set_sort()``/
+        ``set_filter()``/``set_group()`` flags maintained incrementally,
+        point-mutation methods that return exactly the diff a GUI needs, and
+        ``connect()`` for push-based reactivity.
+
+        **The anchor must already exist** — a cursor never creates structure.
+        Calling ``cursor()`` on a missing path raises immediately, the same
+        way indexing a missing key does.
+
+        Multiple independent cursors can point at the same anchor — each
+        gets its own private sort/filter/group state and its own
+        ``connect()`` listeners, but all of them see the same live
+        underlying data and notify each other when any one of them mutates
+        it (a "reorder" event — see ``connect()``).
+
+        A cursor is **not** a full second ``ModDict``: most root-only
+        methods (``link``, ``follow``, ``select``, ``copy``, ``serialize``,
+        ``group_by``, ``keys``/``values``/``items``, ``alias``, ``pop``, and
+        more) raise ``NotImplementedError`` on a cursor by design — call
+        them on the root instead. Field-indexing (``create_index``,
+        ``filter``, ``sort_by``) is likewise not yet cursor-aware and also
+        raises; a cursor's own ``set_sort``/``set_filter``/``set_group``
+        below are unrelated to that machinery.
+
+        Args:
+            path: Dot-notation string or tuple/list of exact segments,
+                  identifying a nested ``{key: row}`` table to anchor on.
+                  Must be fully literal — no ``?`` wildcard segments
+                  (a cursor addresses one deterministic location, never a
+                  flatten across many dynamic parents; for that, use
+                  ``filter()``/``select()`` instead, unchanged).
+
+        Raises:
+            ValueError: path is empty, contains a wildcard segment, or
+                        doesn't resolve to an existing dict-shaped value.
+
+        Example::
+
+            mn = md.ModDict()
+            mn["u1"] = {"orders": {"o1": {"amount": 30, "status": "shipped"}}}
+
+            orders = mn.cursor("u1.orders")   # single segment: mn.cursor("u1") also valid
+            orders["o1"]["amount"]             # 30 — normal dict protocol
+            len(orders)                        # 1
+
+            mn.cursor("u1.missing")            # ValueError — doesn't exist
+            mn.cursor("u1.orders.?.status")    # ValueError — wildcard segment
+        """
+        ...
+
+    def set_sort(
+        self, field: str | tuple[str, ...], reverse: bool = False,
+    ) -> list[tuple[int | None, int]]:
+        """
+        Activate (or reconfigure) incremental sort on a cursor.
+
+        Maintains a private ordered view of this cursor's rows by `field`'s
+        value, kept incrementally in sync by ``insert()``/``update_row()``/
+        ``delete()``/``insert_batch()`` afterward (and by mutations made
+        through a *different* cursor on the same anchor — see ``connect()``
+        "reorder"). This call itself does a full, explicit rebuild — cheap
+        and rare relative to per-mutation maintenance.
+
+        If ``set_group()`` is also active, sort is the **secondary** key
+        (tie-breaker) within each group, not the primary order.
+
+        A field value missing on a given row, or not comparable to another
+        row's value for that field (e.g. ``None`` vs ``int``), sorts after
+        every comparable value — never raises.
+
+        Args:
+            field:   Field name or dot-notation path (see the module
+                     docstring for path syntax) — a literal path within each
+                     row, no ``?`` wildcard.
+            reverse: Descending order if True.
+
+        Returns:
+            A list of ``(old_index, new_index)`` pairs describing exactly
+            what moved, versus whatever presentation order (a prior
+            sort/group, or natural insertion order if this is the first
+            call) existed immediately before — ``old_index=None`` means the
+            row had no defined position before (not applicable here on a
+            reconfigure of an already-populated cursor, but shared
+            vocabulary with ``insert()``/``insert_batch()``). Feed straight
+            into Qt's ``changePersistentIndexList``.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            orders.set_sort("amount")               # ascending by amount
+            orders.at(0)                              # smallest amount
+            orders.set_sort("amount", reverse=True)  # re-sort descending
+        """
+        ...
+
+    def set_group(
+        self, field: str | tuple[str, ...] | None,
+    ) -> list[tuple[int | None, int]]:
+        """
+        Activate (or clear) incremental grouping on a cursor.
+
+        Rows sharing the same `field` value become contiguous — the sort
+        order (if ``set_sort()`` is also active) becomes secondary, applied
+        *within* each group; without an active sort, each group's internal
+        order is plain insertion order. Groups themselves are ordered by the
+        same value-comparison logic used for sort, applied to the distinct
+        group-key values rather than to rows.
+
+        There is no separate group-bucket structure to query directly — a
+        cursor stays one flat, positionally-addressable sequence
+        (``at(i)``/iteration/``len()``); a GUI wanting group headers reads
+        each row's own group field to detect a boundary.
+
+        Args:
+            field: Field name or dot-notation path, or ``None`` to clear
+                   grouping (falls back to plain sort, or natural order).
+
+        Returns:
+            Same ``(old_index, new_index)`` diff vocabulary as ``set_sort()``.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            orders.set_sort("amount")
+            orders.set_group("status")   # grouped by status, sorted by amount within each group
+            orders.set_group(None)       # clear grouping, sort_by("amount") still active
+        """
+        ...
+
+    def set_filter(
+        self, predicate: Callable[[dict], bool] | None,
+    ) -> list[tuple[int | None, int]]:
+        """
+        Activate (or clear) a row-visibility predicate on a cursor.
+
+        `predicate` is called with each row's dict; rows it rejects are
+        tracked as excluded — maintained incrementally afterward, same as
+        ``set_sort()``/``set_group()``.
+
+        Filter membership is currently tracked and diffed correctly, but is
+        **not yet composed into ``len()``/iteration/``at()``** — those still
+        reflect every row under the anchor regardless of filter state. Only
+        the diff returned here (and the payload delivered to a matching
+        mutation's ``connect()`` event) currently reflects visibility.
+
+        Args:
+            predicate: Callable taking a row dict, returning truthy to keep
+                       the row visible. ``None`` clears the filter (every
+                       row becomes visible again).
+
+        Returns:
+            ``(old_index, new_index)`` pairs — for a reconfigure, a row that
+            was hidden by the *previous* filter (or wasn't tracked because
+            no filter was active) and becomes visible under the new one
+            reports ``old_index=None`` even though the row itself already
+            existed; a formerly-visible row that the new filter now excludes
+            reports ``new_index=None``. Multiple rows can legitimately share
+            ``old_index=None`` in the same call — that's exactly why this is
+            a **list**, not a ``{old: new}`` dict (a dict would collapse
+            them).
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            orders.set_filter(lambda row: row["status"] == "shipped")
+            orders.set_filter(None)   # clear
+        """
+        ...
+
+    def connect(self, event_type: Literal["insert", "update", "delete", "reorder"],
+                callback: Callable[[Any], None]) -> None:
+        """
+        Register a callback for one event type on a cursor.
+
+        Framework-agnostic — no Qt/GUI dependency. Fires synchronously on
+        the calling thread; thread marshaling across a Qt event loop is the
+        caller's job (e.g. register a Qt Signal's bound ``.emit`` as the
+        callback, then connect the Signal normally for an automatic
+        ``QueuedConnection`` across threads). Multiple listeners per event
+        are supported — each ``connect()`` call appends, none replace.
+
+        There is no path/wildcard parameter — a listener is always scoped to
+        the exact anchor the cursor it's registered on was created for.
+
+        Events:
+
+        - ``"insert"`` — fired by this cursor's own ``insert()`` (payload:
+          the same ``int | None`` new-position it returns) or
+          ``insert_batch()`` (payload: the same ``list[int | None]``).
+        - ``"update"`` — fired by this cursor's own ``update_row()``.
+          Payload: the same ``((old_index, new_index), changed_fields)``
+          2-tuple it returns.
+        - ``"delete"`` — fired by this cursor's own ``delete()``. Payload:
+          the same ``int | None`` former-position it returns.
+        - ``"reorder"`` — fired on a cursor when a *different* cursor
+          anchored at the same location mutates the data (a sibling doesn't
+          know the precise operation that changed its view, only that it
+          did, so this is the one event that DOES carry the full picture).
+          Payload: ``list[(old_index, new_index)]`` — every row whose
+          position or visibility actually changed, computed by re-diffing
+          this cursor's own state from scratch.
+
+        A listener's exception propagates normally when it's this cursor's
+        own direct mutation call; during a "reorder" broadcast to several
+        sibling cursors, one listener raising doesn't stop the others from
+        being notified.
+
+        Args:
+            event_type: One of ``"insert"``/``"update"``/``"delete"``/``"reorder"``.
+            callback:   Called with that event's payload (see above).
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            orders.connect("insert", lambda diff: model.apply_insert(diff))
+            orders.connect("reorder", lambda diff: model.apply_reorder(diff))
+        """
+        ...
+
+    def insert(self, key: Any, row: dict) -> int | None:
+        """
+        Insert (or overwrite) one row through a cursor.
+
+        Writes straight into the parent's raw anchored dict (same effect as
+        ``cursor[key] = row``), then updates any active sort/filter/group
+        state and notifies sibling cursors on the same anchor. Fires this
+        cursor's own ``"insert"`` ``connect()`` event with the same value
+        this method returns.
+
+        Returns only this row's own landing position — **not** a list of
+        every sibling row that structurally shifted as a side effect (e.g.
+        every row after the insertion point, under an active sort). A GUI's
+        ``beginInsertRows(parent, pos, pos)`` already implies that shift for
+        Qt's whole downstream stack (selection, persistent indices,
+        delegates) — enumerating every renumbered sibling explicitly would
+        be both redundant and, at scale, far more expensive than the actual
+        O(log n) position search + pointer-only vector shift underneath (a
+        real, benchmark-measured cost this return shape avoids: a single
+        insert into a 50 000-row sorted cursor is ~16us, on par with
+        ``bisect.insort`` on a plain list — a full-diff-list return of every
+        shifted sibling cost over 100x more, almost entirely in marshaling
+        that list to Python objects nobody needed).
+
+        A row that an active filter rejects still gets written (it's still
+        in the underlying data — see ``set_filter()``) but has no defined
+        position, so this returns ``None`` for it and fires no event at all.
+
+        Args:
+            key: The row's key within the anchored table.
+            row: The row dict to store.
+
+        Returns:
+            The row's new position (``int``), or ``None`` if an active
+            filter excludes it.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            orders.set_sort("amount")
+            new_index = orders.insert("o9", {"amount": 15, "status": "new"})
+        """
+        ...
+
+    def update_row(self, key: Any, changes: dict) -> tuple[tuple[int | None, int | None], list[str]]:
+        """
+        Merge field changes into one existing row through a cursor.
+
+        Equivalent to ``cursor[key].update(changes)`` plus incremental
+        sort/filter/group maintenance and sibling notification — merges
+        `changes` into the row via a plain dict update (existing fields not
+        named in `changes` are left untouched).
+
+        Unlike ``insert()``/``delete()``, this reports **both** the row's old
+        and new position explicitly, as a pair — not just the one, and not a
+        list of every other shifted sibling either. A field change that
+        moves a row is structurally a *move*, and a GUI's
+        ``beginMoveRows(sourceParent, oldIndex, oldIndex, destParent, newIndex)``
+        genuinely needs both endpoints; unlike a plain insert/remove, there's
+        no way for the GUI to infer where a specific row moved *from* and
+        *to* on its own.
+
+        Args:
+            key:     The row's key within the anchored table. Raises
+                     ``KeyError`` if not found.
+            changes: Fields to merge into the row.
+
+        Returns:
+            A 2-tuple:
+
+            - ``(old_index, new_index)`` — either may be ``None`` if the row
+              wasn't visible before / isn't visible after (an active filter
+              excludes it); both are the same non-``None`` value if the
+              change didn't move the row at all.
+            - ``changed_fields`` — the subset of `changes`' keys whose value
+              actually differs from what was there before (not just "was
+              present in `changes`" — a value written as identical to what
+              was already there is excluded).
+
+        Fires this cursor's own ``"update"`` ``connect()`` event with this
+        same 2-tuple as the payload.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            (old_i, new_i), changed = orders.update_row("o1", {"amount": 99, "status": "shipped"})
+            # changed == ["amount"] if status was already "shipped"
+        """
+        ...
+
+    def delete(self, key: Any) -> int | None:
+        """
+        Delete one row through a cursor.
+
+        Equivalent to ``del cursor[key]`` plus incremental sort/filter/group
+        maintenance and sibling notification. Fires this cursor's own
+        ``"delete"`` ``connect()`` event with the same value this method
+        returns.
+
+        Returns only the deleted row's own former position — **not** a list
+        of every remaining row that shifted as a result. A GUI's
+        ``beginRemoveRows(parent, pos, pos)`` already implies that shift for
+        everything after `pos` — same reasoning as ``insert()``, see there
+        for the benchmark numbers behind this shape.
+
+        Args:
+            key: The row's key within the anchored table. Raises
+                 ``KeyError`` if not found.
+
+        Returns:
+            The row's former position (``int``), or ``None`` if it wasn't
+            visible under an active filter at the time of deletion.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            old_index = orders.delete("o2")
+        """
+        ...
+
+    def insert_batch(self, rows: dict[Any, dict]) -> list[int | None]:
+        """
+        Insert (or overwrite) many rows through a cursor in one call.
+
+        Writes every ``{key: row}`` pair in one pass (not a Python-level
+        loop of individual ``insert()`` calls — one incremental-state
+        rebuild for the whole batch, not one per row), then notifies sibling
+        cursors and fires a single ``"insert"`` ``connect()`` event covering
+        every inserted row.
+
+        Returns only the NEW rows' own landing positions — same "don't
+        enumerate shifted siblings" reasoning as ``insert()``, extended to a
+        batch. Existing rows displaced by the batch aren't reported.
+
+        Args:
+            rows: ``{key: row_dict, ...}`` — every value must be a dict.
+
+        Returns:
+            ``list[int | None]``, one entry per row in `rows` (in the same
+            order `rows` iterates), each either that row's new position or
+            ``None`` if an active filter excludes it.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            positions = orders.insert_batch({
+                "o10": {"amount": 5,  "status": "new"},
+                "o11": {"amount": 40, "status": "new"},
+            })
         """
         ...
 

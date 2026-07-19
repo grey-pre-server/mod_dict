@@ -92,6 +92,14 @@ public:
     void build_wildcard(ModDict* owner, const std::vector<std::string>& pat);
     void clear();
 
+    // Rebuilds from scratch using whatever field_name/pattern this index was
+    // ORIGINALLY built with (already stored as members) — for bulk-load
+    // callers that skip per-row on_insert_row()/on_remove_row() (O(n) shift
+    // each) during a loop and rebuild every existing index ONCE at the end
+    // instead (O(N log N) total, not O(N) × k rows). Reuses build()/
+    // build_wildcard() verbatim, no new indexing logic.
+    void rebuild(ModDict* owner) { if (is_wildcard) build_wildcard(owner, pattern); else build(owner, field_name); }
+
     // ──────────────────────────────────────────────────
     // Инкрементальные обновления
     // ──────────────────────────────────────────────────
