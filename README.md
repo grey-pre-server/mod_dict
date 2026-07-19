@@ -38,8 +38,8 @@ mn.filter("orders.?.customer_id->name").eq("Alice")  # JOIN in WHERE, chainable 
 # (anchored at an existing nested {key: row} table — see "Cursors" below)
 orders = mn.cursor("some_table")
 orders.set_sort("amount")
-new_index = orders.insert("o9", {"amount": 15})  # → int | None — its landing position
-orders.connect("insert", lambda i: qt_model.apply_insert(i))
+new_index, row = orders.insert("o9", {"amount": 15})  # → (int | None, dict) — landing position, row
+orders.connect("insert", lambda payload: qt_model.apply_insert(payload))
 
 # Update from another collection
 mn.update(other)                                 # bulk insert (like dict.update)
@@ -174,10 +174,10 @@ mn.follow("orders.?.customer_id")                        # → ModDict of resolv
 # Cursors — live views for GUI tables, see "Cursors" below
 orders = mn.cursor("u1.orders")                          # anchor must already exist
 orders.set_sort("amount") / orders.set_filter(pred) / orders.set_group("status")
-orders.insert(key, row)          # -> int | None (new_index)
+orders.insert(key, row)          # -> (int | None, dict) = (new_index, row)
 orders.delete(key)               # -> int | None (old_index)
-orders.update_row(key, changes)  # -> ((old_index, new_index), changed_fields)
-orders.insert_batch({key: row, ...})  # -> list[int|None], one write pass, one connect() event
+orders.update_row(key, changes)  # -> ((old_index, new_index), changes) — changes: {field: new_value}
+orders.insert_batch({key: row, ...})  # -> list[(int|None, dict)] = [(new_index, row), ...], one write pass, one connect() event
 orders.insert_batch([row, ...], key="id")  # same, key= extracts each row's outer key instead of a pre-keyed dict
 orders.connect("insert" | "update" | "delete" | "reorder", callback)
 
@@ -404,32 +404,35 @@ len(orders)                           # 2
 orders.set_sort("amount")             # maintained incrementally from here on
 orders.set_group("status")            # rows grouped, sorted by amount within each group
 
-new_index = orders.insert("o3", {"amount": 20, "status": "new"})
-# → int | None — just THIS row's own landing position, not a list of every
-#   sibling that shifted. Feed it straight into Qt's beginInsertRows(pos,
-#   pos) — Qt's own downstream stack (selection, persistent indices) already
-#   knows everything after `pos` moved, no explicit list needed. None means
-#   an active filter excludes the row (it's still written, just not visible).
+new_index, row = orders.insert("o3", {"amount": 20, "status": "new"})
+# → (int | None, dict) — THIS row's own landing position (not a list of
+#   every sibling that shifted — feed it straight into Qt's
+#   beginInsertRows(pos, pos), Qt's own downstream stack already knows
+#   everything after `pos` moved) paired with the row itself, so a
+#   connect() listener elsewhere doesn't need a separate lookup to reach
+#   it. None means an active filter excludes the row (it's still written,
+#   just not visible; `row` is still returned either way).
 
-(old_index, new_index), changed_fields = orders.update_row("o1", {"amount": 99})
+(old_index, new_index), changes = orders.update_row("o1", {"amount": 99})
 # unlike insert/delete, BOTH endpoints are returned — a field-driven move is
 # a Qt beginMoveRows(old, new), and there's no way to infer "from where" on
 # the GUI side the way an insert/remove's implicit shift can be inferred.
-# changed_fields: only fields whose value actually changed.
+# changes: {field: new_value} only for fields whose value actually changed.
 
 old_index = orders.delete("o2")       # → int | None — the row's former position
 
-positions = orders.insert_batch({"o4": {"amount": 5, "status": "new"},
-                                  "o5": {"amount": 40, "status": "new"}})
-# → list[int | None], one per new row, in the same order the batch was
-# given — one write pass, one connect() event, existing rows displaced by
-# the batch aren't individually reported (same reasoning as insert() above)
+results = orders.insert_batch({"o4": {"amount": 5, "status": "new"},
+                                "o5": {"amount": 40, "status": "new"}})
+# → list[(int | None, dict)], one (index, row) pair per new row, in the
+# same order the batch was given — one write pass, one connect() event,
+# existing rows displaced by the batch aren't individually reported
+# (same reasoning as insert() above)
 
 # same effect from a plain list, key= extracts each row's own outer key —
 # saves building the {key: row} mapping yourself in a Python loop first
 orders.insert_batch([{"id": "o4", "amount": 5, "status": "new"}], key="id")
 
-orders.connect("insert", lambda new_index: qt_model.apply_insert(new_index))
+orders.connect("insert", lambda payload: qt_model.apply_insert(payload))
 orders.connect("update", lambda payload: qt_model.apply_update(payload))
 orders.connect("delete", lambda old_index: qt_model.apply_delete(old_index))
 orders.connect("reorder", lambda diff: qt_model.apply_reorder(diff))

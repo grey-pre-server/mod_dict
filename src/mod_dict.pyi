@@ -1237,10 +1237,10 @@ class ModDict:
         Events:
 
         - ``"insert"`` — fired by this cursor's own ``insert()`` (payload:
-          the same ``int | None`` new-position it returns) or
-          ``insert_batch()`` (payload: the same ``list[int | None]``).
+          the same ``(int | None, dict)`` it returns) or ``insert_batch()``
+          (payload: the same ``list[(int | None, dict)]``).
         - ``"update"`` — fired by this cursor's own ``update_row()``.
-          Payload: the same ``((old_index, new_index), changed_fields)``
+          Payload: the same ``((old_index, new_index), changes)``
           2-tuple it returns.
         - ``"delete"`` — fired by this cursor's own ``delete()``. Payload:
           the same ``int | None`` former-position it returns.
@@ -1272,7 +1272,7 @@ class ModDict:
         """
         ...
 
-    def insert(self, key: Any, row: dict) -> int | None:
+    def insert(self, key: Any, row: dict) -> tuple[int | None, dict]:
         """
         Insert (or overwrite) one row through a cursor.
 
@@ -1282,37 +1282,43 @@ class ModDict:
         cursor's own ``"insert"`` ``connect()`` event with the same value
         this method returns.
 
-        Returns only this row's own landing position — **not** a list of
-        every sibling row that structurally shifted as a side effect (e.g.
-        every row after the insertion point, under an active sort). A GUI's
-        ``beginInsertRows(parent, pos, pos)`` already implies that shift for
-        Qt's whole downstream stack (selection, persistent indices,
-        delegates) — enumerating every renumbered sibling explicitly would
-        be both redundant and, at scale, far more expensive than the actual
-        O(log n) position search + pointer-only vector shift underneath (a
-        real, benchmark-measured cost this return shape avoids: a single
-        insert into a 50 000-row sorted cursor is ~17us, on par with
-        ``bisect.insort`` on a plain list — a full-diff-list return of every
-        shifted sibling cost over 100x more, almost entirely in marshaling
-        that list to Python objects nobody needed). An overwrite of an
-        existing key is repositioned the same way (erase + bisect-reinsert),
-        not a full re-sort of every row — see ``update_row()``.
+        Returns the row's own landing position paired with the row itself —
+        **not** a list of every sibling row that structurally shifted as a
+        side effect (e.g. every row after the insertion point, under an
+        active sort). A GUI's ``beginInsertRows(parent, pos, pos)`` already
+        implies that shift for Qt's whole downstream stack (selection,
+        persistent indices, delegates) — enumerating every renumbered
+        sibling explicitly would be both redundant and, at scale, far more
+        expensive than the actual O(log n) position search + pointer-only
+        vector shift underneath (a real, benchmark-measured cost this return
+        shape avoids: a single insert into a 50 000-row sorted cursor is
+        ~17us, on par with ``bisect.insort`` on a plain list — a
+        full-diff-list return of every shifted sibling cost over 100x more,
+        almost entirely in marshaling that list to Python objects nobody
+        needed). An overwrite of an existing key is repositioned the same
+        way (erase + bisect-reinsert), not a full re-sort of every row — see
+        ``update_row()``.
+
+        The row is included so a ``connect()`` listener registered far from
+        this call site — which has no other handle on this row — doesn't
+        need a separate ``cursor[key]``/``.at(index)`` lookup to get at it.
 
         A row that an active filter rejects still gets written (it's still
         in the underlying data — see ``set_filter()``) but has no defined
-        position, so this returns ``None`` for it and fires no event at all.
-        When the row IS visible, the returned position is among the
-        currently-*visible* rows (matching what ``len()``/``.at()`` mean
-        under that same filter), not its raw position among every row under
-        the anchor.
+        position, so the index in the returned pair is ``None`` for it (the
+        row is still the second element). When the row IS visible, the
+        returned position is among the currently-*visible* rows (matching
+        what ``len()``/``.at()`` mean under that same filter), not its raw
+        position among every row under the anchor.
 
         Args:
             key: The row's key within the anchored table.
             row: The row dict to store.
 
         Returns:
-            The row's new position (``int``) among currently-visible rows,
-            or ``None`` if an active filter excludes it.
+            ``(index, row)`` — `index` is the row's new position (``int``)
+            among currently-visible rows, or ``None`` if an active filter
+            excludes it; `row` is the same dict passed in.
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``.
@@ -1321,11 +1327,11 @@ class ModDict:
 
             orders = mn.cursor("u1.orders")
             orders.set_sort("amount")
-            new_index = orders.insert("o9", {"amount": 15, "status": "new"})
+            new_index, row = orders.insert("o9", {"amount": 15, "status": "new"})
         """
         ...
 
-    def update_row(self, key: Any, changes: dict) -> tuple[tuple[int | None, int | None], list[str]]:
+    def update_row(self, key: Any, changes: dict) -> tuple[tuple[int | None, int | None], dict]:
         """
         Merge field changes into one existing row through a cursor.
 
@@ -1362,10 +1368,14 @@ class ModDict:
               change didn't move the row at all. Non-``None`` values are
               positions among currently-visible rows (same convention as
               ``insert()``), not raw positions among every row under the anchor.
-            - ``changed_fields`` — the subset of `changes`' keys whose value
-              actually differs from what was there before (not just "was
-              present in `changes`" — a value written as identical to what
-              was already there is excluded).
+            - ``changes`` — ``{field: new_value}`` for the subset of the
+              `changes` argument's keys whose value actually differs from
+              what was there before (not just "was present in `changes`" —
+              a value written as identical to what was already there is
+              excluded). Carries the actual new values, not just field
+              names, so a ``connect()`` listener registered far from this
+              call site doesn't need a separate row lookup to see what
+              changed.
 
         Fires this cursor's own ``"update"`` ``connect()`` event with this
         same 2-tuple as the payload.
@@ -1377,7 +1387,7 @@ class ModDict:
 
             orders = mn.cursor("u1.orders")
             (old_i, new_i), changed = orders.update_row("o1", {"amount": 99, "status": "shipped"})
-            # changed == ["amount"] if status was already "shipped"
+            # changed == {"amount": 99} if status was already "shipped"
         """
         ...
 
@@ -1417,7 +1427,7 @@ class ModDict:
         """
         ...
 
-    def insert_batch(self, rows: dict[Any, dict] | list[dict], key: Any = None) -> list[int | None]:
+    def insert_batch(self, rows: dict[Any, dict] | list[dict], key: Any = None) -> list[tuple[int | None, dict]]:
         """
         Insert (or overwrite) many rows through a cursor in one call.
 
@@ -1435,9 +1445,11 @@ class ModDict:
         a Python loop first. `key` is only meaningful (and required) when
         `rows` is a list; passing it alongside a dict raises ``TypeError``.
 
-        Returns only the NEW rows' own landing positions — same "don't
-        enumerate shifted siblings" reasoning as ``insert()``, extended to a
-        batch. Existing rows displaced by the batch aren't reported.
+        Returns only the NEW rows' own landing positions, each paired with
+        its own row (same reasoning as ``insert()`` — a ``connect()``
+        listener elsewhere has no other handle on these rows) — **not** a
+        list of every sibling row that structurally shifted as a side
+        effect. Existing rows displaced by the batch aren't reported.
 
         Args:
             rows: ``{key: row_dict, ...}``, or a list of row dicts (with `key` set).
@@ -1445,9 +1457,10 @@ class ModDict:
                   used, and required, when `rows` is a list.
 
         Returns:
-            ``list[int | None]``, one entry per row in `rows` (in the same
-            order `rows` iterates), each either that row's new position or
-            ``None`` if an active filter excludes it.
+            ``list[(index, row)]``, one entry per row in `rows` (in the same
+            order `rows` iterates) — `index` is that row's new position, or
+            ``None`` if an active filter excludes it; `row` is always the
+            row itself, filtered out or not.
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``.
@@ -1455,13 +1468,14 @@ class ModDict:
         Example::
 
             orders = mn.cursor("u1.orders")
-            positions = orders.insert_batch({
+            results = orders.insert_batch({
                 "o10": {"amount": 5,  "status": "new"},
                 "o11": {"amount": 40, "status": "new"},
             })
+            positions = [i for i, _row in results]
 
             # equivalent, from a plain list of rows:
-            positions = orders.insert_batch([
+            results = orders.insert_batch([
                 {"id": "o10", "amount": 5,  "status": "new"},
                 {"id": "o11", "amount": 40, "status": "new"},
             ], key="id")

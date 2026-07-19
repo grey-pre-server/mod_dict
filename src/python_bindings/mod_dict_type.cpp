@@ -1185,7 +1185,12 @@ static PyObject* ModDict_cursor_insert(ModDictObject* s, PyObject* args) {
     if (!PyDict_Check(row)) MOD_DICT_RAISE(PyExc_TypeError, "insert: row must be a dict");
     Py_ssize_t new_pos = s->internal->cursor_insert(key, row);
     if (PyErr_Occurred()) return nullptr;
-    PyObject* payload = py_index_or_none(new_pos);
+    PyObject* idx = py_index_or_none(new_pos);
+    if (!idx) return nullptr;
+    // Pairs the index with the row itself — a connect() listener may live
+    // far from the call site with no other way to reach this row's data.
+    PyObject* payload = PyTuple_Pack(2, idx, row);
+    Py_DECREF(idx);
     if (!payload) return nullptr;
     s->internal->dispatch_event("insert", payload);
     if (PyErr_Occurred()) { Py_DECREF(payload); return nullptr; }
@@ -1208,28 +1213,30 @@ static PyObject* ModDict_cursor_update_row(ModDictObject* s, PyObject* args) {
     auto pos_pair = s->internal->cursor_update_row(key, changes);
     if (PyErr_Occurred()) { Py_DECREF(old_snapshot); return nullptr; }
 
-    // changed_fields: keys in `changes` whose value actually differs from
-    // what was there before the write (not just "was present in `changes`").
-    PyObject* changed_fields = PyList_New(0);
-    if (!changed_fields) { Py_DECREF(old_snapshot); return nullptr; }
+    // changed: {field: new_value} for keys in `changes` whose value actually
+    // differs from what was there before the write (not just "was present
+    // in `changes`") — a connect() listener gets the actual new values, not
+    // just field names, so it doesn't need a separate lookup into the row.
+    PyObject* changed = PyDict_New();
+    if (!changed) { Py_DECREF(old_snapshot); return nullptr; }
     PyObject *ck, *cv; Py_ssize_t pos = 0;
     while (PyDict_Next(changes, &pos, &ck, &cv)) {
         PyObject* prev = PyDict_GetItem(old_snapshot, ck);  // borrowed, NULL = field didn't exist before
         int eq = prev ? PyObject_RichCompareBool(prev, cv, Py_EQ) : 0;
-        if (eq < 0) { Py_DECREF(old_snapshot); Py_DECREF(changed_fields); return nullptr; }
-        if (!eq && PyList_Append(changed_fields, ck) != 0) { Py_DECREF(old_snapshot); Py_DECREF(changed_fields); return nullptr; }
+        if (eq < 0) { Py_DECREF(old_snapshot); Py_DECREF(changed); return nullptr; }
+        if (!eq && PyDict_SetItem(changed, ck, cv) != 0) { Py_DECREF(old_snapshot); Py_DECREF(changed); return nullptr; }
     }
     Py_DECREF(old_snapshot);
 
     PyObject* old_i = py_index_or_none(pos_pair.first);
-    if (!old_i) { Py_DECREF(changed_fields); return nullptr; }
+    if (!old_i) { Py_DECREF(changed); return nullptr; }
     PyObject* new_i = py_index_or_none(pos_pair.second);
-    if (!new_i) { Py_DECREF(old_i); Py_DECREF(changed_fields); return nullptr; }
+    if (!new_i) { Py_DECREF(old_i); Py_DECREF(changed); return nullptr; }
     PyObject* index_part = PyTuple_Pack(2, old_i, new_i);
     Py_DECREF(old_i); Py_DECREF(new_i);
-    if (!index_part) { Py_DECREF(changed_fields); return nullptr; }
-    PyObject* result = PyTuple_Pack(2, index_part, changed_fields);
-    Py_DECREF(index_part); Py_DECREF(changed_fields);
+    if (!index_part) { Py_DECREF(changed); return nullptr; }
+    PyObject* result = PyTuple_Pack(2, index_part, changed);
+    Py_DECREF(index_part); Py_DECREF(changed);
     if (!result) return nullptr;
 
     s->internal->dispatch_event("update", result);
@@ -1295,10 +1302,25 @@ static PyObject* ModDict_cursor_insert_batch(ModDictObject* s, PyObject* args, P
     }
 
     auto positions = s->internal->cursor_insert_batch(rows_dict);
+    if (PyErr_Occurred()) { if (built_rows_dict) Py_DECREF(rows_dict); return nullptr; }
+
+    // Pairs each position with its own row (same reasoning as insert()) —
+    // zip against rows_dict in the same PyDict_Next order cursor_insert_batch()
+    // itself used to build `positions`.
+    PyObject* payload = PyList_New((Py_ssize_t)positions.size());
+    if (!payload) { if (built_rows_dict) Py_DECREF(rows_dict); return nullptr; }
+    PyObject *k, *v; Py_ssize_t dpos = 0; size_t i = 0;
+    while (PyDict_Next(rows_dict, &dpos, &k, &v)) {
+        PyObject* idx = py_index_or_none(positions[i]);
+        if (!idx) { Py_DECREF(payload); if (built_rows_dict) Py_DECREF(rows_dict); return nullptr; }
+        PyObject* pair = PyTuple_Pack(2, idx, v);
+        Py_DECREF(idx);
+        if (!pair) { Py_DECREF(payload); if (built_rows_dict) Py_DECREF(rows_dict); return nullptr; }
+        PyList_SET_ITEM(payload, (Py_ssize_t)i, pair);  // steals the reference
+        i++;
+    }
     if (built_rows_dict) Py_DECREF(rows_dict);
-    if (PyErr_Occurred()) return nullptr;
-    PyObject* payload = py_index_list(positions);
-    if (!payload) return nullptr;
+
     s->internal->dispatch_event("insert", payload);  // one event for the whole batch, same as a single insert()
     if (PyErr_Occurred()) { Py_DECREF(payload); return nullptr; }
     return payload;
@@ -2064,10 +2086,10 @@ static PyMethodDef ModDict_methods[]={
     {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(field_or_None)->list[(old_index|None,new_index)] — cursor only"},
     {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(predicate_or_None)->list[(old_index|None,new_index)] — cursor only"},
     {"connect",(PyCFunction)ModDict_connect,METH_VARARGS,"connect(event_type,callback)->None — cursor only; events: insert/update/delete/reorder"},
-    {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->int|None — new_index; cursor only"},
-    {"update_row",(PyCFunction)ModDict_cursor_update_row,METH_VARARGS,"update_row(key,changes)->((old_index|None,new_index|None),changed_fields) — cursor only"},
+    {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->(int|None,dict) — (new_index, row); cursor only"},
+    {"update_row",(PyCFunction)ModDict_cursor_update_row,METH_VARARGS,"update_row(key,changes)->((old_index|None,new_index|None),changes) — changes: {field:new_value} for fields that actually changed; cursor only"},
     {"delete",(PyCFunction)ModDict_cursor_delete,METH_VARARGS,"delete(key)->int|None — old_index; cursor only"},
-    {"insert_batch",(PyCFunction)ModDict_cursor_insert_batch,METH_VARARGS|METH_KEYWORDS,"insert_batch(rows,key=None)->list[int|None] — rows: dict[key,row], or list[dict] with key= naming the field to extract each row's key from; new_index per row, in rows' iteration order; cursor only; fires one 'insert' event for the whole batch"},
+    {"insert_batch",(PyCFunction)ModDict_cursor_insert_batch,METH_VARARGS|METH_KEYWORDS,"insert_batch(rows,key=None)->list[(int|None,dict)] — rows: dict[key,row], or list[dict] with key= naming the field to extract each row's key from; (new_index, row) per row, in rows' iteration order; cursor only; fires one 'insert' event for the whole batch"},
     {"from_dict",(PyCFunction)ModDict_from_dict,METH_O|METH_CLASS,"from_dict(d)->ModDict"},
     {"from_json",(PyCFunction)ModDict_from_json,METH_O|METH_CLASS,"from_json(s)->ModDict"},
     {"from_rows",(PyCFunction)ModDict_from_rows,METH_VARARGS|METH_KEYWORDS|METH_CLASS,"from_rows(rows,key)->ModDict"},

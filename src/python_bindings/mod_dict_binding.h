@@ -29,8 +29,4 @@ PyObject* index_diff_to_pylist(const ModDict::IndexDiff& diff);
 // effect (see mod_dict.h's comment on cursor_insert() for why).
 PyObject* py_index_or_none(Py_ssize_t idx);
 
-// list[int|None] — cursor_insert_batch()'s return: one entry per row in the
-// batch, in the same order PyDict_Next visits the input `rows` dict.
-PyObject* py_index_list(const std::vector<Py_ssize_t>& positions);
-
 #endif //MOD_DICT_MOD_DICT_TYPE_H

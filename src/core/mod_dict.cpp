@@ -1881,17 +1881,6 @@ PyObject* py_index_or_none(Py_ssize_t idx) {
     return PyLong_FromSsize_t(idx);
 }
 
-PyObject* py_index_list(const std::vector<Py_ssize_t>& positions) {
-    PyObject* result = PyList_New((Py_ssize_t)positions.size());
-    if (!result) return nullptr;
-    for (size_t i = 0; i < positions.size(); i++) {
-        PyObject* v = py_index_or_none(positions[i]);
-        if (!v) { Py_DECREF(result); return nullptr; }
-        PyList_SET_ITEM(result, i, v);  // steals the reference
-    }
-    return result;
-}
-
 void ModDict::dispatch_event(const char* event_type, PyObject* payload) {
     if (!live_connect_listeners) return;
     PyObject* key = PyUnicode_FromString(event_type);
