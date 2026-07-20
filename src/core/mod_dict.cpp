@@ -131,12 +131,6 @@ bool ModDict::insert(const ModValue& key, const ModValue& value) {
     uint64_t h = key.hash_val;
     OuterEntry* existing = outer.find(h);
 
-    // transparent alias redirect
-    if (const uint64_t* orig = alias_to_orig.find(h)) {
-        h = *orig;
-        existing = outer.find(h);
-    }
-
     bool is_new = !existing;
     PyObject* k = key.obj   ? key.obj   : Py_None;
     PyObject* v = value.obj ? value.obj : Py_None;
@@ -160,13 +154,6 @@ void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj, bool ski
     uint64_t oh = outer_key.hash_val;
     OuterEntry* existing = outer.find(oh);
 
-    // transparent alias redirect — preserve the original's key_py
-    bool via_alias = false;
-    if (const uint64_t* orig = alias_to_orig.find(oh)) {
-        oh = *orig; via_alias = true;
-        existing = outer.find(oh);
-    }
-
     // Apply registered converters recursively (no-op if registry empty — O(1) fast path)
     PyObject* row_v = converter_registry_convert_deep(dict_obj);
 
@@ -177,13 +164,10 @@ void ModDict::insert_row(const ModValue& outer_key, PyObject* dict_obj, bool ski
         Py_XDECREF(existing->val_py);
         existing->val_py = row_v;
         existing->is_row = true;
-        // key_py stays unchanged — keep the original key, not the alias key
-        if (!via_alias) {
-            Py_XDECREF(existing->key_py);
-            PyObject* k = outer_key.obj ? outer_key.obj : Py_None;
-            Py_INCREF(k);
-            existing->key_py = k;
-        }
+        Py_XDECREF(existing->key_py);
+        PyObject* k = outer_key.obj ? outer_key.obj : Py_None;
+        Py_INCREF(k);
+        existing->key_py = k;
     } else {
         PyObject* k = outer_key.obj ? outer_key.obj : Py_None;
         Py_INCREF(k);
@@ -264,8 +248,6 @@ PyObject* ModDict::get_subrow(uint64_t oh, const std::string& prefix) const {
 // ── Reindex one row (after in-place field write via RowProxy) ────────────────
 
 void ModDict::reindex_row_no_validate(uint64_t oh, ModDict* originator) {
-    // if accessed via alias, reindex the original key so the index stays correct
-    if (const uint64_t* orig = alias_to_orig.find(oh)) oh = *orig;
     for (auto& fi : indices.by_field.occupied()) {
         fi.value->remove_outer_key(oh);
         fi.value->on_insert_row(oh, this);
@@ -278,8 +260,6 @@ void ModDict::reindex_row_no_validate(uint64_t oh, ModDict* originator) {
 }
 
 void ModDict::reindex_row(uint64_t oh) {
-    // if accessed via alias, reindex the original key so the index stays correct
-    if (const uint64_t* orig = alias_to_orig.find(oh)) oh = *orig;
     reindex_row_no_validate(oh);
 
     // If this row is a declared link's SOURCE table, re-validate it now —
@@ -316,42 +296,9 @@ bool ModDict::remove(const ModValue& key) {
         if (it != order.end()) order.erase(it);
     };
 
-    // Is h an alias?
-    if (const uint64_t* orig_p = alias_to_orig.find(h)) {
-        uint64_t orig_h = *orig_p;
-        // remove alias entry
-        Py_XDECREF(e->key_py); e->key_py = nullptr;
-        outer.erase(h);
-        alias_to_orig.erase(h);
-        orig_to_alias.erase(orig_h);
-        // remove original (symmetric)
-        OuterEntry* orig = outer.find(orig_h);
-        if (orig) {
-            if (orig->is_row)
-                for (auto& fi : indices.by_field.occupied())
-                    fi.value->on_remove_row(orig_h, this);
-            Py_XDECREF(orig->key_py); Py_XDECREF(orig->val_py);
-            orig->key_py = nullptr; orig->val_py = nullptr;
-            outer.erase(orig_h);
-        }
-        erase_order(orig_h);
-        true_root()->notify_live_cursors(orig_h);
-        return true;
-    }
-
     if (e->is_row)
         for (auto& fi : indices.by_field.occupied())
             fi.value->on_remove_row(h, this);
-
-    // if original has an alias, cascade-delete it
-    if (const uint64_t* alias_p = orig_to_alias.find(h)) {
-        uint64_t alias_h = *alias_p;
-        OuterEntry* ae = outer.find(alias_h);
-        if (ae) { Py_XDECREF(ae->key_py); ae->key_py = nullptr; }
-        outer.erase(alias_h);
-        alias_to_orig.erase(alias_h);
-        orig_to_alias.erase(h);
-    }
 
     Py_XDECREF(e->key_py); Py_XDECREF(e->val_py);
     e->key_py = nullptr; e->val_py = nullptr;

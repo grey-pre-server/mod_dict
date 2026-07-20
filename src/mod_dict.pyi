@@ -1056,7 +1056,7 @@ class ModDict:
 
         A cursor is **not** a full second ``ModDict``: most root-only
         methods (``link``, ``follow``, ``select``, ``copy``, ``serialize``,
-        ``group_by``, ``keys``/``values``/``items``, ``alias``, ``pop``, and
+        ``group_by``, ``keys``/``values``/``items``, ``pop``, and
         more) raise ``NotImplementedError`` on a cursor by design — call
         them on the root instead. Field-indexing (``create_index``,
         ``filter``, ``sort_by``) is likewise not yet cursor-aware and also
@@ -1482,6 +1482,64 @@ class ModDict:
         """
         ...
 
+    def view_keys(self) -> list[Any]:
+        """
+        Keys in the cursor's current sort/filter VIEW.
+
+        Same order and same visible subset as ``__iter__``/``len()``/
+        ``.at()`` — honors an active ``set_sort()``/``set_group()``/
+        ``set_filter()``. Deliberately a different name from ``keys()``:
+        on a cursor, ``[key]``/``in``/``del`` stay raw (unaffected by
+        sort/filter, same as the underlying dict), so a name that reads
+        like plain dict access must not silently mean something else.
+        ``view_*`` says up front that sort/filter is being honored.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            orders.set_sort("amount")
+            orders.view_keys()  # keys, sorted by amount
+        """
+        ...
+
+    def view_values(self) -> list[dict]:
+        """
+        Rows in the cursor's current sort/filter VIEW — see ``view_keys()``.
+
+        Saves a second ``cursor[key]`` lookup per row when you only need
+        the row data, not the key, e.g. rendering a table in display order.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            orders.set_filter(lambda r: r["status"] == "shipped")
+            for row in orders.view_values():
+                render(row)
+        """
+        ...
+
+    def view_items(self) -> list[tuple[Any, dict]]:
+        """
+        ``(key, row)`` pairs in the cursor's current sort/filter VIEW — see
+        ``view_keys()``.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders = mn.cursor("u1.orders")
+            for key, row in orders.view_items():
+                ...
+        """
+        ...
+
     # ──────────────────────────────────────────────────
     # Serialization
     # ──────────────────────────────────────────────────
@@ -1511,20 +1569,6 @@ class ModDict:
         """
         ...
 
-    def aliases(self) -> dict[Any, Any]:
-        """
-        Return a mapping of all active aliases to their original keys.
-
-        Alias entries are hidden from ``keys()``, ``iter``, and ``len()`` —
-        this method is the only way to enumerate them.
-
-        Example::
-
-            mn.alias("alice", "al")
-            mn.aliases()  # {"al": "alice"}
-        """
-        ...
-
     def pop(self, key: Any, *default: Any) -> Any:
         """
         Remove *key* and return its value.
@@ -1544,7 +1588,7 @@ class ModDict:
         Return a deep copy of this ModDict.
 
         All row dicts are recursively copied — mutations on the copy do not
-        affect the original and vice versa. Aliases are not copied.
+        affect the original and vice versa.
 
         Example::
 
@@ -1572,26 +1616,6 @@ class ModDict:
             mn["b"] = {"x": 2}
             mn.at(0)   # {"x": 1}
             mn.at(-1)  # {"x": 2}
-        """
-        ...
-
-    def alias(self, key: Any, alias: Any) -> None:
-        """Create a transparent alias for an existing key.
-
-        Both the original key and the alias point to the same row dict.
-        Mutations via either key update the same object and keep indices in sync.
-        Deletion is symmetric: deleting either the alias or the original key
-        removes both from the ModDict.
-
-        Args:
-            key:   Existing key in the ModDict.
-            alias: New key to register as an alias. Must not already exist.
-
-        Example::
-
-            mn["alice"] = {"age": 30}
-            mn.alias("alice", "al")
-            mn["al"]["age"] = 31   # same row — mn["alice"]["age"] == 31
         """
         ...
 

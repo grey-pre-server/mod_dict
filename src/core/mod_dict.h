@@ -47,18 +47,14 @@ struct LinkDecl {
 // ──────────────────────────────────────────────────────────────────────────────
 struct OuterEntry {
     PyObject* key_py = nullptr;
-    PyObject* val_py = nullptr;  // nullptr = alias entry (val always >= Py_None for real entries)
+    PyObject* val_py = nullptr;
     bool      is_row = false;
 };
 
 class ModDict {
 public:
     FlatHashMap<uint64_t, OuterEntry> outer;
-    std::vector<uint64_t> order;  // outer hashes in insertion order, no aliases
-
-    // Alias side-tables (keep main outer entries small)
-    FlatHashMap<uint64_t, uint64_t> alias_to_orig;  // alias_hash → orig_hash
-    FlatHashMap<uint64_t, uint64_t> orig_to_alias;  // orig_hash  → alias_hash
+    std::vector<uint64_t> order;  // outer hashes in insertion order
 
     // `indices` is a reference bound in the ctor to own_indices (root) or
     // root->indices (cursor) — gives a cursor shared field-indices without
@@ -77,7 +73,7 @@ public:
     // root pointing at the true top-level ModDict (flattened — cursor-of-
     // cursor collapses to one hop) and a non-empty, literal anchor_path
     // descending from root's outer to the {pk: row} table it addresses. A
-    // cursor's own outer/order/alias/links are never populated — reads/
+    // cursor's own outer/order/links are never populated — reads/
     // writes go through root + anchor_path (resolve_anchor_path()).
     ModDict* root = nullptr;
     std::vector<std::string> anchor_path;

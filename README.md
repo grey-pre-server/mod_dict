@@ -48,13 +48,6 @@ mn.update(other, "?", "?")                       # key-to-key: also inserts new 
 mn.update(other, "user_id", "id")               # field-to-field
 mn.update(other, "*.geo.lat", "*.geo.lat")      # deep field only
 
-# Aliases — transparent second key for the same row
-mn.alias("alice", "al")
-mn["al"]["age"] = 32          # same row — mn["alice"]["age"] == 32
-mn["al"] = {"age": 33}        # replaces row via alias
-del mn["al"]                  # removes both alias and original
-print(mn.aliases())           # {"al": "alice"}
-
 # Build from a list of rows or any Mapping
 mn3 = md.ModDict.from_rows(users, key="id")      # {r["id"]: r for r in users}
 mn4 = md.ModDict(other_mn)                       # copy from ModDict
@@ -119,9 +112,9 @@ mn.pop(key, default)                     # return default if not found
 
 # Membership / size
 key in mn
-len(mn)                                  # aliases are not counted
+len(mn)
 
-# Iteration — aliases are hidden
+# Iteration
 for key in mn: ...
 mn.keys() / mn.values() / mn.items()
 
@@ -180,11 +173,7 @@ orders.update_row(key, changes)  # -> ((old_index, new_index), changes) — chan
 orders.insert_batch({key: row, ...})  # -> list[(int|None, dict)] = [(new_index, row), ...], one write pass, one connect() event
 orders.insert_batch([row, ...], key="id")  # same, key= extracts each row's outer key instead of a pre-keyed dict
 orders.connect("insert" | "update" | "delete" | "reorder", callback)
-
-# Aliases
-mn.alias(key, alias)                     # create alias (1 per key)
-mn.aliases()                             # → {alias: original_key, ...}
-del mn[alias]                            # removes alias and original
+orders.view_keys() / orders.view_values() / orders.view_items()  # current sort/filter VIEW — [key] / in / del stay raw, unaffected by it
 
 # Update from another collection
 mn.update(other)                                      # bulk insert
@@ -467,9 +456,12 @@ the cursor's own state was immediately before the call.
 **What a cursor does not (yet) support:** field-indexing (`create_index`,
 `filter`, `sort_by` — call these on the root `ModDict` instead) and most
 whole-collection operations (`link`, `follow`, `select`, `copy`, `serialize`,
-`group_by`, `keys`/`values`/`items`, `alias`, `pop`, ...) — these raise
+`group_by`, `keys`/`values`/`items`, `pop`, ...) — these raise
 `NotImplementedError` on a cursor by design; a cursor is a live positional
-view for GUI backing, not a second full `ModDict`.
+view for GUI backing, not a second full `ModDict`. `keys`/`values`/`items`
+specifically stay blocked rather than silently switching meaning on a
+cursor — see `view_keys`/`view_values`/`view_items` below for their
+sort/filter-aware counterparts.
 
 `set_filter()` is fully composed into reads: with an active filter,
 `len()`/iteration/`.at(i)` only see the passing rows, densely indexed
@@ -479,6 +471,30 @@ position(s) agree with that same numbering. Key-based access (`cursor[key]`,
 `in`, `del cursor[key]`) is unaffected by the filter either way — a
 filtered-out row is still fully present in the underlying data, just absent
 from the positional/iteration view.
+
+```python
+orders.set_sort("amount")
+orders.set_filter(lambda r: r["status"] == "shipped")
+
+for key in orders:                 # keys only, same visible/sorted order as .at(i)
+    ...
+orders.view_values()               # → [row, ...] — rows in that same order, no per-row cursor[key] lookup
+orders.view_items()                # → [(key, row), ...] — when you need both
+
+# [key]/in/del are raw and don't know about the filter/sort at all — a
+# filtered-out row is still reachable directly:
+orders["o2"]["amount"]             # works even if "o2" fails the active filter
+"o2" in orders                     # True regardless of the filter
+"o2" in orders.view_keys()         # False — filtered out of the view
+```
+
+`view_keys()`/`view_values()`/`view_items()` are named apart from
+`keys()`/`values()`/`items()` on purpose: `[key]`/`in`/`del` on a cursor stay
+raw (same as on the underlying dict, filter/sort blind), so a method whose
+name reads like plain dict access must never silently mean something else
+depending on whether a filter happens to be active. `view_*` says up front
+that the current sort/filter is being honored — same rows, same order, that
+`__iter__`/`len()`/`.at()` already agree on.
 
 Full method docs (return shapes, event payloads, edge cases) are in
 `src/mod_dict.pyi`.

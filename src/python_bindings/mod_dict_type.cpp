@@ -325,17 +325,6 @@ static PyObject* ModDict_getitem(ModDictObject* s,PyObject* key) {
     uint64_t oh=content_hash_pyobj(key);
     auto* e=s->internal->outer.find(oh);
     if(!e){PyErr_SetObject(PyExc_KeyError,key);return nullptr;}
-    // alias: resolve to original entry
-    if(!e->val_py){
-        const uint64_t* orig_p = s->internal->alias_to_orig.find(oh);
-        if(!orig_p){PyErr_SetObject(PyExc_KeyError,key);return nullptr;}
-        OuterEntry* orig=s->internal->outer.find(*orig_p);
-        if(!orig||!orig->val_py){PyErr_SetObject(PyExc_KeyError,key);return nullptr;}
-        if(orig->is_row && !s->internal->indices.by_field.empty())
-            return RowProxy_create(s, orig->val_py, *orig_p);
-        Py_INCREF(orig->val_py); return orig->val_py;
-    }
-    if(!e->val_py) Py_RETURN_NONE;
     if(e->is_row && !s->internal->indices.by_field.empty())
         return RowProxy_create(s, e->val_py, oh);
     Py_INCREF(e->val_py); return e->val_py;
@@ -396,7 +385,6 @@ static PyObject* ModDict_get(ModDictObject* s,PyObject* args){
     uint64_t oh=content_hash_pyobj(key);
     auto* e=s->internal->outer.find(oh);
     if(!e){Py_INCREF(def);return def;}
-    if(!e->val_py) Py_RETURN_NONE;
     if(e->is_row && !s->internal->indices.by_field.empty())
         return RowProxy_create(s, e->val_py, oh);
     Py_INCREF(e->val_py); return e->val_py;
@@ -980,7 +968,7 @@ static PyObject* ModDictIter_next(ModDictIterObject* s){
     const auto& outer = s->owner->internal->outer;
     while(s->position < outer.capacity()){
         const auto* slot = outer.begin() + s->position++;
-        if(slot->occupied && slot->value.val_py){  // val_py==nullptr means alias entry
+        if(slot->occupied){
             PyObject* k = slot->value.key_py ? slot->value.key_py : Py_None;
             Py_INCREF(k); return k;
         }
@@ -991,6 +979,9 @@ PyTypeObject ModDictIter_Type={
     .tp_name="mod_dict.ModDictIter",.tp_basicsize=sizeof(ModDictIterObject),
     .tp_dealloc=(destructor)ModDictIter_dealloc,.tp_flags=Py_TPFLAGS_DEFAULT,
     .tp_iter=PyObject_SelfIter,.tp_iternext=(iternextfunc)ModDictIter_next};
+// Forward-declared: shared by ModDict_iter and view_keys()/view_values()/
+// view_items() below, defined after ModDict_iter for readability.
+static PyObject* cursor_view_key_list(const ModDictObject* s, PyObject* d);
 static PyObject* ModDict_iter(ModDictObject* s){
     ModDictIterObject* it=PyObject_New(ModDictIterObject,&ModDictIter_Type);
     if(!it){PyErr_NoMemory();return nullptr;}
@@ -998,22 +989,78 @@ static PyObject* ModDict_iter(ModDictObject* s){
     if (s->internal->root) {
         PyObject* d = s->internal->resolve_cursor_dict();
         if (!d) { Py_DECREF(it); return nullptr; }
-        if (s->internal->filter_predicate) {
-            auto& order = s->internal->visible_index;
-            it->snapshot = PyList_New((Py_ssize_t)order.size());
-            if (!it->snapshot) { Py_DECREF(it); return nullptr; }
-            for (size_t i = 0; i < order.size(); i++) { Py_INCREF(order[i]); PyList_SET_ITEM(it->snapshot, (Py_ssize_t)i, order[i]); }
-        } else if (s->internal->has_derived_order) {
-            auto& order = s->internal->sort_index;
-            it->snapshot = PyList_New((Py_ssize_t)order.size());
-            if (!it->snapshot) { Py_DECREF(it); return nullptr; }
-            for (size_t i = 0; i < order.size(); i++) { Py_INCREF(order[i]); PyList_SET_ITEM(it->snapshot, (Py_ssize_t)i, order[i]); }
-        } else {
-            it->snapshot = PyDict_Keys(d);
-            if (!it->snapshot) { Py_DECREF(it); return nullptr; }
-        }
+        it->snapshot = cursor_view_key_list(s, d);
+        if (!it->snapshot) { Py_DECREF(it); return nullptr; }
     }
     return (PyObject*)it;
+}
+
+// view_keys()/view_values()/view_items() — the cursor's current sort/filter
+// VIEW, deliberately named apart from keys()/values()/items() (which stay
+// raw/unaffected by sort/filter on a cursor, same as [key]/in/del) so the
+// name itself says whether sort/filter is being honored — no method that
+// looks dict-like silently means something else depending on context.
+static PyObject* cursor_view_key_list(const ModDictObject* s, PyObject* d) {
+    if (s->internal->filter_predicate) {
+        auto& order = s->internal->visible_index;
+        PyObject* list = PyList_New((Py_ssize_t)order.size());
+        if (!list) return nullptr;
+        for (size_t i = 0; i < order.size(); i++) { Py_INCREF(order[i]); PyList_SET_ITEM(list, (Py_ssize_t)i, order[i]); }
+        return list;
+    }
+    if (s->internal->has_derived_order) {
+        auto& order = s->internal->sort_index;
+        PyObject* list = PyList_New((Py_ssize_t)order.size());
+        if (!list) return nullptr;
+        for (size_t i = 0; i < order.size(); i++) { Py_INCREF(order[i]); PyList_SET_ITEM(list, (Py_ssize_t)i, order[i]); }
+        return list;
+    }
+    return PyDict_Keys(d);
+}
+static PyObject* ModDict_view_keys(ModDictObject* s, PyObject*) {
+    MOD_DICT_REQUIRE_CURSOR(s, "view_keys()");
+    PyObject* d = s->internal->resolve_cursor_dict();
+    if (!d) return nullptr;
+    return cursor_view_key_list(s, d);
+}
+static PyObject* ModDict_view_values(ModDictObject* s, PyObject*) {
+    MOD_DICT_REQUIRE_CURSOR(s, "view_values()");
+    PyObject* d = s->internal->resolve_cursor_dict();
+    if (!d) return nullptr;
+    PyObject* keys = cursor_view_key_list(s, d);
+    if (!keys) return nullptr;
+    Py_ssize_t n = PyList_GET_SIZE(keys);
+    PyObject* list = PyList_New(n);
+    if (!list) { Py_DECREF(keys); return nullptr; }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject* k = PyList_GET_ITEM(keys, i);
+        PyObject* row = PyDict_GetItem(d, k);  // borrowed
+        Py_INCREF(row ? row : Py_None);
+        PyList_SET_ITEM(list, i, row ? row : Py_None);
+    }
+    Py_DECREF(keys);
+    return list;
+}
+static PyObject* ModDict_view_items(ModDictObject* s, PyObject*) {
+    MOD_DICT_REQUIRE_CURSOR(s, "view_items()");
+    PyObject* d = s->internal->resolve_cursor_dict();
+    if (!d) return nullptr;
+    PyObject* keys = cursor_view_key_list(s, d);
+    if (!keys) return nullptr;
+    Py_ssize_t n = PyList_GET_SIZE(keys);
+    PyObject* list = PyList_New(n);
+    if (!list) { Py_DECREF(keys); return nullptr; }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject* k = PyList_GET_ITEM(keys, i); Py_INCREF(k);
+        PyObject* row = PyDict_GetItem(d, k);  // borrowed
+        Py_INCREF(row ? row : Py_None);
+        PyObject* pair = PyTuple_Pack(2, k, row ? row : Py_None);
+        Py_DECREF(k); Py_DECREF(row ? row : Py_None);
+        if (!pair) { Py_DECREF(keys); Py_DECREF(list); return nullptr; }
+        PyList_SET_ITEM(list, i, pair);
+    }
+    Py_DECREF(keys);
+    return list;
 }
 
 static PyObject* ModDict_keys(ModDictObject* s,PyObject*){
@@ -1053,19 +1100,6 @@ static PyObject* ModDict_items(ModDictObject* s,PyObject*){
     }
     return list;
 }
-static PyObject* ModDict_aliases(ModDictObject* s,PyObject*){
-    MOD_DICT_NO_CURSOR(s, "aliases()");
-    PyObject* d=PyDict_New(); if(!d) return nullptr;
-    for(auto& e:s->internal->alias_to_orig.occupied()){
-        OuterEntry* ae  = s->internal->outer.find(e.key);
-        OuterEntry* orig= s->internal->outer.find(e.value);
-        PyObject* ak = ae   && ae->key_py   ? ae->key_py   : Py_None;
-        PyObject* ok = orig && orig->key_py ? orig->key_py : Py_None;
-        PyDict_SetItem(d, ak, ok);
-    }
-    return d;
-}
-
 static PyObject* ModDict_to_dict(ModDictObject* s,PyObject*){
     MOD_DICT_NO_CURSOR(s, "to_dict()");
     return s->internal->to_python_dict();
@@ -1957,43 +1991,6 @@ static PyObject* ModDict_reindex(ModDictObject* s, PyObject* args) {
     Py_RETURN_NONE;
 }
 
-static PyObject* ModDict_alias(ModDictObject* s, PyObject* args) {
-    MOD_DICT_NO_CURSOR(s, "alias()");
-    PyObject* key_obj; PyObject* alias_obj;
-    if (!PyArg_ParseTuple(args, "OO", &key_obj, &alias_obj)) return nullptr;
-
-    uint64_t orig_hash = content_hash_pyobj(key_obj);
-    OuterEntry* orig = s->internal->outer.find(orig_hash);
-    if (!orig) {
-        PyErr_SetObject(PyExc_KeyError, key_obj);
-        return nullptr;
-    }
-
-    uint64_t alias_hash = content_hash_pyobj(alias_obj);
-    OuterEntry* existing = s->internal->outer.find(alias_hash);
-    if (existing) {
-        PyErr_SetString(PyExc_KeyError, "alias key already exists");
-        return nullptr;
-    }
-
-    if (s->internal->orig_to_alias.find(orig_hash)) {
-        PyErr_SetString(PyExc_KeyError, "key already has an alias");
-        return nullptr;
-    }
-
-    Py_INCREF(alias_obj);
-    // alias entry: val_py = nullptr (discriminant), resolved via side tables at access time
-    OuterEntry ae;
-    ae.key_py = alias_obj;
-    ae.val_py = nullptr;
-    ae.is_row = false;
-    s->internal->outer.insert(alias_hash, ae);
-    s->internal->alias_to_orig.insert(alias_hash, orig_hash);
-    s->internal->orig_to_alias.insert(orig_hash, alias_hash);
-
-    Py_RETURN_NONE;
-}
-
 static PyObject* ModDict_at(ModDictObject* s, PyObject* args){
     Py_ssize_t i; if(!PyArg_ParseTuple(args,"n",&i)) return nullptr;
     if (s->internal->root) {
@@ -2090,6 +2087,9 @@ static PyMethodDef ModDict_methods[]={
     {"update_row",(PyCFunction)ModDict_cursor_update_row,METH_VARARGS,"update_row(key,changes)->((old_index|None,new_index|None),changes) — changes: {field:new_value} for fields that actually changed; cursor only"},
     {"delete",(PyCFunction)ModDict_cursor_delete,METH_VARARGS,"delete(key)->int|None — old_index; cursor only"},
     {"insert_batch",(PyCFunction)ModDict_cursor_insert_batch,METH_VARARGS|METH_KEYWORDS,"insert_batch(rows,key=None)->list[(int|None,dict)] — rows: dict[key,row], or list[dict] with key= naming the field to extract each row's key from; (new_index, row) per row, in rows' iteration order; cursor only; fires one 'insert' event for the whole batch"},
+    {"view_keys",(PyCFunction)ModDict_view_keys,METH_NOARGS,"view_keys()->list — keys in the cursor's current sort/filter view, same order as __iter__/.at(); cursor only"},
+    {"view_values",(PyCFunction)ModDict_view_values,METH_NOARGS,"view_values()->list[dict] — rows in the cursor's current sort/filter view; cursor only"},
+    {"view_items",(PyCFunction)ModDict_view_items,METH_NOARGS,"view_items()->list[(key,dict)] — (key,row) pairs in the cursor's current sort/filter view; cursor only"},
     {"from_dict",(PyCFunction)ModDict_from_dict,METH_O|METH_CLASS,"from_dict(d)->ModDict"},
     {"from_json",(PyCFunction)ModDict_from_json,METH_O|METH_CLASS,"from_json(s)->ModDict"},
     {"from_rows",(PyCFunction)ModDict_from_rows,METH_VARARGS|METH_KEYWORDS|METH_CLASS,"from_rows(rows,key)->ModDict"},
@@ -2099,8 +2099,6 @@ static PyMethodDef ModDict_methods[]={
     {"serialize",(PyCFunction)ModDict_serialize,METH_NOARGS,"serialize()->bytes"},
     {"deserialize",(PyCFunction)ModDict_deserialize,METH_VARARGS,"deserialize(data)->ModDict — mutates self in place, returns self for chaining"},
     {"reindex",(PyCFunction)ModDict_reindex,METH_VARARGS,"reindex(key)->None — rebuild field indices for one row after deep nested write"},
-    {"alias",(PyCFunction)ModDict_alias,METH_VARARGS,"alias(key,alias)->None — create transparent alias for an existing key"},
-    {"aliases",(PyCFunction)ModDict_aliases,METH_NOARGS,"aliases()->dict — {alias_key: original_key} mapping"},
     {"copy",(PyCFunction)ModDict_copy,METH_NOARGS,"copy()->ModDict — deep copy"},
     {"pop",(PyCFunction)ModDict_pop,METH_VARARGS,"pop(key[,default])->value — remove and return value"},
     {"at",(PyCFunction)ModDict_at,METH_VARARGS,"at(i)->value — get row by insertion-order index (negative = from end)"},

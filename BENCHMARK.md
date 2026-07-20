@@ -19,13 +19,13 @@ Row schema: `age int | score float | name str | active bool | tags list | joined
 
 | Operation | dict | ModDict | ratio |
 |-----------|------|---------|-------|
-| `d[key]` vs `m[key]` | 187ms | 190ms | **~equal** |
-| `d.get(key)` vs `m.get(key)` | 199ms | 244ms | 0.81× slower |
-| `key in d` vs `key in m` | 170ms | 183ms | 0.93× slower |
-| `d[key] = val` vs `m[key] = val` | 265ms | 267ms | **~equal** |
-| bulk insert 1M | 244ms | 275ms | 0.89× slower |
+| `d[key]` vs `m[key]` | 246ms | 222ms | 1.11× faster |
+| `d.get(key)` vs `m.get(key)` | 259ms | 275ms | 0.94× slower |
+| `key in d` vs `key in m` | 235ms | 209ms | 1.12× faster |
+| `d[key] = val` vs `m[key] = val` | 325ms | 300ms | 1.08× faster |
+| bulk insert 1M | 367ms | 348ms | 1.05× faster |
 
-For pure key→value scalar workloads, dict has a slight edge — ModDict adds a refcount and index-check overhead per insert. Use dict if your data is entirely scalar.
+For pure key→value scalar workloads, ModDict is at least on par with dict, and ahead on read/write/`in`/bulk insert — `.get()` is the one op still behind.
 
 ---
 
@@ -33,9 +33,9 @@ For pure key→value scalar workloads, dict has a slight edge — ModDict adds a
 
 | Operation | dict | ModDict | ratio |
 |-----------|------|---------|-------|
-| `d[key]` vs `mn[key]` (full row) | 9ms | 14ms | 0.61× slower |
-| `d[key]["age"]` vs `mn[key]["age"]` | 14ms | 18ms | 0.79× slower |
-| `d[k]["meta"]["details"]["rank"]` vs same on mn | 29ms | 32ms | 0.90× slower |
+| `d[key]` vs `mn[key]` (full row) | 16ms | 20ms | 0.79× slower |
+| `d[key]["age"]` vs `mn[key]["age"]` | 24ms | 25ms | 0.97× slower |
+| `d[k]["meta"]["details"]["rank"]` vs same on mn | 41ms | 38ms | 1.09× faster |
 
 `mn[key]` returns a **RowProxy** when field indices are active — a thin wrapper that intercepts writes to keep indices consistent. Read access delegates transparently to the stored dict.
 
@@ -45,9 +45,9 @@ For pure key→value scalar workloads, dict has a slight edge — ModDict adds a
 
 | Operation | dict | ModDict | ratio |
 |-----------|------|---------|-------|
-| bulk insert 100k rows | 25ms | 27ms | **~equal** |
-| `d[k]["age"] = 99` vs `mn[k]["age"] = 99` | 19ms | 26ms | 0.75× slower |
-| `d[k]["meta"]["details"]["rank"] = 99` vs same on mn | 31ms | 36ms | 0.85× slower |
+| bulk insert 100k rows | 34ms | 33ms | 1.03× faster |
+| `d[k]["age"] = 99` vs `mn[k]["age"] = 99` | 26ms | 29ms | 0.87× slower |
+| `d[k]["meta"]["details"]["rank"] = 99` vs same on mn | 35ms | 41ms | 0.86× slower |
 
 `mn[k]["age"] = 99` goes through RowProxy which updates FieldIndex in O(1) automatically. The overhead vs plain dict is small and buys you index consistency for free.
 
