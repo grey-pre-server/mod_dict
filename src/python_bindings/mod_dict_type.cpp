@@ -1801,14 +1801,10 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
     }
     return combined;
 }
-static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
-    MOD_DICT_NO_CURSOR(s, "select()");
-    PyObject* fo; const char* ret="rows";
-    static const char* kwl[]={"fields","returns",nullptr};
-    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|s",const_cast<char**>(kwl),&fo,&ret)) return nullptr;
-    if(strcmp(ret,"rows")!=0 && strcmp(ret,"rows_here")!=0 && strcmp(ret,"values")!=0)
-        MOD_DICT_RAISE(PyExc_ValueError,"select: returns must be 'rows', 'rows_here', or 'values'");
-
+// Shared by select() (single path) and select_mass() (list/dict of paths) —
+// `fo` is always a list-of-paths or {label:path} dict by the time this runs;
+// select() wraps its single string into a 1-element list before calling in.
+static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret){
     // fields is either a list of paths (result keyed by each path's default
     // last-segment label — collision raises) or a {label: path} dict (result
     // keyed by the given labels, collision-free by construction).
@@ -1930,6 +1926,66 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
         w->internal=result; w->owns_internal=true; w->parent_ref=(PyObject*)s; Py_INCREF(s); w->weakreflist=nullptr;
         result->py_wrapper=w; return (PyObject*)w;
     }
+}
+static PyObject* ModDict_select_mass(ModDictObject* s,PyObject* args,PyObject* kw){
+    MOD_DICT_NO_CURSOR(s, "select_mass()");
+    PyObject* fo; const char* ret="rows";
+    static const char* kwl[]={"fields","returns",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|s",const_cast<char**>(kwl),&fo,&ret)) return nullptr;
+    if(strcmp(ret,"rows")!=0 && strcmp(ret,"rows_here")!=0 && strcmp(ret,"values")!=0)
+        MOD_DICT_RAISE(PyExc_ValueError,"select_mass: returns must be 'rows', 'rows_here', or 'values'");
+    return select_core(s,fo,ret);
+}
+static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
+    MOD_DICT_NO_CURSOR(s, "select()");
+    PyObject* path_obj; const char* ret="rows";
+    static const char* kwl[]={"path","returns",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|s",const_cast<char**>(kwl),&path_obj,&ret)) return nullptr;
+    if(!PyUnicode_Check(path_obj))
+        MOD_DICT_RAISE(PyExc_TypeError,"select: path must be a single string — use select_mass() for multiple fields");
+    if(strcmp(ret,"rows")!=0 && strcmp(ret,"rows_here")!=0 && strcmp(ret,"values")!=0)
+        MOD_DICT_RAISE(PyExc_ValueError,"select: returns must be 'rows', 'rows_here', or 'values'");
+
+    std::string path(PyUnicode_AsUTF8(path_obj));
+    bool wc=(path.find("->")!=std::string::npos);
+    if(!wc && (path.find('.')!=std::string::npos || path=="?")){
+        for(auto& seg:split_dot_chunk(path)) if(seg=="__pass_key__"){ wc=true; break; }
+    }
+    bool table_landing = wc && strcmp(ret,"rows")==0;
+
+    PyObject* fo=PyList_New(1);
+    if(!fo) return nullptr;
+    Py_INCREF(path_obj);
+    PyList_SET_ITEM(fo,0,path_obj);
+    PyObject* result=select_core(s,fo,ret);
+    Py_DECREF(fo);
+    if(!result) return nullptr;
+
+    if(strcmp(ret,"values")==0){
+        // result is [col] — a single inner list for the one requested field
+        PyObject* inner=PyList_GET_ITEM(result,0);
+        Py_INCREF(inner);
+        Py_DECREF(result);
+        return inner;
+    }
+    if(table_landing) return result;  // nested table-landing shape — nothing to flatten
+
+    // rows/rows_here: result is a ModDict wrapper of {pk: {label: value}}
+    // single-field rows — flatten to {pk: value}; the field name is already
+    // redundant with the call (select("age")), no need to repeat it per row.
+    ModDictObject* rw=(ModDictObject*)result;
+    PyObject* flat=PyDict_New();
+    if(!flat){ Py_DECREF(result); return nullptr; }
+    std::string label=default_select_label(path);
+    for(uint64_t oh : rw->internal->order){
+        const OuterEntry* e=rw->internal->outer.find(oh);
+        if(!e || !e->val_py) continue;
+        PyObject* v=PyDict_GetItemString(e->val_py,label.c_str());
+        PyObject* k=e->key_py?e->key_py:Py_None;
+        if(PyDict_SetItem(flat,k,v)!=0){ Py_DECREF(flat); Py_DECREF(result); return nullptr; }
+    }
+    Py_DECREF(result);
+    return flat;
 }
 static PyObject* ModDict_sort_by(ModDictObject* s,PyObject* args,PyObject* kw){
     MOD_DICT_NO_CURSOR(s, "sort_by()");  // cursor's own set_sort()/sort_index supersede this
@@ -2076,7 +2132,8 @@ static PyMethodDef ModDict_methods[]={
     {"follow",(PyCFunction)(PyCFunctionWithKeywords)ModDict_follow,METH_VARARGS|METH_KEYWORDS,
      "follow(source_path,keys=None,values=None)->ModDict — traverse a declared link"},
     {"sort_by",(PyCFunction)ModDict_sort_by,METH_VARARGS|METH_KEYWORDS,"sort_by(field,reverse=False,returns='rows',inplace=False)->list|None"},
-    {"select",(PyCFunction)ModDict_select,METH_VARARGS|METH_KEYWORDS,"select(fields,returns='rows')->ModDict|list"},
+    {"select",(PyCFunction)ModDict_select,METH_VARARGS|METH_KEYWORDS,"select(path,returns='rows')->dict|list|ModDict — single field; flattened {pk:value}/[value,...], no per-row field-name wrapper"},
+    {"select_mass",(PyCFunction)ModDict_select_mass,METH_VARARGS|METH_KEYWORDS,"select_mass(fields,returns='rows')->ModDict|list[list] — multiple fields, one column/sub-dict per field"},
     {"group_by",(PyCFunction)ModDict_group_by,METH_VARARGS,"group_by(field)->dict"},
     {"cursor",(PyCFunction)ModDict_cursor,METH_VARARGS,"cursor(path)->ModDict — live handle anchored at an existing nested table; path must already exist"},
     {"set_sort",(PyCFunction)(PyCFunctionWithKeywords)ModDict_set_sort,METH_VARARGS|METH_KEYWORDS,"set_sort(field,reverse=False)->list[(old_index|None,new_index)] — cursor only"},

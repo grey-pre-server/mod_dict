@@ -901,12 +901,55 @@ class ModDict:
 
     def select(
         self,
+        path: str,
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+    ) -> dict[Any, Any] | list[Any] | ModDict:
+        """
+        Project rows to a single field — the single-field counterpart to
+        ``select_mass()``.
+
+        Unlike ``select_mass()``, the result is never wrapped a level deeper
+        by field name: there's only one field, so repeating its name per row
+        would be pure redundancy (it's already in the call, ``select("age")``).
+
+        Args:
+            path:    A single dot-notation field path (same path grammar as
+                     ``select_mass()`` — plain, wildcard, or ``->``-hop).
+            returns: ``"rows"`` *(default)* — ``{key: value}`` for a plain
+                     path. For a table-anchored wildcard path, same
+                     table-landing behavior as ``select_mass()`` (returns a
+                     ``ModDict`` of the target table's own rows — nothing to
+                     flatten there, so it passes through unchanged).
+                     ``"rows_here"`` — ``{key: value}``, forcing
+                     value-extraction even for a wildcard/``->`` path.
+                     ``"values"`` — flat ``list[Any]``, one entry per row, in
+                     row order. (``select_mass()``'s ``"values"`` gives
+                     ``list[list[Any]]``, one column per field — with one
+                     field, ``select()`` skips straight to that one column.)
+
+        Example::
+
+            ages = mn.select("age")                     # {"alice": 30, "bob": 25, ...}
+            ages = mn.select("age", returns="values")    # [30, 25, ...]
+
+            mn.link("orders.?.customer_id", "customers.?")
+            mn.select("orders.?.customer_id->name", returns="rows_here")
+            # -> {order_pk: "Alice", ...} — not {order_pk: {"name": "Alice"}}
+        """
+        ...
+
+    def select_mass(
+        self,
         fields: list[str] | dict[str, str],
         returns: Literal["rows", "rows_here", "values"] = "rows",
     ) -> ModDict | list[Any]:
         """
         Project rows to the specified fields — or (default, for wildcard/
         ``->`` fields) land on and keep the tables those fields refer to.
+
+        The multi-field counterpart to ``select()`` — use ``select()``
+        instead for a single field, which skips the per-row field-name
+        wrapper / the outer one-column-list wrapper this method always adds.
 
         Supports dot-notation paths. Ignore the rest of this docstring's
         label discussion when ``returns="rows"`` and any field is wildcard-
@@ -919,11 +962,11 @@ class ModDict:
         ``ValueError``; pass ``fields`` as a ``{label: path}`` dict instead
         to give explicit, collision-free result keys::
 
-            mn.select(["age", "meta.level"])                       # -> {"age": ..., "level": ...}
-            mn.select({"user_age": "age", "lvl": "meta.level"})     # explicit labels
-            mn.select(["orders.?.customer_id->name", "orders.?.vendor_id->name"], returns="rows_here")
+            mn.select_mass(["age", "meta.level"])                       # -> {"age": ..., "level": ...}
+            mn.select_mass({"user_age": "age", "lvl": "meta.level"})     # explicit labels
+            mn.select_mass(["orders.?.customer_id->name", "orders.?.vendor_id->name"], returns="rows_here")
             # ValueError: both default to "name" -- use the dict form:
-            mn.select({"customer": "orders.?.customer_id->name", "vendor": "orders.?.vendor_id->name"}, returns="rows_here")
+            mn.select_mass({"customer": "orders.?.customer_id->name", "vendor": "orders.?.vendor_id->name"}, returns="rows_here")
 
         Args:
             fields:  List of paths, or a ``{label: path}`` dict (explicit
@@ -945,7 +988,7 @@ class ModDict:
         **Wildcard fields and link hops ("->"), with ``returns="rows_here"``/``"values"``**
 
         A field can also be a table-anchored wildcard path, ``"table.?..."``
-        — the first time ``select()`` looks past a single flat collection —
+        — the first time ``select_mass()`` looks past a single flat collection —
         optionally with a ``->`` hop across a declared ``link()``, same
         syntax and semantics as ``filter()``'s. Every field must be
         wildcard-shaped if any is (mixing plain and wildcard fields in one
@@ -954,7 +997,7 @@ class ModDict:
         row's own key — not nested under the table name::
 
             mn.link("orders.?.customer_id", "customers.?")
-            mn.select(["orders.?.customer_id->name", "orders.?.customer_id->email"], returns="rows_here")
+            mn.select_mass(["orders.?.customer_id->name", "orders.?.customer_id->email"], returns="rows_here")
             # -> {order_pk: {"name": ..., "email": ...}, ...}
 
         **Table-landing (default for wildcard/``->`` fields)**
@@ -975,16 +1018,16 @@ class ModDict:
         just unused for this mode's output::
 
             mn.link("workgroup.?.group_id", "user_group.?")
-            mn.select(["workgroup.?.group_id->name"])
+            mn.select_mass(["workgroup.?.group_id->name"])
             # -> {"user_group": {100: {...}, 200: {...}}} -- "name" is unused here
-            mn.select(["workgroup.?.group_id->name", "workgroup.?.status"])
+            mn.select_mass(["workgroup.?.group_id->name", "workgroup.?.status"])
             # -> {"user_group": {...}, "workgroup": {...}} -- mixed: one hops, one doesn't
-            mn.select(["workgroup.?.group_id->name"], returns="rows_here")
+            mn.select_mass(["workgroup.?.group_id->name"], returns="rows_here")
             # -> {1: {"name": "Engineering"}, 2: {"name": "Sales"}, ...} -- force value-extraction instead
 
         The result is chainable — since each landed table is shaped like an
         anchored ``filter()`` result, a further ``.filter("user_group.?.field->...")``
-        or another ``.select(...)`` relays through to the root and
+        or another ``.select_mass(...)`` relays through to the root and
         intersects, same as any other derived result this library produces.
         Reverse traversal (landing back on a table that *references* the
         current one, rather than one the current table's FK points to) is
@@ -993,11 +1036,11 @@ class ModDict:
 
         Examples::
 
-            slim = mn.select(["name", "age", "meta.level"])
+            slim = mn.select_mass(["name", "age", "meta.level"])
             # -> {pk: {"name": ..., "age": ..., "level": ...}, ...}
-            cols = mn.select(["name", "score"], returns="values")
+            cols = mn.select_mass(["name", "score"], returns="values")
             # → [["alice", "bob", ...], [9.5, 6.0, ...]]
-            names, scores = mn.select(["name", "score"], returns="values")
+            names, scores = mn.select_mass(["name", "score"], returns="values")
         """
         ...
 
@@ -1055,9 +1098,9 @@ class ModDict:
         it (a "reorder" event — see ``connect()``).
 
         A cursor is **not** a full second ``ModDict``: most root-only
-        methods (``link``, ``follow``, ``select``, ``copy``, ``serialize``,
-        ``group_by``, ``keys``/``values``/``items``, ``pop``, and
-        more) raise ``NotImplementedError`` on a cursor by design — call
+        methods (``link``, ``follow``, ``select``/``select_mass``, ``copy``,
+        ``serialize``, ``group_by``, ``keys``/``values``/``items``, ``pop``,
+        and more) raise ``NotImplementedError`` on a cursor by design — call
         them on the root instead. Field-indexing (``create_index``,
         ``filter``, ``sort_by``) is likewise not yet cursor-aware and also
         raises; a cursor's own ``set_sort``/``set_filter``/``set_group``

@@ -21,13 +21,14 @@ rows   = mn.sort_by("age")                       # → [row, row, ...]
 keys   = mn.sort_by("age", returns="parent_keys")# → [key, key, ...]
 ages   = mn.sort_by("age", returns="values")     # → [18, 25, 30, ...]
 groups = mn.group_by("age")                      # → {value: ModDict, ...}
-slim   = mn.select(["age", "score"])             # → new ModDict
-cols   = mn.select(["age", "score"], returns="values")  # → [[age,...], [score,...]] (columnar)
+slim   = mn.select_mass(["age", "score"])             # → new ModDict
+cols   = mn.select_mass(["age", "score"], returns="values")  # → [[age,...], [score,...]] (columnar)
+ages   = mn.select("age", returns="values")      # → [age, age, ...] — single field, already flat
 
 # Dot-notation paths in sort / group / select
 mn.sort_by("meta.details.rank")
 mn.group_by("meta.level")
-mn.select(["meta.details.rank", "score"])
+mn.select_mass(["meta.details.rank", "score"])
 
 # Links between rows — declare, traverse, JOIN-in-WHERE, ON DELETE
 mn.link("orders.?.customer_id", "customers.?")
@@ -151,11 +152,14 @@ mn.sort_by("age", inplace=True)                         # reorders mn in-place, 
 mn.sort_by("meta.details.rank", returns="values")       # → [val, ...]
 
 
-mn.select(["age", "name"])                              # → new ModDict, keyed by each path's last segment
-mn.select({"user_age": "age"})                          # explicit labels — also disambiguates collisions
-mn.select(["age", "meta.level"], returns="values")      # → [[age,...], [meta.level,...]] (columnar)
-mn.select(["orders.?.customer_id->name"])                # wildcard/"->" default: lands on target table → {"customers": {100: {...}, ...}}
-mn.select(["orders.?.customer_id->name"], returns="rows_here")  # flat extraction instead → {order_pk: {"name": ...}}
+mn.select("age")                                        # → {pk: age, ...} — single field, flat, no per-row wrapper
+mn.select("age", returns="values")                      # → [age, ...]
+
+mn.select_mass(["age", "name"])                         # → new ModDict, keyed by each path's last segment
+mn.select_mass({"user_age": "age"})                     # explicit labels — also disambiguates collisions
+mn.select_mass(["age", "meta.level"], returns="values") # → [[age,...], [meta.level,...]] (columnar)
+mn.select_mass(["orders.?.customer_id->name"])                # wildcard/"->" default: lands on target table → {"customers": {100: {...}, ...}}
+mn.select_mass(["orders.?.customer_id->name"], returns="rows_here")  # flat extraction instead → {order_pk: {"name": ...}}
 
 mn.group_by("active")                                   # → {value: ModDict, ...}
 mn.group_by("meta.level")
@@ -281,7 +285,7 @@ del mn["employees"][1]                                      # cascades to every 
 # JOIN in WHERE — "->" resolves a declared link mid-path, chainable across hops
 mn.filter("orders.?.customer_id->name").eq("Alice")         # orders whose customer's name is "Alice"
 mn.filter("orders.?.customer_id->company_id->name").eq("Acme")  # 2 hops
-mn.select(["orders.?.customer_id->name"])                   # default returns="rows": lands on target table → {"customers": {100: {...}, ...}}
+mn.select("orders.?.customer_id->name")                     # default returns="rows": lands on target table → {"customers": {100: {...}, ...}}
 ```
 
 `on_delete` is `"restrict"` *(default — refuses if still referenced)*,
@@ -306,22 +310,24 @@ back to a scan of the anchor table. `returns="rows_here"`/`"values"` report
 data from the **anchor** row (e.g. `orders`, not wherever the hop lands),
 one entry per matching anchor row, not deduplicated by target.
 
-`select()`'s default (`returns="rows"`) works differently from `filter()`'s:
-a wildcard/`->` field doesn't extract a value — it **lands on and keeps the
-table** the field resolves to (multi-hop chains `follow()` under the hood; a
-field with no `->` hop just keeps its own anchor table, unchanged). Fields
-resolve independently and merge into one ModDict — mixing hop and non-hop
-fields, or fields anchored on different tables, is fine:
+`select()`/`select_mass()`'s default (`returns="rows"`) works differently
+from `filter()`'s: a wildcard/`->` field doesn't extract a value — it **lands
+on and keeps the table** the field resolves to (multi-hop chains `follow()`
+under the hood; a field with no `->` hop just keeps its own anchor table,
+unchanged). With `select_mass()`, fields resolve independently and merge
+into one ModDict — mixing hop and non-hop fields, or fields anchored on
+different tables, is fine:
 
 ```python
-mn.select(["workgroup.?.group_id->name"])                              # → {"user_group": {100: {...}, ...}}
-mn.select(["workgroup.?.group_id->name", "workgroup.?.status"])        # → {"user_group": {...}, "workgroup": {...}}
-mn.select(["workgroup.?.group_id->name"], returns="rows_here")         # → {1: {"name": "Engineering"}, ...} (old flat extraction)
+mn.select_mass(["workgroup.?.group_id->name"])                              # → {"user_group": {100: {...}, ...}}
+mn.select_mass(["workgroup.?.group_id->name", "workgroup.?.status"])        # → {"user_group": {...}, "workgroup": {...}}
+mn.select_mass(["workgroup.?.group_id->name"], returns="rows_here")         # → {1: {"name": "Engineering"}, ...} (old flat extraction)
 ```
 
-Both a `->`-containing `filter()` and a table-landing `select()` result are
-themselves chainable — a further `.filter("user_group.?.field->...")` or
-`.select(...)` call relays the whole call up to the root ModDict and
+Both a `->`-containing `filter()` and a table-landing `select()`/
+`select_mass()` result are themselves chainable — a further
+`.filter("user_group.?.field->...")` or `.select()`/`.select_mass()` call
+relays the whole call up to the root ModDict and
 intersects with the already-narrowed rows, so multi-step chains across
 tables work as expected. Reverse traversal (landing on a table that
 *references* the current one, rather than one it points to) isn't
@@ -353,12 +359,12 @@ mn.link("users_groups.?.group_id", "groups.?")
 # every group alice belongs to: filter narrows users_groups by a JOIN
 # through user_id, select projects each match's group name through group_id
 mn.filter("users_groups.?.user_id->name").eq("alice") \
-  .select(["users_groups.?.group_id->name"], returns="values")[0]
+  .select("users_groups.?.group_id->name", returns="values")
 # → ["engineering", "support"]
 
 # a different field, through the SAME hop the filter already used
 mn.filter("users_groups.?.user_id->name").eq("alice") \
-  .select(["users_groups.?.user_id->note"], returns="values")[0]
+  .select("users_groups.?.user_id->note", returns="values")
 # → ["vip", "vip"] — one per matching membership row, not deduplicated by user
 ```
 
@@ -455,8 +461,8 @@ the cursor's own state was immediately before the call.
 
 **What a cursor does not (yet) support:** field-indexing (`create_index`,
 `filter`, `sort_by` — call these on the root `ModDict` instead) and most
-whole-collection operations (`link`, `follow`, `select`, `copy`, `serialize`,
-`group_by`, `keys`/`values`/`items`, `pop`, ...) — these raise
+whole-collection operations (`link`, `follow`, `select`/`select_mass`, `copy`,
+`serialize`, `group_by`, `keys`/`values`/`items`, `pop`, ...) — these raise
 `NotImplementedError` on a cursor by design; a cursor is a live positional
 view for GUI backing, not a second full `ModDict`. `keys`/`values`/`items`
 specifically stay blocked rather than silently switching meaning on a

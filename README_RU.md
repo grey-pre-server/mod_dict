@@ -21,13 +21,14 @@ rows   = mn.sort_by("age")                        # → [row, row, ...]
 keys   = mn.sort_by("age", returns="parent_keys") # → [key, key, ...]
 ages   = mn.sort_by("age", returns="values")      # → [18, 25, 30, ...]
 groups = mn.group_by("age")                       # → {value: ModDict, ...}
-slim   = mn.select(["age", "score"])              # → новый ModDict
-cols   = mn.select(["age", "score"], returns="values")  # → [[age,...], [score,...]] (по колонкам)
+slim   = mn.select_mass(["age", "score"])         # → новый ModDict
+cols   = mn.select_mass(["age", "score"], returns="values")  # → [[age,...], [score,...]] (по колонкам)
+ages   = mn.select("age", returns="values")       # → [age, age, ...] — одно поле, уже плоский список
 
 # Пути через точку в sort / group / select
 mn.sort_by("meta.details.rank")
 mn.group_by("meta.level")
-mn.select(["meta.details.rank", "score"])
+mn.select_mass(["meta.details.rank", "score"])
 
 # Связи между строками — объявление, обход, JOIN в WHERE, ON DELETE
 mn.link("orders.?.customer_id", "customers.?")
@@ -150,11 +151,14 @@ mn.sort_by("age", returns="parent_keys")                # → [key, ...]
 mn.sort_by("age", inplace=True)                         # переупорядочивает mn на месте, возвращает None
 mn.sort_by("meta.details.rank", returns="values")       # → [val, ...]
 
-mn.select(["age", "name"])                              # → новый ModDict, ключ — последний сегмент пути
-mn.select({"user_age": "age"})                          # явные метки — также разрешают коллизии
-mn.select(["age", "meta.level"], returns="values")      # → [[age,...], [meta.level,...]] (по колонкам)
-mn.select(["orders.?.customer_id->name"])                # wildcard/"->" по умолчанию: приземляется на целевую таблицу → {"customers": {100: {...}, ...}}
-mn.select(["orders.?.customer_id->name"], returns="rows_here")  # вместо этого плоское извлечение → {order_pk: {"name": ...}}
+mn.select("age")                                        # → {pk: age, ...} — одно поле, без обёртки на строку
+mn.select("age", returns="values")                      # → [age, ...]
+
+mn.select_mass(["age", "name"])                         # → новый ModDict, ключ — последний сегмент пути
+mn.select_mass({"user_age": "age"})                     # явные метки — также разрешают коллизии
+mn.select_mass(["age", "meta.level"], returns="values") # → [[age,...], [meta.level,...]] (по колонкам)
+mn.select_mass(["orders.?.customer_id->name"])                # wildcard/"->" по умолчанию: приземляется на целевую таблицу → {"customers": {100: {...}, ...}}
+mn.select_mass(["orders.?.customer_id->name"], returns="rows_here")  # вместо этого плоское извлечение → {order_pk: {"name": ...}}
 
 mn.group_by("active")                                   # → {value: ModDict, ...}
 mn.group_by("meta.level")
@@ -283,7 +287,7 @@ del mn["employees"][1]                                       # каскадно 
 # JOIN в WHERE — "->" резолвит объявленную связь прямо в пути, можно цепочкой через несколько хопов
 mn.filter("orders.?.customer_id->name").eq("Alice")          # заказы, чей клиент по имени "Alice"
 mn.filter("orders.?.customer_id->company_id->name").eq("Acme")  # 2 хопа
-mn.select(["orders.?.customer_id->name"])                    # returns="rows" по умолчанию: приземляется на целевую таблицу → {"customers": {100: {...}, ...}}
+mn.select("orders.?.customer_id->name")                      # returns="rows" по умолчанию: приземляется на целевую таблицу → {"customers": {100: {...}, ...}}
 ```
 
 `on_delete` — `"restrict"` *(по умолчанию — отказ, если есть ссылки)*,
@@ -310,22 +314,23 @@ skip_managers = mn.follow("employees.?.manager_id", keys=managers.keys()) # 2 х
 хоп), по одной записи на каждую совпавшую якорную строку, без дедупликации
 по цели.
 
-`select()`'s дефолт (`returns="rows"`) работает иначе, чем у `filter()`:
-wildcard/`->`-поле не извлекает значение — оно **приземляется на и оставляет
-таблицу**, на которую указывает поле (мультихоп цепочки используют `follow()`
-под капотом; поле без `->`-хопа просто оставляет свою якорную таблицу как
-есть). Поля резолвятся независимо и мёржатся в один ModDict — смешивать
-хоп- и не-хоп-поля, или поля с разными якорными таблицами, можно:
+`select()`/`select_mass()`'s дефолт (`returns="rows"`) работает иначе, чем у
+`filter()`: wildcard/`->`-поле не извлекает значение — оно **приземляется на
+и оставляет таблицу**, на которую указывает поле (мультихоп цепочки
+используют `follow()` под капотом; поле без `->`-хопа просто оставляет свою
+якорную таблицу как есть). У `select_mass()` поля резолвятся независимо и
+мёржатся в один ModDict — смешивать хоп- и не-хоп-поля, или поля с разными
+якорными таблицами, можно:
 
 ```python
-mn.select(["workgroup.?.group_id->name"])                              # → {"user_group": {100: {...}, ...}}
-mn.select(["workgroup.?.group_id->name", "workgroup.?.status"])        # → {"user_group": {...}, "workgroup": {...}}
-mn.select(["workgroup.?.group_id->name"], returns="rows_here")         # → {1: {"name": "Engineering"}, ...} (старое плоское извлечение)
+mn.select_mass(["workgroup.?.group_id->name"])                              # → {"user_group": {100: {...}, ...}}
+mn.select_mass(["workgroup.?.group_id->name", "workgroup.?.status"])        # → {"user_group": {...}, "workgroup": {...}}
+mn.select_mass(["workgroup.?.group_id->name"], returns="rows_here")         # → {1: {"name": "Engineering"}, ...} (старое плоское извлечение)
 ```
 
-И `filter()` с `->`, и `select()` с приземлением на таблицу — сами по себе
-chainable: дальнейший вызов `.filter("user_group.?.field->...")` или
-`.select(...)` ретранслируется до корневого ModDict и пересекается с уже
+И `filter()` с `->`, и `select()`/`select_mass()` с приземлением на таблицу —
+сами по себе chainable: дальнейший вызов `.filter("user_group.?.field->...")`
+или `.select()`/`.select_mass()` ретранслируется до корневого ModDict и пересекается с уже
 сузившимися строками, так что многошаговые цепочки между таблицами работают
 как ожидается. Обратный обход (приземление на таблицу, которая *ссылается*
 на текущую, а не на ту, куда она указывает) не поддерживается — только то
@@ -357,12 +362,12 @@ mn.link("users_groups.?.group_id", "groups.?")
 # все группы alice: filter сужает users_groups через JOIN по user_id,
 # select проецирует имя группы каждого совпадения через group_id
 mn.filter("users_groups.?.user_id->name").eq("alice") \
-  .select(["users_groups.?.group_id->name"], returns="values")[0]
+  .select("users_groups.?.group_id->name", returns="values")
 # → ["engineering", "support"]
 
 # другое поле через ТОТ ЖЕ хоп, что уже использовал filter
 mn.filter("users_groups.?.user_id->name").eq("alice") \
-  .select(["users_groups.?.user_id->note"], returns="values")[0]
+  .select("users_groups.?.user_id->note", returns="values")
 # → ["vip", "vip"] — по одному на совпавшую строку членства, без дедупликации по пользователю
 ```
 
@@ -458,8 +463,8 @@ grid_view.insert("o9", {"amount": 5, "status": "new"})
 
 **Что курсор пока не поддерживает:** индексацию полей (`create_index`,
 `filter`, `sort_by` — их нужно звать на корневом `ModDict`) и большинство
-операций над коллекцией целиком (`link`, `follow`, `select`, `copy`,
-`serialize`, `group_by`, `keys`/`values`/`items`, `pop`, ...) — эти
+операций над коллекцией целиком (`link`, `follow`, `select`/`select_mass`,
+`copy`, `serialize`, `group_by`, `keys`/`values`/`items`, `pop`, ...) — эти
 методы намеренно кидают `NotImplementedError` на курсоре: курсор — это
 живой позиционный вид для GUI, а не второй полноценный `ModDict`.
 `keys`/`values`/`items` заблокированы намеренно, а не временно — они не
