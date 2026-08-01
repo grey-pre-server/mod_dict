@@ -382,6 +382,20 @@ static PyObject* ModDict_repr(ModDictObject* s){
 static PyObject* ModDict_get(ModDictObject* s,PyObject* args){
     PyObject* key; PyObject* def=Py_None;
     if(!PyArg_ParseTuple(args,"O|O",&key,&def)) return nullptr;
+    if (s->internal->root) {
+        // Cursor mode: the non-raising sibling of cursor[key], resolved
+        // through the anchored dict — without this it would read the always-
+        // empty `outer` below and silently answer `default` for keys that DO
+        // exist. Raw like [key]/in/del: an active filter doesn't hide a row
+        // from it (see view_keys()/view_values()/view_items() for the
+        // sort/filter-aware reads).
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        PyObject* v = PyDict_GetItem(d, key);  // borrowed
+        if (!v) { Py_INCREF(def); return def; }
+        Py_INCREF(v);
+        return v;
+    }
     uint64_t oh=content_hash_pyobj(key);
     auto* e=s->internal->outer.find(oh);
     if(!e){Py_INCREF(def);return def;}
@@ -1063,8 +1077,17 @@ static PyObject* ModDict_view_items(ModDictObject* s, PyObject*) {
     return list;
 }
 
+// keys()/values()/items()/to_dict() on a cursor are RAW — the anchored
+// dict's own contents in its own natural order, blind to set_sort()/
+// set_filter(), exactly like [key]/in/del/get. view_keys()/view_values()/
+// view_items() are the sort/filter-aware counterparts; the split is by name
+// so neither meaning is ever silently implied.
 static PyObject* ModDict_keys(ModDictObject* s,PyObject*){
-    MOD_DICT_NO_CURSOR(s, "keys()");
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        return PyDict_Keys(d);
+    }
     const auto& ord=s->internal->order;
     PyObject* list=PyList_New((Py_ssize_t)ord.size()); if(!list) return nullptr;
     Py_ssize_t idx=0;
@@ -1075,7 +1098,11 @@ static PyObject* ModDict_keys(ModDictObject* s,PyObject*){
     return list;
 }
 static PyObject* ModDict_values(ModDictObject* s,PyObject*){
-    MOD_DICT_NO_CURSOR(s, "values()");
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        return PyDict_Values(d);
+    }
     const auto& ord=s->internal->order;
     PyObject* list=PyList_New((Py_ssize_t)ord.size()); if(!list) return nullptr;
     Py_ssize_t idx=0;
@@ -1087,7 +1114,11 @@ static PyObject* ModDict_values(ModDictObject* s,PyObject*){
     return list;
 }
 static PyObject* ModDict_items(ModDictObject* s,PyObject*){
-    MOD_DICT_NO_CURSOR(s, "items()");
+    if (s->internal->root) {
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        return PyDict_Items(d);
+    }
     const auto& ord=s->internal->order;
     PyObject* list=PyList_New((Py_ssize_t)ord.size()); if(!list) return nullptr;
     Py_ssize_t idx=0;
@@ -1101,13 +1132,33 @@ static PyObject* ModDict_items(ModDictObject* s,PyObject*){
     return list;
 }
 static PyObject* ModDict_to_dict(ModDictObject* s,PyObject*){
-    MOD_DICT_NO_CURSOR(s, "to_dict()");
+    if (s->internal->root) {
+        // Shallow, like the root's own to_dict(): a fresh plain dict, rows
+        // still the same objects (this library never deep-copies rows on a
+        // read — see copy() for the deep variant).
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        return PyDict_Copy(d);
+    }
     return s->internal->to_python_dict();
 }
 
 /* Serialization */
 static PyObject* ModDict_serialize(ModDictObject* s,PyObject*){
-    MOD_DICT_NO_CURSOR(s, "serialize()");
+    if (s->internal->root) {
+        // Serializes the anchored TABLE (a cursor has no storage of its own),
+        // so the bytes deserialize back into a plain {key: row} ModDict — the
+        // cursor's own sort/filter/connect state is presentation, not data,
+        // and is deliberately not part of the payload.
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        ModDict* tmp = pyobj_to_moddict_temp(d);
+        if (!tmp) return nullptr;
+        std::vector<uint8_t> data = tmp->serialize();
+        delete tmp;
+        if (PyErr_Occurred()) return nullptr;
+        return PyBytes_FromStringAndSize((const char*)data.data(),(Py_ssize_t)data.size());
+    }
     std::vector<uint8_t> data=s->internal->serialize(); if(PyErr_Occurred()) return nullptr;
     return PyBytes_FromStringAndSize((const char*)data.data(),(Py_ssize_t)data.size());
 }
@@ -1988,7 +2039,11 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     return flat;
 }
 static PyObject* ModDict_sort_by(ModDictObject* s,PyObject* args,PyObject* kw){
-    MOD_DICT_NO_CURSOR(s, "sort_by()");  // cursor's own set_sort()/sort_index supersede this
+    // Not a conflict with the cursor's own set_sort(): sort_by() is a one-shot
+    // query returning data, set_sort() is persistent presentation state — they
+    // don't overlap. Blocked only because this reads outer/order directly,
+    // which a cursor never populates. Same for filter()/group_by().
+    MOD_DICT_NO_CURSOR(s, "sort_by()");
     const char* field=nullptr; int rev=0; const char* ret="rows"; int inplace=0;
     static const char* kwl[]={"field","reverse","returns","inplace",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"s|psp",const_cast<char**>(kwl),&field,&rev,&ret,&inplace)) return nullptr;
@@ -2092,16 +2147,46 @@ static PyObject* ModDict_at(ModDictObject* s, PyObject* args){
 }
 
 static PyObject* ModDict_copy(ModDictObject* s, PyObject*){
-    MOD_DICT_NO_CURSOR(s, "copy()");
+    if (s->internal->root) {
+        // A cursor owns no storage, so "copy" means the anchored table:
+        // materialize it as a real ModDict (rows still by reference), then
+        // reuse deep_copy() verbatim — the result is a standalone root
+        // ModDict, not another cursor.
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        ModDict* tmp = pyobj_to_moddict_temp(d);
+        if (!tmp) return nullptr;
+        ModDict* c = tmp->deep_copy();
+        delete tmp;
+        if (!c) { PyErr_NoMemory(); return nullptr; }
+        return ModDict_wrap_owned(c);
+    }
     ModDict* c = s->internal->deep_copy();
     if(!c){ PyErr_NoMemory(); return nullptr; }
     return ModDict_wrap_owned(c);
 }
 
 static PyObject* ModDict_pop(ModDictObject* s, PyObject* args){
-    MOD_DICT_NO_CURSOR(s, "pop()");
     PyObject* key; PyObject* def = nullptr;
     if(!PyArg_ParseTuple(args,"O|O",&key,&def)) return nullptr;
+    if (s->internal->root) {
+        // Raw, the returning sibling of `del cursor[key]` — same write path
+        // (anchored dict + root field-index resync), so it fires "reorder"
+        // on live cursors like `del` does, NOT the "delete" event that the
+        // cursor-native delete(key) fires.
+        PyObject* d = s->internal->resolve_cursor_dict();
+        if (!d) return nullptr;
+        PyObject* val = PyDict_GetItem(d, key);  // borrowed
+        if (!val) {
+            if (def) { Py_INCREF(def); return def; }
+            PyErr_SetObject(PyExc_KeyError, key);
+            return nullptr;
+        }
+        Py_INCREF(val);  // keep it alive past the delete below
+        if (PyDict_DelItem(d, key) != 0) { Py_DECREF(val); return nullptr; }
+        s->internal->true_root()->reindex_row_no_validate(s->internal->cached_top_hash);
+        return val;
+    }
     PyObject* val = ModDict_getitem(s, key);
     if(!val){
         if(!PyErr_ExceptionMatches(PyExc_KeyError)) return nullptr;

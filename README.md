@@ -452,31 +452,41 @@ grid_view.insert("o9", {"amount": 5, "status": "new"})
 # it, only that its own view changed
 ```
 
-**What a cursor supports:** the plain dict protocol (`cursor[key]`,
-`cursor[key] = row`, `del cursor[key]`, `in`, `len()`, iteration, `.at(i)`),
+**What a cursor supports:** the full raw dict protocol (`cursor[key]`,
+`cursor[key] = row`, `del cursor[key]`, `in`, `get`, `pop`, `keys`/`values`/
+`items`, `to_dict`, `copy`, `serialize`, `len()`, iteration, `.at(i)`),
 `set_sort()`/`set_filter()`/`set_group()`, `connect()`, and the point-mutation
 methods `insert()`/`update_row()`/`delete()`/`insert_batch()` shown above —
 each returns exactly the diff a GUI model needs, computed against whatever
 the cursor's own state was immediately before the call.
 
-**What a cursor does not (yet) support:** field-indexing (`create_index`,
-`filter`, `sort_by` — call these on the root `ModDict` instead) and most
-whole-collection operations (`link`, `follow`, `select`/`select_mass`, `copy`,
-`serialize`, `group_by`, `keys`/`values`/`items`, `pop`, ...) — these raise
-`NotImplementedError` on a cursor by design; a cursor is a live positional
-view for GUI backing, not a second full `ModDict`. `keys`/`values`/`items`
-specifically stay blocked rather than silently switching meaning on a
-cursor — see `view_keys`/`view_values`/`view_items` below for their
-sort/filter-aware counterparts.
+Everything in that raw group reads/writes the anchored table directly and is
+**blind to `set_sort()`/`set_filter()`** — `keys()` returns every row in the
+table's own order even under an active filter. `view_keys()`/`view_values()`/
+`view_items()` are the sort/filter-aware counterparts (see below); the split
+is by name so neither meaning is ever silently implied. `copy()`/`serialize()`
+act on the anchored *table*, producing a standalone root `ModDict`/its bytes —
+a cursor's sort/filter/connect state is presentation, not data, and is never
+part of that payload.
+
+**What a cursor does not support:** genuinely root-only operations —
+`link`/`follow` (links are declared on root-level table paths; a cursor lives
+*inside* one table), `reindex` (ambiguous: key relative to the root or the
+anchor?), `deserialize` (replaces content wholesale). Separately,
+`filter`/`sort_by`/`group_by`/`select`/`select_mass`/`update` and
+`create_index`/`drop_index`/`has_index` raise because they read the root's own
+storage, which a cursor never populates — call them on the root. Those are
+one-shot queries that return data, and don't overlap with a cursor's
+`set_sort`/`set_filter`/`set_group`, which are persistent presentation state.
 
 `set_filter()` is fully composed into reads: with an active filter,
 `len()`/iteration/`.at(i)` only see the passing rows, densely indexed
 (`.at(0)` is the first *visible* row, not necessarily the first row under
 the anchor) — and `insert()`/`update_row()`/`delete()`'s returned
-position(s) agree with that same numbering. Key-based access (`cursor[key]`,
-`in`, `del cursor[key]`) is unaffected by the filter either way — a
-filtered-out row is still fully present in the underlying data, just absent
-from the positional/iteration view.
+position(s) agree with that same numbering. The whole raw group (`cursor[key]`,
+`in`, `del`, `get`, `pop`, `keys`/`values`/`items`, `to_dict`, ...) is
+unaffected by the filter either way — a filtered-out row is still fully
+present in the underlying data, just absent from the positional/iteration view.
 
 ```python
 orders.set_sort("amount")
@@ -487,16 +497,18 @@ for key in orders:                 # keys only, same visible/sorted order as .at
 orders.view_values()               # → [row, ...] — rows in that same order, no per-row cursor[key] lookup
 orders.view_items()                # → [(key, row), ...] — when you need both
 
-# [key]/in/del are raw and don't know about the filter/sort at all — a
-# filtered-out row is still reachable directly:
+# the raw group doesn't know about the filter/sort at all — a filtered-out
+# row is still reachable directly:
 orders["o2"]["amount"]             # works even if "o2" fails the active filter
+orders.get("o2")                   # same, non-raising
 "o2" in orders                     # True regardless of the filter
+orders.keys()                      # EVERY key, in the table's own order
 "o2" in orders.view_keys()         # False — filtered out of the view
 ```
 
 `view_keys()`/`view_values()`/`view_items()` are named apart from
-`keys()`/`values()`/`items()` on purpose: `[key]`/`in`/`del` on a cursor stay
-raw (same as on the underlying dict, filter/sort blind), so a method whose
+`keys()`/`values()`/`items()` on purpose: the raw group on a cursor means
+exactly what it means on a plain dict (filter/sort blind), so a method whose
 name reads like plain dict access must never silently mean something else
 depending on whether a filter happens to be active. `view_*` says up front
 that the current sort/filter is being honored — same rows, same order, that

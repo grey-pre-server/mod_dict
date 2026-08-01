@@ -454,6 +454,11 @@ class ModDict:
         """
         Return the record for *key*, or *default* if not found.
 
+        Works on a cursor too — the non-raising sibling of ``cursor[key]``,
+        and raw the same way ``[key]``/``in``/``del`` are: an active
+        ``set_filter()`` does not hide a row from it (use ``view_keys()``/
+        ``view_values()``/``view_items()`` for the sort/filter-aware reads).
+
         Example::
 
             row = mn.get("alice", {})
@@ -461,15 +466,28 @@ class ModDict:
         ...
 
     def keys(self) -> list[Any]:
-        """Return list of all keys."""
+        """Return list of all keys.
+
+        On a cursor: the anchored table's own keys, in its own natural
+        order — raw, blind to ``set_sort()``/``set_filter()``. Use
+        ``view_keys()`` for the sort/filter-aware version.
+        """
         ...
 
     def values(self) -> list[Any]:
-        """Return list of all values (rows reconstructed as dicts)."""
+        """Return list of all values (rows reconstructed as dicts).
+
+        On a cursor: raw, like ``keys()`` — see ``view_values()`` for the
+        sort/filter-aware version.
+        """
         ...
 
     def items(self) -> list[tuple[Any, Any]]:
-        """Return list of ``(key, value)`` pairs."""
+        """Return list of ``(key, value)`` pairs.
+
+        On a cursor: raw, like ``keys()`` — see ``view_items()`` for the
+        sort/filter-aware version.
+        """
         ...
 
     # ──────────────────────────────────────────────────
@@ -1097,14 +1115,28 @@ class ModDict:
         underlying data and notify each other when any one of them mutates
         it (a "reorder" event — see ``connect()``).
 
-        A cursor is **not** a full second ``ModDict``: most root-only
-        methods (``link``, ``follow``, ``select``/``select_mass``, ``copy``,
-        ``serialize``, ``group_by``, ``keys``/``values``/``items``, ``pop``,
-        and more) raise ``NotImplementedError`` on a cursor by design — call
-        them on the root instead. Field-indexing (``create_index``,
-        ``filter``, ``sort_by``) is likewise not yet cursor-aware and also
-        raises; a cursor's own ``set_sort``/``set_filter``/``set_group``
-        below are unrelated to that machinery.
+        The full raw dict protocol works on a cursor, reading/writing the
+        anchored table directly and staying blind to ``set_sort()``/
+        ``set_filter()``: ``[key]``, ``in``, ``del``, ``get``, ``pop``,
+        ``keys``/``values``/``items``, ``to_dict``, ``copy``, ``serialize``.
+        (``view_keys``/``view_values``/``view_items`` are the sort/filter-aware
+        counterparts — the split is by name so neither is silently implied.)
+        ``copy()``/``serialize()`` act on the anchored TABLE, producing a
+        standalone root ``ModDict``/its bytes — a cursor's sort/filter/connect
+        state is presentation, not data, and is never part of that payload.
+
+        A cursor is **not** a full second ``ModDict``, though. Genuinely
+        root-only operations raise ``NotImplementedError``: ``link``/
+        ``follow`` (links are declared on root-level table paths, a cursor
+        lives inside one table), ``reindex`` (ambiguous — key relative to the
+        root or to the anchor?), and ``deserialize`` (replaces content
+        wholesale). Separately, ``filter``/``sort_by``/``group_by``/
+        ``select``/``select_mass``/``update`` and ``create_index``/
+        ``drop_index``/``has_index`` raise only because they read the
+        root's own storage, which a cursor never populates — call them on the
+        root. These are one-shot queries returning data and do not overlap
+        with a cursor's ``set_sort``/``set_filter``/``set_group``, which are
+        persistent presentation state.
 
         Args:
             path: Dot-notation string or tuple/list of exact segments,
@@ -1601,6 +1633,10 @@ class ModDict:
         converter first via ``md.register_converter()``, or convert the value
         to a supported type before storing/serializing it.
 
+        On a cursor: serializes the anchored TABLE, so the bytes restore into
+        a plain ``{key: row}`` ModDict. The cursor's own sort/filter/connect
+        state is presentation, not data, and is never part of the payload.
+
         Returns:
             Bytes object. Can be stored to disk or transferred over network.
 
@@ -1619,6 +1655,12 @@ class ModDict:
         If *key* is not found and *default* is given, return *default*.
         If *key* is not found and no default is given, raise ``KeyError``.
 
+        On a cursor: the returning sibling of ``del cursor[key]``, and raw
+        like it — an active ``set_filter()`` doesn't hide a row from it.
+        Being the ``del`` path, it fires a ``"reorder"`` event on live
+        cursors, not the ``"delete"`` event that cursor-native
+        ``delete(key)`` fires.
+
         Example::
 
             val = mn.pop("alice")           # removes "alice", returns its row
@@ -1632,6 +1674,9 @@ class ModDict:
 
         All row dicts are recursively copied — mutations on the copy do not
         affect the original and vice versa.
+
+        On a cursor: copies the anchored TABLE, returning a standalone root
+        ModDict (not another cursor).
 
         Example::
 
@@ -1700,6 +1745,9 @@ class ModDict:
         handing data to code that requires an actual ``dict`` (e.g. Pydantic's
         ``model_validate``, which only accepts ``dict`` or a model instance,
         not arbitrary Mapping-like objects).
+
+        On a cursor: a fresh plain dict of the anchored table — raw, so an
+        active ``set_filter()`` doesn't hide rows from it.
 
         Example::
 
