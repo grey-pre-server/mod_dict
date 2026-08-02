@@ -534,19 +534,34 @@ turned into `None`.
 ### Geometry (WKB) — shapely / geoalchemy2
 
 A `shapely` geometry or `geoalchemy2.WKBElement` value serializes as raw WKB
-bytes regardless of which library produced it. On the reading side, which
-library it reconstructs into is controlled by `md.set_geo_backend(...)`, not
-by which one wrote it:
+bytes regardless of which library produced it. On the reading side, what it
+turns back into is controlled by `md.set_geo_backend(...)`, not by which one
+wrote it:
 
 ```python
-md.set_geo_backend("shapely")       # or "geoalchemy2", or None to clear
+md.set_geo_backend("shapely")       # -> shapely geometry
+md.set_geo_backend("geoalchemy2")   # -> WKBElement
+md.set_geo_backend("wkb_bytes")     # -> the raw WKB bytes, unparsed
+md.set_geo_backend(None)            # clear -> auto-detect (see below)
 ```
 
-- Only one of the two libraries installed on the reading side → that one is
-  used automatically, no call needed.
+`"wkb_bytes"` needs neither library installed and skips the per-value
+parse/allocate cost entirely — the right choice when the geometry is only
+being relayed onward (to another service, straight back into a database) and
+never inspected geometrically. It also makes the result independent of what
+happens to be `pip install`ed in a given environment.
+
+Without an explicit choice, reconstruction depends on the reading side:
+
+- Only one of the two libraries installed → that one is used automatically,
+  no call needed.
 - Both installed → **required** — deserializing a geometry without calling
-  this first raises `ValueError` (ambiguous which to reconstruct into).
-- Neither installed → the raw WKB `bytes` come back instead, no data loss.
+  this first raises `ValueError`. Deliberately an error rather than a guess:
+  the choice decides the returned *type*, so guessing would be a source of
+  silent wrong results.
+- Neither installed → the raw WKB `bytes` come back, no data loss. Prefer
+  stating `"wkb_bytes"` outright if that's what you actually want, rather
+  than relying on a library being absent.
 
 `md.ShapelyWKB(raw_bytes)` / `md.GeoAlchemyWKB(raw_bytes)` let you tag raw
 WKB bytes for storage without either library installed on the writing side —

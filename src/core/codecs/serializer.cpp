@@ -20,9 +20,14 @@ static std::string s_geo_backend;  // empty = unset (auto-detect)
 
 bool set_geo_backend(const char* name) {
     if (!name) { s_geo_backend.clear(); return true; }
+    // "wkb_bytes" hands back the raw WKB unparsed — needs no library, so it
+    // skips the installed-check below. Without it, raw bytes were reachable
+    // only BY ACCIDENT (when neither library happened to be installed), which
+    // made the result depend on the environment rather than on the code.
+    if (strcmp(name, "wkb_bytes") == 0) { s_geo_backend = name; return true; }
     if (strcmp(name, "shapely") != 0 && strcmp(name, "geoalchemy2") != 0) {
         PyErr_Format(PyExc_ValueError,
-            "set_geo_backend: name must be 'shapely' or 'geoalchemy2', got '%s'", name);
+            "set_geo_backend: name must be 'shapely', 'geoalchemy2', or 'wkb_bytes', got '%s'", name);
         return false;
     }
     PyObject* mod = PyImport_ImportModule(name);
@@ -40,12 +45,21 @@ const char* get_geo_backend() {
     return s_geo_backend.empty() ? nullptr : s_geo_backend.c_str();
 }
 
-// Reconstruct a shapely geometry or geoalchemy2 WKBElement from raw WKB bytes.
+// Reconstruct a shapely geometry or geoalchemy2 WKBElement from raw WKB bytes
+// — or hand the bytes straight back under the "wkb_bytes" backend.
 // Honors an explicit set_geo_backend() preference; otherwise auto-detects
 // among whichever of {shapely, geoalchemy2} is importable — falls back to
 // the raw bytes if neither is installed, raises if both are (ambiguous,
 // caller must disambiguate via set_geo_backend()).
 static PyObject* reconstruct_wkb(PyObject* wkb) {
+    const char* pref = get_geo_backend();
+    // Answered before the import probing below — "wkb_bytes" deliberately
+    // needs neither library, so don't pay for finding out whether they exist.
+    if (pref && strcmp(pref, "wkb_bytes") == 0) {
+        Py_INCREF(wkb);
+        return wkb;
+    }
+
     bool has_shapely    = false;
     bool has_geoalchemy = false;
     {
@@ -57,7 +71,6 @@ static PyObject* reconstruct_wkb(PyObject* wkb) {
         if (m) { has_geoalchemy = true; Py_DECREF(m); } else PyErr_Clear();
     }
 
-    const char* pref = get_geo_backend();
     bool want_shapely;
     if (pref) {
         want_shapely = (strcmp(pref, "shapely") == 0);
@@ -73,10 +86,14 @@ static PyObject* reconstruct_wkb(PyObject* wkb) {
         }
     } else {
         if (has_shapely && has_geoalchemy) {
+            // Deliberately still an error rather than picking one: the choice
+            // decides what TYPE the caller gets back, so guessing here would
+            // be a silent-wrong-result source.
             PyErr_SetString(PyExc_ValueError,
-                "reconstruct WKB: both shapely and geoalchemy2 are installed - call "
-                "md.set_geo_backend(\"shapely\") or md.set_geo_backend(\"geoalchemy2\") "
-                "to disambiguate which one to deserialize into");
+                "reconstruct WKB: both shapely and geoalchemy2 are installed - pick one "
+                "explicitly: md.set_geo_backend(\"shapely\") -> shapely geometry, "
+                "md.set_geo_backend(\"geoalchemy2\") -> WKBElement, or "
+                "md.set_geo_backend(\"wkb_bytes\") -> the raw WKB bytes, unparsed");
             return nullptr;
         }
         if (!has_shapely && !has_geoalchemy) {

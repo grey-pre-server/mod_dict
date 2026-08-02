@@ -115,9 +115,11 @@ static PyObject* py_register_converter(PyObject*, PyObject* args) {
 }
 
 /* ============================================================================
-   set_geo_backend — which library a deserialized shapely/geoalchemy2 geometry
-   reconstructs into. Required if both are installed (otherwise ambiguous),
-   optional (auto-detected) if only one is. Pass None to clear the preference.
+   set_geo_backend — what a deserialized WKB geometry turns into: "shapely",
+   "geoalchemy2", or "wkb_bytes" (the raw bytes, unparsed — needs neither
+   library installed). Required if both libraries are installed (otherwise
+   ambiguous), optional (auto-detected) if only one is. Pass None to clear the
+   preference and go back to auto-detection.
    ============================================================================ */
 
 static PyObject* py_set_geo_backend(PyObject*, PyObject* arg) {
@@ -200,12 +202,15 @@ static PyMethodDef module_methods[] = {
      "Deserialize bytes produced by dumps() (or ModDict.serialize())."},
     {"set_geo_backend", py_set_geo_backend, METH_O,
      "set_geo_backend(name)\n"
-     "Which library a deserialized shapely/geoalchemy2 geometry reconstructs\n"
-     "into: \"shapely\" or \"geoalchemy2\". Required if both are installed\n"
-     "(deserializing a geometry otherwise raises ValueError, ambiguous);\n"
-     "optional (auto-detected) if only one is installed. Pass None to clear\n"
-     "the preference. Raises ValueError/ImportError immediately if the name\n"
-     "is invalid or that library isn't importable."},
+     "What a deserialized WKB geometry turns into: \"shapely\" (shapely\n"
+     "geometry), \"geoalchemy2\" (WKBElement), or \"wkb_bytes\" (the raw WKB\n"
+     "bytes, unparsed — needs neither library installed, and skips the parse\n"
+     "cost entirely when you only relay the value onward). Required if both\n"
+     "libraries are installed (deserializing a geometry otherwise raises\n"
+     "ValueError, ambiguous); optional (auto-detected) if only one is. Pass\n"
+     "None to clear the preference and go back to auto-detection. Raises\n"
+     "ValueError/ImportError immediately if the name is invalid or that\n"
+     "library isn't importable (\"wkb_bytes\" never needs one)."},
     {nullptr, nullptr, 0, nullptr}
 };
 

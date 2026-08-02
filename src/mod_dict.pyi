@@ -1790,30 +1790,47 @@ class GeoAlchemyWKB:
     def __init__(self, data: bytes) -> None: ...
 
 
-def set_geo_backend(name: Literal["shapely", "geoalchemy2"] | None) -> None:
+def set_geo_backend(name: Literal["shapely", "geoalchemy2", "wkb_bytes"] | None) -> None:
     """
-    Choose which library a deserialized geometry reconstructs into.
+    Choose what a deserialized geometry turns into.
 
-    A serialized geometry only ever remembers that it *is* WKB geometry data
-    — reconstructing it back into a ``shapely`` object or a
-    ``geoalchemy2.WKBElement`` depends on what's importable on the reading
-    side, regardless of which one wrote it:
+    A serialized geometry only ever remembers that it *is* WKB geometry data.
+    What it comes back as is this setting's job:
+
+    - ``"shapely"`` — a shapely geometry object.
+    - ``"geoalchemy2"`` — a ``geoalchemy2.WKBElement``.
+    - ``"wkb_bytes"`` — the raw WKB ``bytes``, unparsed. Needs neither
+      library installed, and skips the per-value parse/allocate cost
+      entirely — the right choice when the value is only being relayed
+      onward (to another service, straight back into a database) and never
+      inspected geometrically. Also makes the result independent of what
+      happens to be installed in a given environment.
+
+    Without an explicit choice, reconstruction falls back to whatever is
+    importable on the reading side, regardless of which library wrote it:
 
     - Only one of Shapely / GeoAlchemy2 installed: that one is used
       automatically, no call to this function needed.
     - Both installed: **required** — deserializing a geometry without
-      calling this first raises ``ValueError`` (ambiguous which to use).
-    - Neither installed: the raw WKB ``bytes`` are returned instead — no
-      data loss, just no reconstruction.
+      calling this first raises ``ValueError``. Deliberately an error rather
+      than a guess: the choice decides the returned *type*, so guessing would
+      be a silent-wrong-result source.
+    - Neither installed: the raw WKB ``bytes`` are returned — no data loss,
+      just no reconstruction. Prefer stating ``"wkb_bytes"`` outright if
+      that's what you actually want, rather than relying on absence.
 
     Raises ``ValueError`` if *name* isn't ``"shapely"``/``"geoalchemy2"``/
-    ``None``, or ``ImportError`` if that library isn't actually installed.
-    Pass ``None`` to clear a previously set preference.
+    ``"wkb_bytes"``/``None``, or ``ImportError`` if that library isn't
+    actually installed (``"wkb_bytes"`` never needs one). Pass ``None`` to
+    clear a previously set preference and go back to auto-detection.
 
     Example::
 
         md.set_geo_backend("shapely")   # both libs installed -> always shapely
         mn2 = md.loads(md.dumps(mn))    # geometries come back as shapely objects
+
+        md.set_geo_backend("wkb_bytes")  # pure relay — don't build objects
+        mn3 = md.loads(md.dumps(mn))     # geometries stay as raw WKB bytes
     """
     ...
 
