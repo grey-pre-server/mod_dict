@@ -175,6 +175,7 @@ orders.delete(key)               # -> int | None (прежняя позиция)
 orders.update_row(key, changes)  # -> ((old_index, new_index), changes) — changes: {поле: новое_значение}
 orders.insert_batch({key: row, ...})  # -> list[(int|None, dict)] = [(новая позиция, row), ...], одна запись, одно событие connect()
 orders.insert_batch([row, ...], key="id")  # то же, key= извлекает ключ строки вместо готового {key: row}
+orders.insert_batch([row, ...], key=("user_id", "group_id"))  # кортеж имён полей -> составной ключ-кортеж на строку
 orders.connect("insert" | "update" | "delete" | "reorder", callback)
 orders.view_keys() / orders.view_values() / orders.view_items()  # текущий вид с учётом sort/filter — [key] / in / del остаются raw, фильтра не видят
 
@@ -193,6 +194,9 @@ mn.at(-1)                                        # значение послед
 md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}
 md.ModDict.from_row(row)                         # нормализует Mapping → обычный dict
 mn.load_rows(rows, key="id", path="users")       # пишет в СУЩЕСТВУЮЩИЙ mn: mn["users"] = {r["id"]: r for r in rows}
+# key= кортежем имён полей собирает составной ключ-кортеж (составной PK из БД) —
+# одинаково для from_rows/load_rows/cursor.insert_batch:
+md.ModDict.from_rows(rows, key=("user_id", "group_id"))   # {(r["user_id"], r["group_id"]): r for r in rows}
 
 # Сериализация
 mn.serialize() / mn.deserialize(data)          # data → self, возвращает self для чейнинга

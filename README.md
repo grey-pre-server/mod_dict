@@ -176,6 +176,7 @@ orders.delete(key)               # -> int | None (old_index)
 orders.update_row(key, changes)  # -> ((old_index, new_index), changes) — changes: {field: new_value}
 orders.insert_batch({key: row, ...})  # -> list[(int|None, dict)] = [(new_index, row), ...], one write pass, one connect() event
 orders.insert_batch([row, ...], key="id")  # same, key= extracts each row's outer key instead of a pre-keyed dict
+orders.insert_batch([row, ...], key=("user_id", "group_id"))  # tuple of field names -> composite tuple key per row
 orders.connect("insert" | "update" | "delete" | "reorder", callback)
 orders.view_keys() / orders.view_values() / orders.view_items()  # current sort/filter VIEW — [key] / in / del stay raw, unaffected by it
 
@@ -194,6 +195,9 @@ mn.at(-1)                                        # last inserted key's value
 md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}
 md.ModDict.from_row(row)                         # normalize Mapping → plain dict
 mn.load_rows(rows, key="id", path="users")       # writes into an EXISTING mn: mn["users"] = {r["id"]: r for r in rows}
+# key= as a tuple of field names builds a composite tuple key (DB composite PK) —
+# same for from_rows/load_rows/cursor.insert_batch:
+md.ModDict.from_rows(rows, key=("user_id", "group_id"))   # {(r["user_id"], r["group_id"]): r for r in rows}
 
 # Serialize
 mn.serialize() / mn.deserialize(data)          # data → self, returned for chaining

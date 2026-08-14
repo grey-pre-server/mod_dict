@@ -327,15 +327,21 @@ class ModDict:
         ...
 
     @classmethod
-    def from_rows(cls, rows: list[dict], key: Any) -> ModDict:
+    def from_rows(cls, rows: list[dict], key: Any | tuple) -> ModDict:
         """
         Build a ModDict from a list of row dicts using one field as the outer key.
 
         Typically used to index SQL result sets or any list of records by primary key.
 
+        `key` as a **tuple of field names** builds a composite tuple key from
+        those fields' values instead — the DB-composite-PK case, where the
+        parts arrive as separate row fields, never pre-joined. A missing
+        field raises ``KeyError`` naming that exact field.
+
         Args:
             rows: Iterable of dicts (or Mapping-like objects).
-            key:  Field name whose value becomes the outer key.
+            key:  Field name whose value becomes the outer key — or a tuple
+                  of field names for a composite tuple key.
 
         Example::
 
@@ -345,6 +351,9 @@ class ModDict:
             ]
             mn = ModDict.from_rows(rows, key="id")
             mn[1]["name"]   # "alice"
+
+            links = ModDict.from_rows(membership_rows, key=("user_id", "group_id"))
+            links[(1, 100)]  # the row whose user_id=1, group_id=100
         """
         ...
 
@@ -362,7 +371,7 @@ class ModDict:
         """
         ...
 
-    def load_rows(self, rows: list[dict], key: Any, path: str) -> None:
+    def load_rows(self, rows: list[dict], key: Any | tuple, path: str) -> None:
         """
         Write a list of row dicts into this ModDict as a new table, keyed by one field.
 
@@ -381,7 +390,9 @@ class ModDict:
 
         Args:
             rows: Iterable of dicts (or Mapping-like objects).
-            key:  Field name whose value becomes each row's outer key.
+            key:  Field name whose value becomes each row's outer key — or a
+                  tuple of field names for a composite tuple key, same
+                  semantics as ``from_rows()``.
             path: The top-level key to write the resulting table under.
 
         Example::
@@ -389,6 +400,9 @@ class ModDict:
             mn = ModDict()
             mn.load_rows(user_rows, key="id", path="users")
             # same effect as: mn["users"] = {r["id"]: r for r in user_rows}
+
+            mn.load_rows(membership_rows, key=("user_id", "group_id"), path="links")
+            # mn["links"][(1, 100)] -> the row whose user_id=1, group_id=100
         """
         ...
 
@@ -1502,7 +1516,7 @@ class ModDict:
         """
         ...
 
-    def insert_batch(self, rows: dict[Any, dict] | list[dict], key: Any = None) -> list[tuple[int | None, dict]]:
+    def insert_batch(self, rows: dict[Any, dict] | list[dict], key: Any | tuple = None) -> list[tuple[int | None, dict]]:
         """
         Insert (or overwrite) many rows through a cursor in one call.
 
@@ -1517,8 +1531,14 @@ class ModDict:
         the field each row's own outer key should be extracted from —
         ``{row[key]: row for row in rows}`` is built in one C-level pass
         instead of requiring the caller to build that mapping themselves in
-        a Python loop first. `key` is only meaningful (and required) when
-        `rows` is a list; passing it alongside a dict raises ``TypeError``.
+        a Python loop first. `key` as a **tuple of field names** builds a
+        composite tuple key from those fields' values instead
+        (``key=("user_id", "group_id")`` → ``(row["user_id"],
+        row["group_id"])`` — the DB-composite-PK case, where the parts
+        arrive as separate row fields; a missing field raises ``KeyError``
+        naming that exact field). `key` is only meaningful (and required)
+        when `rows` is a list; passing it alongside a dict raises
+        ``TypeError``.
 
         Returns only the NEW rows' own landing positions, each paired with
         its own row (same reasoning as ``insert()`` — a ``connect()``
@@ -1528,7 +1548,8 @@ class ModDict:
 
         Args:
             rows: ``{key: row_dict, ...}``, or a list of row dicts (with `key` set).
-            key:  Field name to extract each row's outer key from — only
+            key:  Field name to extract each row's outer key from — or a
+                  tuple of field names for a composite tuple key. Only
                   used, and required, when `rows` is a list.
 
         Returns:
@@ -1554,6 +1575,13 @@ class ModDict:
                 {"id": "o10", "amount": 5,  "status": "new"},
                 {"id": "o11", "amount": 40, "status": "new"},
             ], key="id")
+
+            # composite key from separate fields (DB composite PK):
+            links.insert_batch([
+                {"user_id": 1, "group_id": 100, "role": "admin"},
+                {"user_id": 1, "group_id": 200, "role": "member"},
+            ], key=("user_id", "group_id"))
+            links[(1, 100)]["role"]   # "admin"
         """
         ...
 

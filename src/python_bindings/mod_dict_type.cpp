@@ -1342,6 +1342,51 @@ static PyObject* ModDict_cursor_delete(ModDictObject* s, PyObject* args) {
     return payload;
 }
 
+// Extracts a row's outer key per key_obj — shared by insert_batch()/
+// from_rows()/load_rows(). A TUPLE of field names builds a composite tuple
+// key from those fields' values (key=("user_id","group_id") ->
+// (row["user_id"], row["group_id"]) — the DB-composite-PK case where the
+// parts arrive as separate fields, never pre-joined); anything else is a
+// single literal field name, as before. This claims tuples for "composite" —
+// a field literally NAMED by a tuple can no longer be key='d directly;
+// string/int/etc. field names, the real-world case, are untouched.
+// Handles dict rows (PyDict_GetItem) and Mapping-like rows
+// (PyObject_GetItem) alike. Returns a NEW reference; nullptr with PyErr set
+// (KeyError names the exact missing FIELD, not the whole tuple).
+static PyObject* extract_row_key(PyObject* row, PyObject* key_obj) {
+    bool is_dict = PyDict_Check(row);
+    if (PyTuple_Check(key_obj)) {
+        Py_ssize_t nf = PyTuple_GET_SIZE(key_obj);
+        if (nf == 0) {
+            PyErr_SetString(PyExc_TypeError, "composite key= needs at least one field name");
+            return nullptr;
+        }
+        PyObject* pk = PyTuple_New(nf);
+        if (!pk) return nullptr;
+        for (Py_ssize_t fi = 0; fi < nf; fi++) {
+            PyObject* fname = PyTuple_GET_ITEM(key_obj, fi);
+            PyObject* fv;
+            if (is_dict) { fv = PyDict_GetItem(row, fname); Py_XINCREF(fv); }  // borrowed -> owned
+            else         { fv = PyObject_GetItem(row, fname); }                // new ref
+            if (!fv) {
+                if (!PyErr_Occurred()) PyErr_SetObject(PyExc_KeyError, fname);
+                Py_DECREF(pk);
+                return nullptr;
+            }
+            PyTuple_SET_ITEM(pk, fi, fv);  // steals the reference
+        }
+        return pk;
+    }
+    PyObject* pk;
+    if (is_dict) { pk = PyDict_GetItem(row, key_obj); Py_XINCREF(pk); }
+    else         { pk = PyObject_GetItem(row, key_obj); }
+    // PyDict_GetItem reports a miss as NULL with NO exception set — always
+    // normalize to a KeyError here so no caller can return NULL bare
+    // (a SystemError waiting to happen, which from_rows() previously did).
+    if (!pk && !PyErr_Occurred()) PyErr_SetObject(PyExc_KeyError, key_obj);
+    return pk;
+}
+
 static PyObject* ModDict_cursor_insert_batch(ModDictObject* s, PyObject* args, PyObject* kw) {
     MOD_DICT_REQUIRE_CURSOR(s, "insert_batch()");
     PyObject* rows; PyObject* key_obj = nullptr;
@@ -1359,9 +1404,11 @@ static PyObject* ModDict_cursor_insert_batch(ModDictObject* s, PyObject* args, P
         }
     } else {
         // rows is a list (or other iterable) of plain row dicts — key=
-        // names the field each row's own outer key is extracted from,
-        // building {row[key]: row} in one C-level pass instead of requiring
-        // the caller to build that mapping themselves in a Python loop.
+        // names the field each row's own outer key is extracted from
+        // (or, as a tuple of field names, builds a composite tuple key —
+        // see extract_row_key()), building {row[key]: row} in one C-level
+        // pass instead of requiring the caller to build that mapping
+        // themselves in a Python loop.
         if (!key_obj) MOD_DICT_RAISE(PyExc_TypeError, "insert_batch: rows is not a dict — pass key= to extract each row's identifier from its own field");
         rows_dict = PyDict_New();
         if (!rows_dict) return nullptr;
@@ -1374,12 +1421,10 @@ static PyObject* ModDict_cursor_insert_batch(ModDictObject* s, PyObject* args, P
                 PyErr_SetString(PyExc_TypeError, "insert_batch: every row must be a dict");
                 Py_DECREF(row); Py_DECREF(iter); Py_DECREF(rows_dict); return nullptr;
             }
-            PyObject* pk = PyDict_GetItem(row, key_obj);  // borrowed
-            if (!pk) {
-                PyErr_SetObject(PyExc_KeyError, key_obj);
-                Py_DECREF(row); Py_DECREF(iter); Py_DECREF(rows_dict); return nullptr;
-            }
+            PyObject* pk = extract_row_key(row, key_obj);  // new ref
+            if (!pk) { Py_DECREF(row); Py_DECREF(iter); Py_DECREF(rows_dict); return nullptr; }
             PyDict_SetItem(rows_dict, pk, row);  // SetItem INCREFs both itself
+            Py_DECREF(pk);
             Py_DECREF(row);
         }
         Py_DECREF(iter);
@@ -1530,10 +1575,11 @@ static PyObject* ModDict_from_rows(PyObject* cls, PyObject* args, PyObject* kw){
     if(!iter){ Py_DECREF(s); return nullptr; }
     PyObject* row;
     while((row=PyIter_Next(iter))){
-        // support dict and Mapping-like objects (row[key])
-        PyObject* pk=nullptr;
-        if(PyDict_Check(row)) pk=PyDict_GetItem(row,key_obj);   // borrowed
-        else                  pk=PyObject_GetItem(row,key_obj);  // new ref — need DECREF
+        // dict and Mapping-like rows, single or composite (tuple) key= —
+        // see extract_row_key(). Always a new ref; always leaves a real
+        // KeyError on a miss (previously a dict row with the field absent
+        // returned bare NULL with no exception set — a SystemError).
+        PyObject* pk = extract_row_key(row, key_obj);
         if(!pk){ Py_DECREF(row); Py_DECREF(iter); Py_DECREF(s); return nullptr; }
 
         PyObject* row_dict = PyDict_Check(row) ? row : nullptr;
@@ -1552,11 +1598,10 @@ static PyObject* ModDict_from_rows(PyObject* cls, PyObject* args, PyObject* kw){
             Py_INCREF(row_dict);
         }
 
-        bool borrowed_pk = PyDict_Check(row);
         ModValue mk=ModValue::from_pyobject(pk);
         s->internal->insert_row(mk, row_dict);
         Py_DECREF(row_dict);
-        if(!borrowed_pk) Py_DECREF(pk);
+        Py_DECREF(pk);
         Py_DECREF(row);
     }
     Py_DECREF(iter);
@@ -1581,14 +1626,10 @@ static PyObject* ModDict_load_rows(ModDictObject* s, PyObject* args, PyObject* k
     if(!iter){ Py_DECREF(built); return nullptr; }
     PyObject* row;
     while((row=PyIter_Next(iter))){
-        // support dict and Mapping-like objects (row[key]) — same as from_rows()
-        PyObject* pk=nullptr;
-        if(PyDict_Check(row)) pk=PyDict_GetItem(row,key_obj);   // borrowed
-        else                  pk=PyObject_GetItem(row,key_obj);  // new ref — need DECREF
-        if(!pk){
-            if(!PyErr_Occurred()) PyErr_SetObject(PyExc_KeyError, key_obj);  // PyDict_GetItem doesn't set one itself
-            Py_DECREF(row); Py_DECREF(iter); Py_DECREF(built); return nullptr;
-        }
+        // dict and Mapping-like rows, single or composite (tuple) key= —
+        // same extract_row_key() as from_rows()/insert_batch().
+        PyObject* pk = extract_row_key(row, key_obj);
+        if(!pk){ Py_DECREF(row); Py_DECREF(iter); Py_DECREF(built); return nullptr; }
 
         PyObject* row_dict = PyDict_Check(row) ? row : nullptr;
         bool own_row_dict = false;
@@ -1605,10 +1646,9 @@ static PyObject* ModDict_load_rows(ModDictObject* s, PyObject* args, PyObject* k
             }
         }
 
-        bool borrowed_pk = PyDict_Check(row);
         PyDict_SetItem(built, pk, row_dict);  // SetItem INCREFs pk/row_dict itself
         if(own_row_dict) Py_DECREF(row_dict);
-        if(!borrowed_pk) Py_DECREF(pk);
+        Py_DECREF(pk);
         Py_DECREF(row);
     }
     Py_DECREF(iter);
@@ -2228,15 +2268,15 @@ static PyMethodDef ModDict_methods[]={
     {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->(int|None,dict) — (new_index, row); cursor only"},
     {"update_row",(PyCFunction)ModDict_cursor_update_row,METH_VARARGS,"update_row(key,changes)->((old_index|None,new_index|None),changes) — changes: {field:new_value} for fields that actually changed; cursor only"},
     {"delete",(PyCFunction)ModDict_cursor_delete,METH_VARARGS,"delete(key)->int|None — old_index; cursor only"},
-    {"insert_batch",(PyCFunction)ModDict_cursor_insert_batch,METH_VARARGS|METH_KEYWORDS,"insert_batch(rows,key=None)->list[(int|None,dict)] — rows: dict[key,row], or list[dict] with key= naming the field to extract each row's key from; (new_index, row) per row, in rows' iteration order; cursor only; fires one 'insert' event for the whole batch"},
+    {"insert_batch",(PyCFunction)ModDict_cursor_insert_batch,METH_VARARGS|METH_KEYWORDS,"insert_batch(rows,key=None)->list[(int|None,dict)] — rows: dict[key,row], or list[dict] with key= naming the field to extract each row's key from (a tuple of field names builds a composite tuple key: key=('user_id','group_id') -> (row['user_id'],row['group_id'])); (new_index, row) per row, in rows' iteration order; cursor only; fires one 'insert' event for the whole batch"},
     {"view_keys",(PyCFunction)ModDict_view_keys,METH_NOARGS,"view_keys()->list — keys in the cursor's current sort/filter view, same order as __iter__/.at(); cursor only"},
     {"view_values",(PyCFunction)ModDict_view_values,METH_NOARGS,"view_values()->list[dict] — rows in the cursor's current sort/filter view; cursor only"},
     {"view_items",(PyCFunction)ModDict_view_items,METH_NOARGS,"view_items()->list[(key,dict)] — (key,row) pairs in the cursor's current sort/filter view; cursor only"},
     {"from_dict",(PyCFunction)ModDict_from_dict,METH_O|METH_CLASS,"from_dict(d)->ModDict"},
     {"from_json",(PyCFunction)ModDict_from_json,METH_O|METH_CLASS,"from_json(s)->ModDict"},
-    {"from_rows",(PyCFunction)ModDict_from_rows,METH_VARARGS|METH_KEYWORDS|METH_CLASS,"from_rows(rows,key)->ModDict"},
+    {"from_rows",(PyCFunction)ModDict_from_rows,METH_VARARGS|METH_KEYWORDS|METH_CLASS,"from_rows(rows,key)->ModDict — key: field name, or tuple of field names for a composite tuple key"},
     {"from_row",(PyCFunction)ModDict_from_row,METH_O|METH_CLASS,"from_row(row)->dict"},
-    {"load_rows",(PyCFunction)ModDict_load_rows,METH_VARARGS|METH_KEYWORDS,"load_rows(rows,key,path)->None — writes self[path]={row[key]:row for row in rows}"},
+    {"load_rows",(PyCFunction)ModDict_load_rows,METH_VARARGS|METH_KEYWORDS,"load_rows(rows,key,path)->None — writes self[path]={row[key]:row for row in rows}; key: field name, or tuple of field names for a composite tuple key"},
     {"to_dict",(PyCFunction)ModDict_to_dict,METH_NOARGS,"to_dict()->dict — shallow copy as plain dict, bypasses RowProxy"},
     {"serialize",(PyCFunction)ModDict_serialize,METH_NOARGS,"serialize()->bytes"},
     {"deserialize",(PyCFunction)ModDict_deserialize,METH_VARARGS,"deserialize(data)->ModDict — mutates self in place, returns self for chaining"},

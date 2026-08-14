@@ -37,8 +37,33 @@ uint64_t content_hash_pyobj(PyObject* obj) {
         if (!s) { PyErr_Clear(); return 0; }
         return fnv1a64(s, (size_t)len);
     }
-    if (PyBytes_Check(obj))
-        return fnv1a64(PyBytes_AS_STRING(obj), (size_t)PyBytes_GET_SIZE(obj));
+    if (PyBytes_Check(obj)) {
+        // Salted so b"abc" and "abc" hash DIFFERENTLY: both branches feed the
+        // same octets to fnv1a64, and FlatHashMap trusts the hash alone — so
+        // without the salt, a str key and a bytes key with identical content
+        // silently overwrote each other (same silent-data-loss class as the
+        // (1,2)-vs-"(1, 2)" repr collision fixed alongside). Hashes are never
+        // serialized (recomputed on load), so changing this is internal-only.
+        uint64_t h = fnv1a64(PyBytes_AS_STRING(obj), (size_t)PyBytes_GET_SIZE(obj));
+        return h ^ 0x62797465735F5F5FULL;  // "bytes___" — type tag
+    }
+    // Composite keys (e.g. a (region_id, item_id) tuple mirroring a DB's
+    // composite primary key) — fold each element's own stable content hash
+    // together (recursive, so nested tuples of primitives stay just as
+    // stable as a lone string/int would be) instead of falling through to
+    // the repr()-based fallback below. repr() on a tuple builds a formatted
+    // Python string (recursing through repr() on every element, allocating
+    // a new PyUnicode) just to hash THAT — measured ~3x slower on insert for
+    // a typical (int, str) composite key than this direct combine.
+    if (PyTuple_Check(obj)) {
+        Py_ssize_t n = PyTuple_GET_SIZE(obj);
+        uint64_t h = 14695981039346656037ULL;  // fnv1a64's own offset basis
+        for (Py_ssize_t i = 0; i < n; i++) {
+            uint64_t eh = content_hash_pyobj(PyTuple_GET_ITEM(obj, i));  // borrowed
+            h = (h ^ eh) * 1099511628211ULL;  // fold, same prime fnv1a64 uses
+        }
+        return h;
+    }
     // fallback: stable repr hash
     PyObject* r = PyObject_Repr(obj);
     if (!r) { PyErr_Clear(); return 0; }
