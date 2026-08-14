@@ -178,6 +178,7 @@ orders.insert_batch({key: row, ...})  # -> list[(int|None, dict)] = [(new_index,
 orders.insert_batch([row, ...], key="id")  # same, key= extracts each row's outer key instead of a pre-keyed dict
 orders.insert_batch([row, ...], key=("user_id", "group_id"))  # tuple of field names -> composite tuple key per row
 orders.connect("insert" | "update" | "delete" | "reorder", callback)
+orders.disconnect(event?, callback?)  # -> int removed; (event,cb) / (event) / () — one, the event's, or all listeners
 orders.view_keys() / orders.view_values() / orders.view_items()  # current sort/filter VIEW — [key] / in / del stay raw, unaffected by it
 
 # Update from another collection
@@ -438,6 +439,13 @@ orders.connect("reorder", lambda diff: qt_model.apply_reorder(diff))
 # "reorder" is the one event that DOES carry a full list[(old,new)] diff —
 # it fires on a SIBLING cursor reacting to someone else's mutation, and
 # that sibling has no way to know which single row triggered the change.
+
+orders.disconnect("insert", handler)  # -> how many registrations were removed (0 = nothing matched)
+orders.disconnect("reorder")          # drop all of one event's listeners
+orders.disconnect()                   # drop everything
+# matching is ==, not identity — self.method / signal.emit pair up naturally
+# across connect/disconnect; a listener may disconnect itself mid-dispatch
+# (takes effect from the NEXT event — the current dispatch runs on a snapshot)
 ```
 
 Multiple independent cursors can point at the same anchor — each keeps its

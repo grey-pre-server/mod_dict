@@ -247,7 +247,7 @@ PyObject* ModDict::get_subrow(uint64_t oh, const std::string& prefix) const {
 
 // ── Reindex one row (after in-place field write via RowProxy) ────────────────
 
-void ModDict::reindex_row_no_validate(uint64_t oh, ModDict* originator) {
+void ModDict::reindex_row_no_validate(uint64_t oh, ModDict* originator, const CursorMutationHint* hint) {
     for (auto& fi : indices.by_field.occupied()) {
         fi.value->remove_outer_key(oh);
         fi.value->on_insert_row(oh, this);
@@ -256,7 +256,7 @@ void ModDict::reindex_row_no_validate(uint64_t oh, ModDict* originator) {
     // double-notification. Fires even if reindex_row()'s later link
     // validation raises: the data write already happened and indices
     // already reflect it, independent of whether that raises afterward.
-    true_root()->notify_live_cursors(oh, originator);
+    true_root()->notify_live_cursors(oh, originator, hint);
 }
 
 void ModDict::reindex_row(uint64_t oh) {
@@ -1835,16 +1835,109 @@ void ModDict::dispatch_event(const char* event_type, PyObject* payload) {
     PyObject* listeners = PyDict_GetItem(live_connect_listeners, key);  // borrowed
     Py_DECREF(key);
     if (!listeners) return;
-    Py_ssize_t n = PyList_Size(listeners);
+    // Snapshot before calling out: a listener may disconnect() itself (or
+    // others, or connect() new ones) DURING this dispatch — mutating the
+    // live list mid-loop would mean reading past a shrunk list, and
+    // disconnect(event) dropping the whole list would free it out from
+    // under this borrowed pointer. Snapshot semantics on purpose: changes
+    // made by a listener take effect from the NEXT event, not this one
+    // (same rule Qt applies to its own signal dispatch).
+    PyObject* snapshot = PySequence_List(listeners);
+    if (!snapshot) return;
+    Py_ssize_t n = PyList_GET_SIZE(snapshot);
     for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject* cb = PyList_GetItem(listeners, i);  // borrowed
+        PyObject* cb = PyList_GET_ITEM(snapshot, i);  // borrowed from snapshot, which we own
         PyObject* res = PyObject_CallOneArg(cb, payload);
-        if (!res) return;  // listener raised — propagate (fail loud), stop this dispatch
+        if (!res) { Py_DECREF(snapshot); return; }  // listener raised — propagate (fail loud), stop this dispatch
         Py_DECREF(res);
+    }
+    Py_DECREF(snapshot);
+}
+
+bool ModDict::has_listener(const char* event_type) const {
+    if (!live_connect_listeners) return false;
+    PyObject* l = PyDict_GetItemString(live_connect_listeners, event_type);  // borrowed
+    return l && PyList_GET_SIZE(l) > 0;
+}
+
+// Emits shift entries into `diff` for the CURRENT rows of sort_index in
+// [from_now, to_now] (inclusive, post-mutation positions), each of which
+// moved by `delta` (+1: it was one position earlier before the mutation;
+// -1: one later). Hidden rows (filter active, not in membership) are
+// omitted — same convention resync_and_diff() emits.
+static void emit_shift_range(ModDict::IndexDiff& diff,
+                             const std::vector<PyObject*>& sort_index,
+                             const FlatHashMap<uint64_t, char>* membership,
+                             Py_ssize_t from_now, Py_ssize_t to_now, Py_ssize_t delta) {
+    for (Py_ssize_t j = from_now; j <= to_now && j < (Py_ssize_t)sort_index.size(); j++) {
+        if (j < 0) continue;
+        if (membership && !membership->find(content_hash_pyobj(sort_index[(size_t)j]))) continue;
+        diff.emplace_back(j - delta, j);
     }
 }
 
-void ModDict::notify_live_cursors(uint64_t changed_top_hash, ModDict* originator) {
+ModDict::IndexDiff ModDict::sibling_apply_hint(const CursorMutationHint& hint, bool want_diff) {
+    IndexDiff diff;
+    PyObject* d = cached_anchor_dict;
+    uint64_t h = content_hash_pyobj(hint.key);
+    const FlatHashMap<uint64_t, char>* membership = filter_predicate ? &filter_membership : nullptr;
+
+    if (hint.kind == CursorMutationHint::Kind::Remove) {
+        Py_ssize_t raw_pos = find_sort_index_position(hint.key);
+        bool was_visible = !filter_predicate || filter_membership.find(h);
+        Py_ssize_t vis_pos = (filter_predicate && was_visible) ? find_visible_index_position(hint.key) : -1;
+        if (raw_pos >= 0) erase_from_sort_index(raw_pos);
+        if (filter_predicate) {
+            filter_membership.erase(h);
+            if (vis_pos >= 0) erase_from_visible_index(vis_pos);
+        }
+        if (want_diff && raw_pos >= 0) {
+            if (was_visible) diff.emplace_back(raw_pos, -1);
+            // Rows now at [raw_pos, end) were one position later before.
+            emit_shift_range(diff, sort_index, membership, raw_pos, (Py_ssize_t)sort_index.size() - 1, -1);
+        }
+        return diff;
+    }
+
+    // Insert (new or overwrite) / Update — the row is in the dict already.
+    PyObject* row = PyDict_GetItem(d, hint.key);  // borrowed
+    if (!row) return diff;  // hint out of step with the data — nothing safe to apply
+    bool existed = (hint.kind == CursorMutationHint::Kind::Update) || hint.key_existed;
+    // Same O(1)-before-O(n) reasoning as cursor_insert(): a brand-new key's
+    // old position is trivially -1, no scan needed.
+    Py_ssize_t raw_old = existed ? find_sort_index_position(hint.key) : -1;
+    bool was_visible = filter_predicate ? (existed && filter_membership.find(h) != nullptr)
+                                        : (raw_old >= 0);
+    Py_ssize_t vis_old = (filter_predicate && was_visible) ? find_visible_index_position(hint.key) : -1;
+
+    Py_ssize_t raw_new = reposition_in_sort_index(hint.key, raw_old);
+    bool now_visible = true;
+    if (filter_predicate) {
+        if (!update_filter_membership_one(h, row)) return diff;  // PyErr set — caller handles
+        now_visible = filter_membership.find(h) != nullptr;
+        if (now_visible) (void)reposition_in_visible_index(hint.key, vis_old);
+        else if (vis_old >= 0) erase_from_visible_index(vis_old);
+    }
+
+    if (want_diff) {
+        Py_ssize_t oi = was_visible ? raw_old : -1;
+        Py_ssize_t ni = now_visible ? raw_new : -1;
+        if (oi != ni) diff.emplace_back(oi, ni);
+        if (raw_old < 0) {
+            // Pure insert: rows now after raw_new were one earlier before.
+            emit_shift_range(diff, sort_index, membership, raw_new + 1, (Py_ssize_t)sort_index.size() - 1, +1);
+        } else if (raw_new < raw_old) {
+            // Moved up: the in-between rows slid one later.
+            emit_shift_range(diff, sort_index, membership, raw_new + 1, raw_old, +1);
+        } else if (raw_new > raw_old) {
+            // Moved down: the in-between rows slid one earlier.
+            emit_shift_range(diff, sort_index, membership, raw_old, raw_new - 1, -1);
+        }
+    }
+    return diff;
+}
+
+void ModDict::notify_live_cursors(uint64_t changed_top_hash, ModDict* originator, const CursorMutationHint* hint) {
     ModDict* actual_root = true_root();
     for (auto& bucket : actual_root->live_cursors.occupied()) {
         auto& weakrefs = bucket.value;
@@ -1864,12 +1957,33 @@ void ModDict::notify_live_cursors(uint64_t changed_top_hash, ModDict* originator
                 if (tmp && seg0_hash == changed_top_hash) {
                     // Ensures cached_anchor_dict is populated (a never-yet-
                     // read sibling cursor starts with it null) before diffing.
+                    PyObject* before = cur->cached_anchor_dict;
                     if (!cur->resolve_cursor_dict()) { PyErr_Clear(); i++; continue; }
-                    IndexDiff diff = cur->resync_and_diff();
-                    if (PyErr_Occurred()) { PyErr_Clear(); i++; continue; }  // don't let one bad cursor abort the broadcast
-                    PyObject* payload = index_diff_to_pylist(diff);
-                    if (payload) { cur->dispatch_event("reorder", payload); Py_DECREF(payload); }
-                    if (PyErr_Occurred()) PyErr_Clear();  // a listener's exception shouldn't abort the broadcast either
+                    bool want_diff = cur->has_listener("reorder");
+                    IndexDiff diff;
+                    if (hint && cur->cached_anchor_dict == before && cur->has_derived_order) {
+                        // The hint says exactly which row changed and how —
+                        // update this sibling with the same O(log n) bisect
+                        // primitives the originator used on itself, ONE
+                        // filter-predicate call instead of one per row.
+                        diff = cur->sibling_apply_hint(*hint, want_diff);
+                        if (PyErr_Occurred()) { PyErr_Clear(); i++; continue; }
+                    } else {
+                        // No hint (RowProxy write, wholesale rebind, batch),
+                        // an anchor rebind just detected by resolve (indices
+                        // were rebuilt mid-resolve — the hint is already
+                        // absorbed), or a sibling with no maintained
+                        // snapshot (has_derived_order false — bootstrapping
+                        // AFTER the write would double-apply the hint):
+                        // the full recompute, exactly as before.
+                        diff = cur->resync_and_diff();
+                        if (PyErr_Occurred()) { PyErr_Clear(); i++; continue; }  // don't let one bad cursor abort the broadcast
+                    }
+                    if (want_diff) {
+                        PyObject* payload = index_diff_to_pylist(diff);
+                        if (payload) { cur->dispatch_event("reorder", payload); Py_DECREF(payload); }
+                        if (PyErr_Occurred()) PyErr_Clear();  // a listener's exception shouldn't abort the broadcast either
+                    }
                 }
             }
             i++;
@@ -1897,8 +2011,10 @@ Py_ssize_t ModDict::cursor_insert(PyObject* key, PyObject* row) {
     if (PyDict_SetItem(d, key, row) != 0) return -1;
     // Notifies siblings (excluding `this`, via originator) — reindex_row_no_
     // validate() already does this; a second explicit call here would
-    // re-notify the same siblings a second time for nothing.
-    true_root()->reindex_row_no_validate(cached_top_hash, this);
+    // re-notify the same siblings a second time for nothing. The hint lets
+    // each sibling update incrementally instead of full-rebuilding.
+    CursorMutationHint hint{CursorMutationHint::Kind::Insert, key, key_exists};
+    true_root()->reindex_row_no_validate(cached_top_hash, this, &hint);
 
     // Repositioning handles both a genuinely new key (old_pos=-1, pure
     // bisect-insert) and an overwrite of an existing key (erase + reinsert
@@ -1938,7 +2054,8 @@ std::pair<Py_ssize_t,Py_ssize_t> ModDict::cursor_update_row(PyObject* key, PyObj
     Py_ssize_t old_pos = filter_predicate ? (was_visible ? vis_old_pos : -1) : raw_old_pos;
 
     if (PyDict_Update(row, changes) != 0) return {-1, -1};
-    true_root()->reindex_row_no_validate(cached_top_hash, this);  // notifies siblings — see cursor_insert() comment
+    CursorMutationHint hint{CursorMutationHint::Kind::Update, key, true};
+    true_root()->reindex_row_no_validate(cached_top_hash, this, &hint);  // notifies siblings — see cursor_insert() comment
 
     // Only this row's field values changed — every other row's relative
     // order is unaffected, so erase+reinsert (O(log n)+O(shift)) is enough;
@@ -1972,7 +2089,8 @@ Py_ssize_t ModDict::cursor_delete(PyObject* key) {
     Py_ssize_t old_pos = filter_predicate ? (was_visible ? vis_pos : -1) : raw_pos;
 
     if (PyDict_DelItem(d, key) != 0) return -1;
-    true_root()->reindex_row_no_validate(cached_top_hash, this);  // notifies siblings — see cursor_insert() comment
+    CursorMutationHint hint{CursorMutationHint::Kind::Remove, key, true};
+    true_root()->reindex_row_no_validate(cached_top_hash, this, &hint);  // notifies siblings — see cursor_insert() comment
 
     // Removing one row doesn't change the relative order of the rest — an
     // O(shift) erase is enough, no need to re-sort everyone via a full

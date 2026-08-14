@@ -1334,12 +1334,14 @@ class ModDict:
         - ``"delete"`` — fired by this cursor's own ``delete()``. Payload:
           the same ``int | None`` former-position it returns.
         - ``"reorder"`` — fired on a cursor when a *different* cursor
-          anchored at the same location mutates the data (a sibling doesn't
-          know the precise operation that changed its view, only that it
-          did, so this is the one event that DOES carry the full picture).
+          anchored at the same location mutates the data (the listener
+          doesn't know the precise operation that changed this view, so
+          this is the one event that DOES carry the full picture).
           Payload: ``list[(old_index, new_index)]`` — every row whose
-          position or visibility actually changed, computed by re-diffing
-          this cursor's own state from scratch.
+          position or visibility actually changed. (Internally the diff is
+          built incrementally from the sibling's mutation when possible,
+          with a full re-diff as the fallback — the payload shape is the
+          same either way.)
 
         A listener's exception propagates normally when it's this cursor's
         own direct mutation call; during a "reorder" broadcast to several
@@ -1358,6 +1360,49 @@ class ModDict:
             orders = mn.cursor("u1.orders")
             orders.connect("insert", lambda diff: model.apply_insert(diff))
             orders.connect("reorder", lambda diff: model.apply_reorder(diff))
+        """
+        ...
+
+    def disconnect(self,
+                   event_type: Literal["insert", "update", "delete", "reorder"] | None = None,
+                   callback: Callable[[Any], None] | None = None) -> int:
+        """
+        Unregister ``connect()`` listeners — the missing other half of
+        ``connect()``. Three granularities:
+
+        - ``disconnect(event_type, callback)`` — remove every registration
+          of *callback* for that event.
+        - ``disconnect(event_type)`` — remove all of that event's listeners.
+        - ``disconnect()`` — remove every listener for every event.
+
+        Returns how many registrations were removed. ``0`` means nothing
+        matched — deliberately reported rather than silently absorbed, so a
+        typo'd event name or an already-disconnected callback is visible to
+        the caller instead of becoming a listener that mysteriously keeps
+        (or stops) firing.
+
+        Callback matching uses ``==``, not identity — ``self.method``
+        produces a fresh bound-method object on every access, and two of
+        those compare equal, so ``c.connect("insert", self.on_insert)`` /
+        ``c.disconnect("insert", self.on_insert)`` pairs up naturally. (The
+        same holds for a Qt Signal's ``.emit``.) A lambda, by contrast, only
+        ever equals the exact object ``connect()`` was given — keep the
+        reference if you plan to disconnect it.
+
+        A listener may call ``disconnect()`` (itself included) from inside
+        its own callback: the dispatch in progress runs on a snapshot, so
+        the change takes effect from the NEXT event, not the current one.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders.connect("insert", self.on_insert)
+            ...
+            removed = orders.disconnect("insert", self.on_insert)  # 1
+            orders.disconnect("reorder")   # drop all reorder listeners
+            orders.disconnect()            # drop everything
         """
         ...
 

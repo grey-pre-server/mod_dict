@@ -1263,6 +1263,55 @@ static PyObject* ModDict_connect(ModDictObject* s, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+// disconnect([event_type[, callback]]) — three granularities in one method:
+// (event, cb) drops every registration equal to cb for that event;
+// (event) drops all of that event's listeners; () drops everything.
+// Always returns how many registrations were removed — 0 is the caller's
+// signal that nothing matched (a silently-absorbed no-op would hide typos
+// and double-disconnect bugs). Callback identity is Py_EQ, not `is`:
+// self.method creates a NEW bound-method object on every attribute access,
+// so an identity check could never match the one stored at connect() time.
+static PyObject* ModDict_disconnect(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "disconnect()");
+    const char* event = nullptr; PyObject* cb = nullptr;
+    if (!PyArg_ParseTuple(args, "|sO", &event, &cb)) return nullptr;
+    if (cb && !PyCallable_Check(cb)) MOD_DICT_RAISE(PyExc_TypeError, "disconnect: callback must be callable");
+    PyObject* all = s->internal->live_connect_listeners;
+    if (!all) return PyLong_FromLong(0);
+    Py_ssize_t removed = 0;
+    if (!event) {
+        PyObject *k, *v; Py_ssize_t pos = 0;
+        while (PyDict_Next(all, &pos, &k, &v)) removed += PyList_GET_SIZE(v);
+        PyDict_Clear(all);
+        return PyLong_FromSsize_t(removed);
+    }
+    PyObject* key = PyUnicode_FromString(event);
+    if (!key) return nullptr;
+    PyObject* listeners = PyDict_GetItem(all, key);  // borrowed
+    if (!listeners) { Py_DECREF(key); return PyLong_FromLong(0); }
+    if (!cb) {
+        removed = PyList_GET_SIZE(listeners);
+        PyDict_DelItem(all, key);
+        Py_DECREF(key);
+        return PyLong_FromSsize_t(removed);
+    }
+    // Backwards, so removals don't shift the yet-unvisited indices.
+    for (Py_ssize_t i = PyList_GET_SIZE(listeners) - 1; i >= 0; i--) {
+        int eq = PyObject_RichCompareBool(PyList_GET_ITEM(listeners, i), cb, Py_EQ);
+        if (eq < 0) { Py_DECREF(key); return nullptr; }
+        if (eq) {
+            if (PyList_SetSlice(listeners, i, i + 1, nullptr) != 0) { Py_DECREF(key); return nullptr; }
+            removed++;
+        }
+    }
+    // An emptied list is dropped from the dict — dispatch_event() then skips
+    // the event on the cheap no-listeners path instead of snapshotting an
+    // empty list every mutation.
+    if (PyList_GET_SIZE(listeners) == 0 && PyDict_DelItem(all, key) != 0) { Py_DECREF(key); return nullptr; }
+    Py_DECREF(key);
+    return PyLong_FromSsize_t(removed);
+}
+
 static PyObject* ModDict_cursor_insert(ModDictObject* s, PyObject* args) {
     MOD_DICT_REQUIRE_CURSOR(s, "insert()");
     PyObject *key, *row;
@@ -2265,6 +2314,7 @@ static PyMethodDef ModDict_methods[]={
     {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(field_or_None)->list[(old_index|None,new_index)] — cursor only"},
     {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(predicate_or_None)->list[(old_index|None,new_index)] — cursor only"},
     {"connect",(PyCFunction)ModDict_connect,METH_VARARGS,"connect(event_type,callback)->None — cursor only; events: insert/update/delete/reorder"},
+    {"disconnect",(PyCFunction)ModDict_disconnect,METH_VARARGS,"disconnect(event_type=None,callback=None)->int — (event,cb): drop that callback; (event): drop the event's listeners; (): drop everything; returns how many were removed (0 = nothing matched); cursor only"},
     {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->(int|None,dict) — (new_index, row); cursor only"},
     {"update_row",(PyCFunction)ModDict_cursor_update_row,METH_VARARGS,"update_row(key,changes)->((old_index|None,new_index|None),changes) — changes: {field:new_value} for fields that actually changed; cursor only"},
     {"delete",(PyCFunction)ModDict_cursor_delete,METH_VARARGS,"delete(key)->int|None — old_index; cursor only"},

@@ -219,21 +219,58 @@ public:
     PyObject* resolve_cursor_dict();
 
     // Recomputes sort_index/filter_membership against cached_anchor_dict's
-    // current contents and diffs against their prior state. Used both for
-    // sibling notification and (full O(n) recompute, not incremental) by
-    // this cursor's own insert()/update_row()/delete(). Assumes
+    // current contents and diffs against their prior state — the full-O(n)
+    // fallback for sibling notification when no mutation hint is available
+    // (RowProxy writes, wholesale rebinds, insert_batch). Assumes
     // resolve_cursor_dict() has already been called.
     IndexDiff resync_and_diff();
 
+    // A mutation's identity, carried from the originating cursor's method to
+    // the sibling notification — the whole reason siblings can update
+    // incrementally instead of full-rebuilding: without it a sibling only
+    // learns "something under this top-level key changed" and its only
+    // correct move is resync_and_diff() (O(n log n) + one filter-predicate
+    // call PER ROW, measured 1137us vs the originator's own 1.8us bisect
+    // path for the same insert). `key` is borrowed for the duration of the
+    // notify call. `key_existed` matters for Insert only: it decides whether
+    // the sibling must O(n)-scan for the old position (overwrite) or can
+    // pure-bisect (new key).
+    struct CursorMutationHint {
+        enum class Kind : uint8_t { Insert, Update, Remove };
+        Kind kind;
+        PyObject* key;
+        bool key_existed;
+    };
+
+    // Applies one hinted mutation to THIS (sibling) cursor's derived state —
+    // same primitives, same order as the originator's own cursor_insert()/
+    // cursor_update_row()/cursor_delete() post-write maintenance, so both
+    // cursors converge on identical index states. Requires has_derived_order
+    // (a maintained snapshot to update); the anchored dict already contains
+    // the mutation. Returns the same diff convention resync_and_diff()
+    // produces (raw sort_index positions, hidden rows omitted, -1 = absent
+    // side) — built only when want_diff (someone listens for "reorder");
+    // index maintenance happens either way. May leave PyErr set (filter
+    // predicate raised) — caller decides whether to clear.
+    IndexDiff sibling_apply_hint(const CursorMutationHint& hint, bool want_diff);
+
     void dispatch_event(const char* event_type, PyObject* payload);
+
+    // True when at least one connect() listener is registered for the event
+    // — lets notify_live_cursors() skip building a diff nobody would see.
+    bool has_listener(const char* event_type) const;
 
     // Notifies every live cursor whose anchor's top segment hash matches
     // `changed_top_hash`, excluding `originator` (the cursor that made the
-    // mutation, which already computes its own diff via resync_and_diff() —
-    // without the exclusion it would get silently resynced here first,
-    // leaving nothing for that explicit call to find). Prunes dead weakrefs
-    // along the way. Only meaningful on a true root.
-    void notify_live_cursors(uint64_t changed_top_hash, ModDict* originator = nullptr);
+    // mutation, which already maintains its own state inline — without the
+    // exclusion it would get silently resynced here first, leaving nothing
+    // for its own maintenance to do). With a `hint`, siblings holding a
+    // maintained snapshot update incrementally via sibling_apply_hint();
+    // hint-less notifications (RowProxy writes, rebinds, batches) and
+    // snapshot-less siblings fall back to resync_and_diff(). Prunes dead
+    // weakrefs along the way. Only meaningful on a true root.
+    void notify_live_cursors(uint64_t changed_top_hash, ModDict* originator = nullptr,
+                             const CursorMutationHint* hint = nullptr);
 
     // Point-mutation API for a cursor: writes through to the anchored dict,
     // reindexes, notifies siblings, and returns only THIS row's own
@@ -305,7 +342,8 @@ public:
     // guarantees the table is fully consistent once it returns.
     // originator: the cursor making the mutation (excluded from its own
     // notify_live_cursors() resync — see that function). nullptr elsewhere.
-    void reindex_row_no_validate(uint64_t outer_hash, ModDict* originator = nullptr);
+    void reindex_row_no_validate(uint64_t outer_hash, ModDict* originator = nullptr,
+                                 const CursorMutationHint* hint = nullptr);
 
     // ──────────────────────────────────────────────────
     // Operations

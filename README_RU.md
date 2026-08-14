@@ -177,6 +177,7 @@ orders.insert_batch({key: row, ...})  # -> list[(int|None, dict)] = [(новая
 orders.insert_batch([row, ...], key="id")  # то же, key= извлекает ключ строки вместо готового {key: row}
 orders.insert_batch([row, ...], key=("user_id", "group_id"))  # кортеж имён полей -> составной ключ-кортеж на строку
 orders.connect("insert" | "update" | "delete" | "reorder", callback)
+orders.disconnect(event?, callback?)  # -> int снятых; (event,cb) / (event) / () — один, все слушатели события, или вообще все
 orders.view_keys() / orders.view_values() / orders.view_items()  # текущий вид с учётом sort/filter — [key] / in / del остаются raw, фильтра не видят
 
 # Обновление из другой коллекции
@@ -438,6 +439,14 @@ orders.connect("reorder", lambda diff: qt_model.apply_reorder(diff))
 # "reorder" — единственное событие, которое отдаёт полный list[(old,new)] —
 # оно летит СИБЛИНГ-курсору в ответ на чужую мутацию, а сиблинг не знает,
 # какая именно строка стала причиной изменения
+
+orders.disconnect("insert", handler)  # -> сколько регистраций снято (0 = ничего не совпало)
+orders.disconnect("reorder")          # снять все слушатели одного события
+orders.disconnect()                   # снять вообще всё
+# сопоставление по ==, не по идентичности — self.method / signal.emit
+# естественно спариваются между connect/disconnect; слушатель может отписать
+# сам себя прямо из колбэка (подействует со СЛЕДУЮЩЕГО события — текущая
+# рассылка идёт по снапшоту)
 ```
 
 Несколько независимых курсоров могут указывать на один и тот же anchor —
