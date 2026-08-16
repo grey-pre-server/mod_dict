@@ -132,6 +132,61 @@ static void write_u32_at(std::vector<uint8_t>& buf, size_t pos, uint32_t val) {
     buf[pos+3] = (val >> 24) & 0xFF;
 }
 
+// Writes one TypeId::WKB record from a WKB-carrying object (bytes, or a
+// memoryview as geoalchemy2's WKBElement.data often is). Raises (PyErr set,
+// nothing written) if the object can't be viewed as bytes — never the old
+// "swallow the error and write None" path, which turned a geometry into a
+// silent None.
+//
+// SRID: geoalchemy2/shapely keep the SRID as an ATTRIBUTE unless the bytes
+// are already EWKB (extended=True, what PostGIS returns) — plain WKB bytes
+// don't carry it, so rebuilding from raw bytes alone silently reset it to
+// -1. Rather than adding an SRID field to the container format (a format
+// change), fold it into the bytes: upgrade plain WKB to EWKB in-stream by
+// setting the SRID flag in the geometry-type word and inserting the 4-byte
+// SRID after it. Both geoalchemy2 (WKBElement autodetects the flag) and
+// shapely (wkb.loads reads it) reconstruct SRID from EWKB unaided. Bytes
+// that are already EWKB pass through untouched.
+static const uint32_t EWKB_SRID_FLAG = 0x20000000u;
+
+static void write_wkb_value(std::vector<uint8_t>& buf, PyObject* wkb_obj, long srid) {
+    PyObject* b = PyBytes_Check(wkb_obj) ? (Py_INCREF(wkb_obj), wkb_obj) : PyObject_Bytes(wkb_obj);
+    if (!b) return;  // PyErr set
+    const uint8_t* p = (const uint8_t*)PyBytes_AS_STRING(b);
+    size_t len = (size_t)PyBytes_GET_SIZE(b);
+
+    // Only touch the header when we have an SRID to add and the bytes are a
+    // well-formed WKB header (1 byte order + 4 byte type) without the flag.
+    bool need_srid = (srid >= 0) && len >= 5;
+    uint32_t gtype = 0;
+    bool little = false;
+    if (need_srid) {
+        little = (p[0] == 1);
+        gtype = little ? (uint32_t)p[1] | ((uint32_t)p[2] << 8) | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24)
+                       : (uint32_t)p[4] | ((uint32_t)p[3] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 24);
+        if (gtype & EWKB_SRID_FLAG) need_srid = false;  // already EWKB — leave as is
+    }
+
+    buf.push_back(to_byte(TypeId::WKB));
+    if (!need_srid) {
+        write_u32(buf, (uint32_t)len);
+        write_bytes(buf, p, len);
+    } else {
+        write_u32(buf, (uint32_t)(len + 4));
+        buf.push_back(p[0]);
+        uint32_t t = gtype | EWKB_SRID_FLAG;
+        uint32_t s = (uint32_t)srid;
+        auto put = [&](uint32_t v) {
+            if (little) { buf.push_back(v & 0xFF); buf.push_back((v >> 8) & 0xFF); buf.push_back((v >> 16) & 0xFF); buf.push_back((v >> 24) & 0xFF); }
+            else        { buf.push_back((v >> 24) & 0xFF); buf.push_back((v >> 16) & 0xFF); buf.push_back((v >> 8) & 0xFF); buf.push_back(v & 0xFF); }
+        };
+        put(t);
+        put(s);
+        write_bytes(buf, p + 5, len - 5);
+    }
+    Py_DECREF(b);
+}
+
 /* ============================================================================
    serialize_pyobj — direct PyObject* serialization without ModValue overhead.
    No Py_INCREF/Py_DECREF, no content_hash_pyobj, no PyObject_Repr for dicts.
@@ -244,16 +299,9 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
     if (PyObject_TypeCheck(obj, &ShapelyWKB_Type) || PyObject_TypeCheck(obj, &GeoAlchemyWKB_Type)) {
         const char* attr = PyObject_TypeCheck(obj, &ShapelyWKB_Type) ? "wkb" : "data";
         PyObject* b = PyObject_GetAttrString(obj, attr);
-        if (b && PyBytes_Check(b)) {
-            Py_ssize_t len = PyBytes_GET_SIZE(b);
-            buf.push_back(to_byte(TypeId::WKB));
-            write_u32(buf, (uint32_t)len);
-            write_bytes(buf, (const uint8_t*)PyBytes_AS_STRING(b), (size_t)len);
-        } else {
-            PyErr_Clear();
-            buf.push_back(to_byte(TypeId::NONE)); write_u32(buf, 0);
-        }
-        Py_XDECREF(b);
+        if (!b) return;  // PyErr set — fail loud, same as any unsupported type
+        write_wkb_value(buf, b, -1);  // our own wrappers carry no SRID attribute
+        Py_DECREF(b);
         return;
     }
 
@@ -380,23 +428,46 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
             bool is_shapely = strncmp(mname, "shapely", 7) == 0;
             Py_DECREF(tp_mod);
             PyObject* wkb;
+            long srid = -1;
             if (is_shapely) {
+                // .wkb is PLAIN WKB — shapely 2.x keeps the SRID out of it
+                // (no .srid attribute either; only shapely.get_srid()), so
+                // it was silently dropped on every round-trip. Read it via
+                // get_srid and fold it into EWKB like the geoalchemy branch.
                 wkb = PyObject_GetAttrString(obj, "wkb");
+                PyObject* sh = PyImport_ImportModule("shapely");
+                PyObject* s = sh ? PyObject_CallMethod(sh, "get_srid", "O", obj) : nullptr;
+                if (s) {
+                    // get_srid returns a numpy scalar (numpy.intc), NOT a
+                    // Python int — PyLong_Check rejects it. PyNumber_Long
+                    // coerces anything with __index__/__int__.
+                    PyObject* as_long = PyNumber_Long(s);
+                    if (as_long) { srid = PyLong_AsLong(as_long); Py_DECREF(as_long); }
+                    else PyErr_Clear();
+                    Py_DECREF(s);
+                }
+                else PyErr_Clear();  // older shapely without get_srid — no SRID to carry
+                Py_XDECREF(sh);
+                if (srid == 0) srid = -1;  // shapely's "unset" is 0, not -1 — don't tag SRID=0
             } else {
-                PyObject* desc = PyObject_GetAttrString(obj, "desc");
-                wkb = desc ? PyObject_Bytes(desc) : nullptr;
-                Py_XDECREF(desc);
+                // WKBElement: `.data` is the WKB (bytes OR memoryview);
+                // `.desc` — what this read before — is the HEX STRING
+                // representation, so PyObject_Bytes(desc) raised TypeError,
+                // which was then swallowed and the geometry written as None.
+                // A geoalchemy2 geometry serialized to None, silently.
+                wkb = PyObject_GetAttrString(obj, "data");
+                PyObject* s = PyObject_GetAttrString(obj, "srid");
+                if (s) {
+                    PyObject* as_long = PyNumber_Long(s);  // tolerate numpy ints here too
+                    if (as_long) { srid = PyLong_AsLong(as_long); Py_DECREF(as_long); }
+                    else PyErr_Clear();
+                    Py_DECREF(s);
+                }
+                else PyErr_Clear();
             }
-            if (wkb && PyBytes_Check(wkb)) {
-                Py_ssize_t len = PyBytes_GET_SIZE(wkb);
-                buf.push_back(to_byte(TypeId::WKB));
-                write_u32(buf, (uint32_t)len);
-                write_bytes(buf, (const uint8_t*)PyBytes_AS_STRING(wkb), (size_t)len);
-            } else {
-                PyErr_Clear();
-                buf.push_back(to_byte(TypeId::NONE)); write_u32(buf, 0);
-            }
-            Py_XDECREF(wkb);
+            if (!wkb) return;  // PyErr set — fail loud
+            write_wkb_value(buf, wkb, srid);
+            Py_DECREF(wkb);
             return;
         }
 

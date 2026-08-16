@@ -1872,6 +1872,15 @@ def set_geo_backend(name: Literal["shapely", "geoalchemy2", "wkb_bytes"] | None)
 
     - ``"shapely"`` — a shapely geometry object.
     - ``"geoalchemy2"`` — a ``geoalchemy2.WKBElement``.
+
+    **SRID survives.** Both libraries keep the SRID *outside* the WKB bytes
+    unless the value is already EWKB (``extended=True`` — what PostGIS
+    returns), so serializing the raw bytes alone would silently reset it to
+    ``-1`` on the way back. Instead, a known SRID is folded into the bytes
+    on write (plain WKB → EWKB: SRID flag in the geometry-type word plus
+    the 4-byte SRID); both libraries read it back from EWKB unaided, and
+    ``"wkb_bytes"`` hands you EWKB — the same bytes PostGIS itself would.
+    Bytes that are already EWKB pass through untouched.
     - ``"wkb_bytes"`` — the raw WKB ``bytes``, unparsed. Needs neither
       library installed, and skips the per-value parse/allocate cost
       entirely — the right choice when the value is only being relayed
