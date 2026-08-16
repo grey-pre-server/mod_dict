@@ -18,7 +18,64 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj);
 // ── WKB geometry deserialize backend preference ───────────────────────────────
 static std::string s_geo_backend;  // empty = unset (auto-detect)
 
+// Process-wide cache of "which geo libraries exist, and the callable that
+// reconstructs a value" — resolved ONCE, on the first reconstruct after
+// (re)configuration, then reused for every subsequent value.
+//
+// Without this, reconstruct_wkb() re-ran PyImport_ImportModule("shapely.wkb")
+// AND PyImport_ImportModule("geoalchemy2") for EVERY geometry deserialized.
+// A successful import is a cheap sys.modules hit, but a FAILED one is not
+// cached anywhere — CPython walks the whole sys.path finder chain and builds
+// then discards an ImportError each time. In a shapely-only environment that
+// meant a guaranteed-failing geoalchemy2 probe per value: measured 498us per
+// point of which shapely.wkb.loads itself was 5us — 99% of deserialize time
+// was probing for a library that isn't there. 10k points: 5.7s.
+//
+// Invalidated by set_geo_backend() (any call, including None) so a library
+// installed mid-process and then selected is picked up on the next
+// reconstruct rather than being stuck as "absent" forever.
+struct GeoLibCache {
+    bool resolved = false;
+    bool has_shapely = false;
+    bool has_geoalchemy = false;
+    PyObject* shapely_loads = nullptr;   // owned: shapely.wkb.loads
+    PyObject* shapely_get_srid = nullptr;// owned: shapely.get_srid (write side; may stay null on old shapely)
+    PyObject* wkbelement_cls = nullptr;  // owned: geoalchemy2.WKBElement
+    void clear() {
+        Py_CLEAR(shapely_loads);
+        Py_CLEAR(shapely_get_srid);
+        Py_CLEAR(wkbelement_cls);
+        resolved = has_shapely = has_geoalchemy = false;
+    }
+    void resolve() {
+        clear();
+        PyObject* sh = PyImport_ImportModule("shapely.wkb");
+        if (sh) {
+            shapely_loads = PyObject_GetAttrString(sh, "loads");
+            has_shapely = (shapely_loads != nullptr);
+            if (!has_shapely) PyErr_Clear();
+            Py_DECREF(sh);
+            PyObject* top = PyImport_ImportModule("shapely");
+            if (top) {
+                shapely_get_srid = PyObject_GetAttrString(top, "get_srid");
+                if (!shapely_get_srid) PyErr_Clear();  // pre-2.0 shapely — no SRID to carry
+                Py_DECREF(top);
+            } else PyErr_Clear();
+        } else PyErr_Clear();
+        PyObject* ga = PyImport_ImportModule("geoalchemy2");
+        if (ga) {
+            wkbelement_cls = PyObject_GetAttrString(ga, "WKBElement");
+            has_geoalchemy = (wkbelement_cls != nullptr);
+            if (!has_geoalchemy) PyErr_Clear();
+            Py_DECREF(ga);
+        } else PyErr_Clear();
+        resolved = true;
+    }
+};
+static GeoLibCache s_geo_libs;
+
 bool set_geo_backend(const char* name) {
+    s_geo_libs.clear();  // re-probe on next reconstruct — see GeoLibCache
     if (!name) { s_geo_backend.clear(); return true; }
     // "wkb_bytes" hands back the raw WKB unparsed — needs no library, so it
     // skips the installed-check below. Without it, raw bytes were reachable
@@ -50,26 +107,21 @@ const char* get_geo_backend() {
 // Honors an explicit set_geo_backend() preference; otherwise auto-detects
 // among whichever of {shapely, geoalchemy2} is importable — falls back to
 // the raw bytes if neither is installed, raises if both are (ambiguous,
-// caller must disambiguate via set_geo_backend()).
+// caller must disambiguate via set_geo_backend()). Library presence and
+// the reconstructing callables come from GeoLibCache — resolved once, not
+// per value.
 static PyObject* reconstruct_wkb(PyObject* wkb) {
     const char* pref = get_geo_backend();
-    // Answered before the import probing below — "wkb_bytes" deliberately
-    // needs neither library, so don't pay for finding out whether they exist.
+    // Answered before touching the library cache — "wkb_bytes" deliberately
+    // needs neither library, so don't even resolve whether they exist.
     if (pref && strcmp(pref, "wkb_bytes") == 0) {
         Py_INCREF(wkb);
         return wkb;
     }
 
-    bool has_shapely    = false;
-    bool has_geoalchemy = false;
-    {
-        PyObject* m = PyImport_ImportModule("shapely.wkb");
-        if (m) { has_shapely = true; Py_DECREF(m); } else PyErr_Clear();
-    }
-    {
-        PyObject* m = PyImport_ImportModule("geoalchemy2");
-        if (m) { has_geoalchemy = true; Py_DECREF(m); } else PyErr_Clear();
-    }
+    if (!s_geo_libs.resolved) s_geo_libs.resolve();
+    bool has_shapely    = s_geo_libs.has_shapely;
+    bool has_geoalchemy = s_geo_libs.has_geoalchemy;
 
     bool want_shapely;
     if (pref) {
@@ -103,18 +155,9 @@ static PyObject* reconstruct_wkb(PyObject* wkb) {
         want_shapely = has_shapely;
     }
 
-    PyObject* result = nullptr;
-    if (want_shapely) {
-        PyObject* sh = PyImport_ImportModule("shapely.wkb");
-        result = sh ? PyObject_CallMethod(sh, "loads", "O", wkb) : nullptr;
-        Py_XDECREF(sh);
-    } else {
-        PyObject* ga  = PyImport_ImportModule("geoalchemy2");
-        PyObject* cls = ga ? PyObject_GetAttrString(ga, "WKBElement") : nullptr;
-        result = cls ? PyObject_CallOneArg(cls, wkb) : nullptr;
-        Py_XDECREF(cls); Py_XDECREF(ga);
-    }
-    return result;
+    // Direct call on the cached callable — no import, no attribute lookup.
+    return want_shapely ? PyObject_CallOneArg(s_geo_libs.shapely_loads, wkb)
+                        : PyObject_CallOneArg(s_geo_libs.wkbelement_cls, wkb);
 }
 
 static void backfill_length(std::vector<uint8_t>& buf, size_t len_pos) {
@@ -435,8 +478,11 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
                 // it was silently dropped on every round-trip. Read it via
                 // get_srid and fold it into EWKB like the geoalchemy branch.
                 wkb = PyObject_GetAttrString(obj, "wkb");
-                PyObject* sh = PyImport_ImportModule("shapely");
-                PyObject* s = sh ? PyObject_CallMethod(sh, "get_srid", "O", obj) : nullptr;
+                // get_srid comes from the same once-resolved cache the read
+                // side uses — no per-value import/attribute lookup.
+                if (!s_geo_libs.resolved) s_geo_libs.resolve();
+                PyObject* s = s_geo_libs.shapely_get_srid
+                            ? PyObject_CallOneArg(s_geo_libs.shapely_get_srid, obj) : nullptr;
                 if (s) {
                     // get_srid returns a numpy scalar (numpy.intc), NOT a
                     // Python int — PyLong_Check rejects it. PyNumber_Long
@@ -446,8 +492,7 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
                     else PyErr_Clear();
                     Py_DECREF(s);
                 }
-                else PyErr_Clear();  // older shapely without get_srid — no SRID to carry
-                Py_XDECREF(sh);
+                else PyErr_Clear();  // no get_srid (pre-2.0 shapely) or it raised — no SRID to carry
                 if (srid == 0) srid = -1;  // shapely's "unset" is 0, not -1 — don't tag SRID=0
             } else {
                 // WKBElement: `.data` is the WKB (bytes OR memoryview);
