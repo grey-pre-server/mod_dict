@@ -1582,12 +1582,65 @@ Py_ssize_t ModDict::reposition_in_sort_index(PyObject* key, Py_ssize_t old_pos) 
     return bisect_insert_sort_index(key);
 }
 
-Py_ssize_t ModDict::find_sort_index_position(PyObject* key) const {
-    if (!has_derived_order) return -1;
-    uint64_t h = content_hash_pyobj(key);
-    for (size_t i = 0; i < sort_index.size(); i++)
-        if (content_hash_pyobj(sort_index[i]) == h) return (Py_ssize_t)i;
+ModDict::SortKeyValues ModDict::capture_sort_key_values(PyObject* row) const {
+    SortKeyValues v;
+    if (row) {
+        if (!group_field.empty()) {
+            PyObject* fv = read_field_path(row, group_field_py);
+            v.group_val = fv ? ModValue::from_pyobject_for_compare(fv) : ModValue();
+        }
+        if (!sort_field.empty()) {
+            PyObject* fv = read_field_path(row, sort_field_py);
+            v.sort_val = fv ? ModValue::from_pyobject_for_compare(fv) : ModValue();
+        }
+    }
+    return v;
+}
+
+// Shared by find_sort_index_position()/find_visible_index_position() — see
+// the header comment on the former for the strategy.
+static Py_ssize_t locate_key(const ModDict* self, const std::vector<PyObject*>& vec,
+                             PyObject* key, const ModDict::SortKeyValues* old_vals) {
+    // Cheap identity/equality test — sort_index holds the SAME key objects
+    // the anchored dict does, so `is` hits almost always; the rich-compare
+    // only runs for an equal-but-distinct object (e.g. a fresh tuple key).
+    auto is_key = [&](PyObject* cand) -> bool {
+        if (cand == key) return true;
+        int eq = PyObject_RichCompareBool(cand, key, Py_EQ);
+        if (eq < 0) { PyErr_Clear(); return false; }
+        return eq == 1;
+    };
+
+    bool has_cmp = !self->sort_field.empty() || !self->group_field.empty();
+    if (has_cmp && old_vals) {
+        // Bisect to the first element NOT less than the old values, then walk
+        // the run of equal-valued neighbours until the key turns up. The run
+        // is normally length 1; ties (duplicate sort values) are what the
+        // walk is for.
+        auto lo = std::lower_bound(vec.begin(), vec.end(), *old_vals,
+            [&](PyObject* a, const ModDict::SortKeyValues& ov) {
+                ModDict::SortKeyValues av = self->capture_sort_key_values(
+                    PyDict_GetItem(self->cached_anchor_dict, a));  // borrowed
+                return self->less_by_values(av.group_val, ov.group_val, av.sort_val, ov.sort_val);
+            });
+        for (auto it = lo; it != vec.end(); ++it) {
+            if (is_key(*it)) return (Py_ssize_t)(it - vec.begin());
+            // Left the equal run without finding it — the row's stored value
+            // no longer matches (mutated behind the cursor's back); fall
+            // through to the linear scan rather than report absent.
+            ModDict::SortKeyValues cv = self->capture_sort_key_values(
+                PyDict_GetItem(self->cached_anchor_dict, *it));
+            if (self->less_by_values(old_vals->group_val, cv.group_val, old_vals->sort_val, cv.sort_val)) break;
+        }
+    }
+    for (size_t i = 0; i < vec.size(); i++)
+        if (is_key(vec[i])) return (Py_ssize_t)i;
     return -1;
+}
+
+Py_ssize_t ModDict::find_sort_index_position(PyObject* key, const SortKeyValues* old_vals) const {
+    if (!has_derived_order) return -1;
+    return locate_key(this, sort_index, key, old_vals);
 }
 
 void ModDict::rebuild_filter_membership() {
@@ -1648,11 +1701,8 @@ Py_ssize_t ModDict::reposition_in_visible_index(PyObject* key, Py_ssize_t old_po
     return bisect_insert_visible_index(key);
 }
 
-Py_ssize_t ModDict::find_visible_index_position(PyObject* key) const {
-    uint64_t h = content_hash_pyobj(key);
-    for (size_t i = 0; i < visible_index.size(); i++)
-        if (content_hash_pyobj(visible_index[i]) == h) return (Py_ssize_t)i;
-    return -1;
+Py_ssize_t ModDict::find_visible_index_position(PyObject* key, const SortKeyValues* old_vals) const {
+    return locate_key(this, visible_index, key, old_vals);
 }
 
 ModDict::IndexDiff ModDict::set_sort(const std::vector<std::string>& field, bool reverse) {
@@ -1882,10 +1932,16 @@ ModDict::IndexDiff ModDict::sibling_apply_hint(const CursorMutationHint& hint, b
     uint64_t h = content_hash_pyobj(hint.key);
     const FlatHashMap<uint64_t, char>* membership = filter_predicate ? &filter_membership : nullptr;
 
+    // The row's values as THIS cursor sorts them, taken from the pre-mutation
+    // snapshot the originator passed along — lets both lookups below bisect
+    // instead of scanning (see find_sort_index_position).
+    SortKeyValues old_vals = capture_sort_key_values(hint.old_row);
+    const SortKeyValues* ov = hint.old_row ? &old_vals : nullptr;
+
     if (hint.kind == CursorMutationHint::Kind::Remove) {
-        Py_ssize_t raw_pos = find_sort_index_position(hint.key);
+        Py_ssize_t raw_pos = find_sort_index_position(hint.key, ov);
         bool was_visible = !filter_predicate || filter_membership.find(h);
-        Py_ssize_t vis_pos = (filter_predicate && was_visible) ? find_visible_index_position(hint.key) : -1;
+        Py_ssize_t vis_pos = (filter_predicate && was_visible) ? find_visible_index_position(hint.key, ov) : -1;
         if (raw_pos >= 0) erase_from_sort_index(raw_pos);
         if (filter_predicate) {
             filter_membership.erase(h);
@@ -1903,12 +1959,11 @@ ModDict::IndexDiff ModDict::sibling_apply_hint(const CursorMutationHint& hint, b
     PyObject* row = PyDict_GetItem(d, hint.key);  // borrowed
     if (!row) return diff;  // hint out of step with the data — nothing safe to apply
     bool existed = (hint.kind == CursorMutationHint::Kind::Update) || hint.key_existed;
-    // Same O(1)-before-O(n) reasoning as cursor_insert(): a brand-new key's
-    // old position is trivially -1, no scan needed.
-    Py_ssize_t raw_old = existed ? find_sort_index_position(hint.key) : -1;
+    // A brand-new key's old position is trivially -1, no lookup needed.
+    Py_ssize_t raw_old = existed ? find_sort_index_position(hint.key, ov) : -1;
     bool was_visible = filter_predicate ? (existed && filter_membership.find(h) != nullptr)
                                         : (raw_old >= 0);
-    Py_ssize_t vis_old = (filter_predicate && was_visible) ? find_visible_index_position(hint.key) : -1;
+    Py_ssize_t vis_old = (filter_predicate && was_visible) ? find_visible_index_position(hint.key, ov) : -1;
 
     Py_ssize_t raw_new = reposition_in_sort_index(hint.key, raw_old);
     bool now_visible = true;
@@ -1999,22 +2054,30 @@ Py_ssize_t ModDict::cursor_insert(PyObject* key, PyObject* row) {
     // nothing meaningful to distinguish from "after". Only matters on first
     // use; a no-op once already active.
     if (!has_derived_order) rebuild_sort_index();
-    // O(1) check first — find_sort_index_position() is an O(n) scan, only
-    // worth paying when the key genuinely already exists (an overwrite); a
+    // O(1) check first — the position lookup is only needed when the key
+    // genuinely already exists (an overwrite); a
     // brand-new key's old_pos is trivially -1, no search needed.
     bool key_exists = PyDict_Contains(d, key);
-    Py_ssize_t old_pos = key_exists ? find_sort_index_position(key) : -1;
+    // Overwrite: the OLD row is still in the dict here — capture its values
+    // so the old position is a bisect, not a scan.
+    SortKeyValues old_vals = key_exists ? capture_sort_key_values(PyDict_GetItem(d, key)) : SortKeyValues();
+    Py_ssize_t old_pos = key_exists ? find_sort_index_position(key, &old_vals) : -1;
     uint64_t h = content_hash_pyobj(key);
     bool was_visible = filter_predicate && key_exists && filter_membership.find(h);
-    Py_ssize_t vis_old_pos = was_visible ? find_visible_index_position(key) : -1;
+    Py_ssize_t vis_old_pos = was_visible ? find_visible_index_position(key, &old_vals) : -1;
 
-    if (PyDict_SetItem(d, key, row) != 0) return -1;
+    // On overwrite, hold the OLD row across the notify so siblings can bisect
+    // for its old position; PyDict_SetItem below drops the dict's reference.
+    PyObject* old_row = key_exists ? PyDict_GetItem(d, key) : nullptr;  // borrowed
+    Py_XINCREF(old_row);
+    if (PyDict_SetItem(d, key, row) != 0) { Py_XDECREF(old_row); return -1; }
     // Notifies siblings (excluding `this`, via originator) — reindex_row_no_
     // validate() already does this; a second explicit call here would
     // re-notify the same siblings a second time for nothing. The hint lets
     // each sibling update incrementally instead of full-rebuilding.
-    CursorMutationHint hint{CursorMutationHint::Kind::Insert, key, key_exists};
+    CursorMutationHint hint{CursorMutationHint::Kind::Insert, key, key_exists, old_row};
     true_root()->reindex_row_no_validate(cached_top_hash, this, &hint);
+    Py_XDECREF(old_row);
 
     // Repositioning handles both a genuinely new key (old_pos=-1, pure
     // bisect-insert) and an overwrite of an existing key (erase + reinsert
@@ -2045,17 +2108,26 @@ std::pair<Py_ssize_t,Py_ssize_t> ModDict::cursor_update_row(PyObject* key, PyObj
     if (!row) { PyErr_SetObject(PyExc_KeyError, key); return {-1, -1}; }
     if (!has_derived_order) rebuild_sort_index();  // see cursor_insert() comment
 
-    Py_ssize_t raw_old_pos = find_sort_index_position(key);
+    // Capture the row's sort-relevant values NOW — the in-place PyDict_Update
+    // below overwrites them, and they're what lets the old position be found
+    // by bisect instead of a full scan.
+    SortKeyValues old_vals = capture_sort_key_values(row);
+    Py_ssize_t raw_old_pos = find_sort_index_position(key, &old_vals);
     uint64_t h = content_hash_pyobj(key);
     bool was_visible = !filter_predicate || filter_membership.find(h);
-    Py_ssize_t vis_old_pos = (filter_predicate && was_visible) ? find_visible_index_position(key) : -1;
+    Py_ssize_t vis_old_pos = (filter_predicate && was_visible) ? find_visible_index_position(key, &old_vals) : -1;
     // Reported positions must agree with what len()/.at() mean under an
     // active filter (visible_index), not sort_index's raw position.
     Py_ssize_t old_pos = filter_predicate ? (was_visible ? vis_old_pos : -1) : raw_old_pos;
 
-    if (PyDict_Update(row, changes) != 0) return {-1, -1};
-    CursorMutationHint hint{CursorMutationHint::Kind::Update, key, true};
+    // Shallow snapshot of the row BEFORE the in-place update — the only way
+    // siblings can still see its old field values (and thus its old position).
+    PyObject* old_row = PyDict_Copy(row);
+    if (!old_row) return {-1, -1};
+    if (PyDict_Update(row, changes) != 0) { Py_DECREF(old_row); return {-1, -1}; }
+    CursorMutationHint hint{CursorMutationHint::Kind::Update, key, true, old_row};
     true_root()->reindex_row_no_validate(cached_top_hash, this, &hint);  // notifies siblings — see cursor_insert() comment
+    Py_DECREF(old_row);
 
     // Only this row's field values changed — every other row's relative
     // order is unaffected, so erase+reinsert (O(log n)+O(shift)) is enough;
@@ -2077,20 +2149,24 @@ std::pair<Py_ssize_t,Py_ssize_t> ModDict::cursor_update_row(PyObject* key, PyObj
 Py_ssize_t ModDict::cursor_delete(PyObject* key) {
     PyObject* d = resolve_cursor_dict();
     if (!d) return -1;
-    if (!PyDict_Contains(d, key)) { PyErr_SetObject(PyExc_KeyError, key); return -1; }
+    PyObject* row = PyDict_GetItem(d, key);  // borrowed; still intact until PyDict_DelItem below
+    if (!row) { PyErr_SetObject(PyExc_KeyError, key); return -1; }
     if (!has_derived_order) rebuild_sort_index();  // see cursor_insert() comment
 
-    Py_ssize_t raw_pos = find_sort_index_position(key);
+    SortKeyValues old_vals = capture_sort_key_values(row);
+    Py_ssize_t raw_pos = find_sort_index_position(key, &old_vals);
     uint64_t h = content_hash_pyobj(key);
     bool was_visible = !filter_predicate || filter_membership.find(h);
-    Py_ssize_t vis_pos = (filter_predicate && was_visible) ? find_visible_index_position(key) : -1;
+    Py_ssize_t vis_pos = (filter_predicate && was_visible) ? find_visible_index_position(key, &old_vals) : -1;
     // Same reasoning as cursor_update_row(): report the visible_index
     // position, not sort_index's raw one, when a filter is active.
     Py_ssize_t old_pos = filter_predicate ? (was_visible ? vis_pos : -1) : raw_pos;
 
-    if (PyDict_DelItem(d, key) != 0) return -1;
-    CursorMutationHint hint{CursorMutationHint::Kind::Remove, key, true};
+    Py_INCREF(row);  // keep the removed row alive across the sibling notify
+    if (PyDict_DelItem(d, key) != 0) { Py_DECREF(row); return -1; }
+    CursorMutationHint hint{CursorMutationHint::Kind::Remove, key, true, row};
     true_root()->reindex_row_no_validate(cached_top_hash, this, &hint);  // notifies siblings — see cursor_insert() comment
+    Py_DECREF(row);
 
     // Removing one row doesn't change the relative order of the rest — an
     // O(shift) erase is enough, no need to re-sort everyone via a full

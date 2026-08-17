@@ -173,11 +173,25 @@ public:
     // needed. O(log n) search + O(shift distance), vs. a full O(n log n) rebuild.
     Py_ssize_t reposition_in_sort_index(PyObject* key, Py_ssize_t old_pos);
 
-    // O(n) scan for `key`'s position in sort_index, -1 if absent. Called
-    // once per mutation (see bisect_insert_sort_index's comment for why a
-    // maintained position map isn't worth it here) — already the same order
-    // as the shift the caller is about to do anyway.
-    Py_ssize_t find_sort_index_position(PyObject* key) const;
+    // A row's sort-relevant field values, captured BEFORE a mutation so the
+    // row's OLD position can still be located afterwards (once the row dict
+    // is updated in place, its old values are gone).
+    struct SortKeyValues { ModValue group_val; ModValue sort_val; };
+    SortKeyValues capture_sort_key_values(PyObject* row) const;
+
+    // Position of `key` in sort_index, -1 if absent.
+    //
+    // With a sort/group field active AND `old_vals` supplied, this is an
+    // O(log n) bisect on the values (sort_index is ordered by exactly those)
+    // followed by a walk of the equal-valued run to find the key — the
+    // OLD-value lookup update_row()/delete() need. Without a comparator
+    // (natural order, no set_sort/set_group) or without old_vals it falls
+    // back to a linear scan — but a cheap one: pointer identity first
+    // (sort_index holds the very key objects the anchored dict holds), then
+    // rich-equality only on a pointer miss; the previous scan re-hashed EVERY
+    // key on EVERY call, which is what made update_row() ~20x slower than
+    // insert() at 50k rows (bench_cursor_vs_root.py, 2026-08-17).
+    Py_ssize_t find_sort_index_position(PyObject* key, const SortKeyValues* old_vals = nullptr) const;
 
     // Rebuilds filter_membership from filter_predicate; leaves PyErr set and
     // returns early if the predicate raises.
@@ -209,7 +223,7 @@ public:
     Py_ssize_t bisect_insert_visible_index(PyObject* key);
     void erase_from_visible_index(Py_ssize_t pos);
     Py_ssize_t reposition_in_visible_index(PyObject* key, Py_ssize_t old_pos);
-    Py_ssize_t find_visible_index_position(PyObject* key) const;
+    Py_ssize_t find_visible_index_position(PyObject* key, const SortKeyValues* old_vals = nullptr) const;
 
     // Re-resolves the anchored dict fresh every call (never cache the raw
     // pointer). If it differs from cached_anchor_dict, the anchor was
@@ -240,6 +254,14 @@ public:
         Kind kind;
         PyObject* key;
         bool key_existed;
+        // The row AS IT WAS before the mutation (borrowed for the notify
+        // call; nullptr for a brand-new Insert). Siblings need it to locate
+        // the row's OLD position by bisect on their OWN sort fields — which
+        // the originator can't precompute for them, since every cursor sorts
+        // by its own field. Update mutates the row dict in place, so the
+        // originator hands over a shallow snapshot; Remove keeps the removed
+        // row alive across the notify with an INCREF.
+        PyObject* old_row;
     };
 
     // Applies one hinted mutation to THIS (sibling) cursor's derived state —

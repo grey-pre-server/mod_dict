@@ -1697,9 +1697,17 @@ class ModDict:
         Serialize the entire ModDict to a compact binary format.
 
         The format preserves all supported types including datetime, date,
-        time, bytes, bytearray, pathlib paths, set, frozenset, tuple, uuid.UUID,
-        Decimal, and WKB geometry (shapely / geoalchemy2 — see
-        ``set_geo_backend()``).
+        time, timedelta, bytes, bytearray, pathlib paths, set, frozenset,
+        tuple, uuid.UUID, Decimal, and WKB geometry (shapely / geoalchemy2 —
+        see ``set_geo_backend()``).
+
+        Temporal values round-trip **exactly**: a naive ``datetime`` comes
+        back as written (wall clock, no local-timezone interpretation on
+        either side), a tz-aware one keeps its UTC offset, any year 1..9999
+        is representable at microsecond precision, and ``time`` keeps its
+        ``tzinfo``. Non-value objects from the ``datetime`` module
+        (``timezone``, ``tzinfo``) are not serializable and raise
+        ``TypeError``.
 
         Any other type (arbitrary Python objects with no registered converter)
         is **not** serializable and raises ``TypeError`` — register a

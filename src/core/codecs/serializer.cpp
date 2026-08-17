@@ -74,6 +74,58 @@ struct GeoLibCache {
 };
 static GeoLibCache s_geo_libs;
 
+// Same lesson as GeoLibCache, applied to the STANDARD-library constructors
+// the deserializer needs — datetime.datetime/date/time, decimal.Decimal,
+// pathlib.Pure*Path/Path, uuid.UUID. These imports always succeed (cheap
+// sys.modules hit) so it was never the 100x geo disaster, but
+// PyImport_ImportModule + PyObject_GetAttrString per VALUE still made a
+// short datetime/Decimal/UUID/Path cost 5-20x a small int on the way back
+// in (bench_serialize_types.py). Resolved once per process; these modules
+// can't be un-imported, so no invalidation is needed. Any member left null
+// (import failed — shouldn't happen for the stdlib) simply falls back to
+// "couldn't rebuild → None", the same outcome the per-value code had.
+struct StdCtorCache {
+    bool resolved = false;
+    PyObject* datetime_cls = nullptr;
+    PyObject* date_cls = nullptr;
+    PyObject* time_cls = nullptr;
+    PyObject* timedelta_cls = nullptr;
+    PyObject* timezone_cls = nullptr;
+    PyObject* epoch_naive = nullptr;     // datetime(1970,1,1) — the zero point for naive µs
+    PyObject* decimal_cls = nullptr;
+    PyObject* uuid_cls = nullptr;
+    PyObject* path_cls = nullptr;
+    PyObject* posix_path_cls = nullptr;
+    PyObject* windows_path_cls = nullptr;
+    void resolve() {
+        auto grab = [](const char* mod, const char* attr) -> PyObject* {
+            PyObject* m = PyImport_ImportModule(mod);
+            if (!m) { PyErr_Clear(); return nullptr; }
+            PyObject* a = PyObject_GetAttrString(m, attr);
+            if (!a) PyErr_Clear();
+            Py_DECREF(m);
+            return a;  // owned
+        };
+        datetime_cls     = grab("datetime", "datetime");
+        date_cls         = grab("datetime", "date");
+        time_cls         = grab("datetime", "time");
+        timedelta_cls    = grab("datetime", "timedelta");
+        timezone_cls     = grab("datetime", "timezone");
+        if (datetime_cls) {
+            epoch_naive = PyObject_CallFunction(datetime_cls, "iii", 1970, 1, 1);
+            if (!epoch_naive) PyErr_Clear();
+        }
+        decimal_cls      = grab("decimal", "Decimal");
+        uuid_cls         = grab("uuid", "UUID");
+        path_cls         = grab("pathlib", "Path");
+        posix_path_cls   = grab("pathlib", "PurePosixPath");
+        windows_path_cls = grab("pathlib", "PureWindowsPath");
+        resolved = true;
+    }
+};
+static StdCtorCache s_std;
+static inline void ensure_std_ctors() { if (!s_std.resolved) s_std.resolve(); }
+
 bool set_geo_backend(const char* name) {
     s_geo_libs.clear();  // re-probe on next reconstruct — see GeoLibCache
     if (!name) { s_geo_backend.clear(); return true; }
@@ -190,6 +242,103 @@ static void write_u32_at(std::vector<uint8_t>& buf, size_t pos, uint32_t val) {
 // SRID after it. Both geoalchemy2 (WKBElement autodetects the flag) and
 // shapely (wkb.loads reads it) reconstruct SRID from EWKB unaided. Bytes
 // that are already EWKB pass through untouched.
+// ── Temporal encoding — one codec for datetime / time / timedelta ────────────
+//
+//   DATETIME  int64 µs since 1970-01-01T00:00:00 (NAIVE wall-clock — no
+//             timezone interpretation, no local-time round trip)
+//             [+ 1 byte has_tz  + int32 utcoffset seconds]
+//   TIME      int64 µs since midnight  [+ same tz tail]
+//   TIMEDELTA int64 µs (days*86400e6 + seconds*1e6 + µs), no tail
+//   DATE      int32 days since epoch — unchanged
+//
+// Why this replaced the .timestamp()/fromtimestamp() float path (found
+// 2026-08-16, all silent): (1) a tz-aware value came back shifted to the
+// MACHINE's local zone and naive; (2) naive was interpreted as local time,
+// so its meaning depended on where the reader ran; (3) datetimes before
+// 1970 collapsed to the epoch (.timestamp() raises on Windows for negative
+// values, and the error was swallowed → 0); (4) float µs lost precision;
+// (5) timedelta had a TypeId but no write path and became None; (6) any
+// other datetime-module object fell to a swallow-and-write-None branch.
+//
+// int64 µs spans ±292,000 years — Python's own datetime range (year 1..9999)
+// fits ~36x over, at datetime's own microsecond precision. Nothing lost.
+//
+// Compatibility: old blobs wrote DATETIME/TIME as exactly 8 bytes; the new
+// form is 13. Every record carries its length, so the reader distinguishes
+// them by length — old blobs still read (as naive), no format-version bump.
+static const size_t TEMPORAL_TZ_TAIL = 1 + 4;
+
+// utcoffset() as whole seconds, or -1 with *has_tz=false for a naive value.
+// Reads via the object's own utcoffset() so it works for datetime AND time.
+static int32_t read_utcoffset_seconds(PyObject* obj, bool* has_tz) {
+    *has_tz = false;
+    PyObject* off = PyObject_CallMethod(obj, "utcoffset", nullptr);
+    if (!off) { PyErr_Clear(); return 0; }
+    if (off == Py_None) { Py_DECREF(off); return 0; }
+    PyObject* secs = PyObject_CallMethod(off, "total_seconds", nullptr);
+    Py_DECREF(off);
+    if (!secs) { PyErr_Clear(); return 0; }
+    double d = PyFloat_AsDouble(secs);
+    Py_DECREF(secs);
+    if (PyErr_Occurred()) { PyErr_Clear(); return 0; }
+    *has_tz = true;
+    return (int32_t)d;
+}
+
+static void write_tz_tail(std::vector<uint8_t>& buf, bool has_tz, int32_t offset_s) {
+    buf.push_back(has_tz ? 1 : 0);
+    write_u32(buf, (uint32_t)offset_s);  // two's-complement round-trips via read_i32
+}
+
+// A tzinfo for the given offset — datetime.timezone(timedelta(seconds=off)),
+// or timezone.utc when off == 0. New reference; nullptr with PyErr set.
+static PyObject* make_tzinfo(int32_t offset_s) {
+    ensure_std_ctors();
+    if (!s_std.timezone_cls || !s_std.timedelta_cls) {
+        PyErr_SetString(PyExc_RuntimeError, "datetime.timezone unavailable");
+        return nullptr;
+    }
+    if (offset_s == 0) return PyObject_GetAttrString(s_std.timezone_cls, "utc");
+    PyObject* delta = PyObject_CallFunction(s_std.timedelta_cls, "iii", 0, (int)offset_s, 0);
+    if (!delta) return nullptr;
+    PyObject* tz = PyObject_CallOneArg(s_std.timezone_cls, delta);
+    Py_DECREF(delta);
+    return tz;
+}
+
+// obj.replace(tzinfo=tz) — datetime/time .replace() takes tzinfo ONLY as a
+// keyword (positional slots are year/month/... or hour/minute/...), so this
+// has to be a real kwargs call; PyObject_CallMethod's "{s:O}" would build a
+// dict and pass it POSITIONALLY as `year`, which is exactly the
+// "'dict' object cannot be interpreted as an integer" the first build hit.
+// New reference; nullptr with PyErr set.
+static PyObject* replace_tzinfo(PyObject* obj, PyObject* tz) {
+    PyObject* meth = PyObject_GetAttrString(obj, "replace");
+    if (!meth) return nullptr;
+    PyObject* args = PyTuple_New(0);
+    PyObject* kw = Py_BuildValue("{s:O}", "tzinfo", tz);
+    PyObject* res = (args && kw) ? PyObject_Call(meth, args, kw) : nullptr;
+    Py_XDECREF(kw); Py_XDECREF(args); Py_DECREF(meth);
+    return res;
+}
+
+// timedelta -> whole microseconds, exact integer arithmetic (days/seconds/
+// microseconds are ints on the object; total_seconds() would go through a
+// float). Returns false with PyErr set if the attributes can't be read.
+static bool timedelta_to_us(PyObject* td, int64_t* out) {
+    PyObject* d = PyObject_GetAttrString(td, "days");
+    PyObject* s = PyObject_GetAttrString(td, "seconds");
+    PyObject* u = PyObject_GetAttrString(td, "microseconds");
+    bool ok = d && s && u;
+    if (ok) {
+        long long dd = PyLong_AsLongLong(d), ss = PyLong_AsLongLong(s), uu = PyLong_AsLongLong(u);
+        ok = !PyErr_Occurred();
+        if (ok) *out = dd * 86400000000LL + ss * 1000000LL + uu;
+    }
+    Py_XDECREF(d); Py_XDECREF(s); Py_XDECREF(u);
+    return ok;
+}
+
 static const uint32_t EWKB_SRID_FLAG = 0x20000000u;
 
 static void write_wkb_value(std::vector<uint8_t>& buf, PyObject* wkb_obj, long srid) {
@@ -380,40 +529,74 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
         if (strcmp(mname, "datetime") == 0) {
             PyObject* tname = PyObject_GetAttrString((PyObject*)Py_TYPE(obj), "__name__");
             const char* n = tname ? PyUnicode_AsUTF8(tname) : nullptr;
-            bool is_dt   = n && strcmp(n, "datetime") == 0;
-            bool is_date = n && strcmp(n, "date")     == 0;
-            bool is_time = n && strcmp(n, "time")     == 0;
+            bool is_dt   = n && strcmp(n, "datetime")  == 0;
+            bool is_date = n && strcmp(n, "date")      == 0;
+            bool is_time = n && strcmp(n, "time")      == 0;
+            bool is_td   = n && strcmp(n, "timedelta") == 0;
             Py_XDECREF(tname);
             Py_DECREF(tp_mod);
 
             if (is_dt) {
-                PyObject* ts = PyObject_CallMethod(obj, "timestamp", nullptr);
-                int64_t us = ts ? (int64_t)(PyFloat_AsDouble(ts) * 1e6) : 0;
-                Py_XDECREF(ts);
-                if (PyErr_Occurred()) PyErr_Clear();
-                buf.push_back(to_byte(TypeId::DATETIME)); write_u32(buf, 8); write_i64(buf, us);
+                // Naive µs since epoch by INTEGER arithmetic on wall-clock
+                // fields — never .timestamp() (float, local-zone
+                // interpretation, raises on Windows before 1970). The tz, if
+                // any, rides separately in the tail; the µs are the
+                // wall-clock reading regardless.
+                ensure_std_ctors();
+                bool has_tz = false;
+                int32_t off = read_utcoffset_seconds(obj, &has_tz);
+                // (obj - epoch) needs both naive or both aware — strip tz
+                // for the subtraction; the wall-clock fields are what we want.
+                PyObject* naive = has_tz ? replace_tzinfo(obj, Py_None) : (Py_INCREF(obj), obj);
+                if (!naive) return;
+                PyObject* delta = s_std.epoch_naive ? PyNumber_Subtract(naive, s_std.epoch_naive) : nullptr;
+                Py_DECREF(naive);
+                if (!delta) return;  // PyErr set — fail loud
+                int64_t us = 0;
+                bool ok = timedelta_to_us(delta, &us);
+                Py_DECREF(delta);
+                if (!ok) return;
+                buf.push_back(to_byte(TypeId::DATETIME));
+                write_u32(buf, (uint32_t)(8 + TEMPORAL_TZ_TAIL));
+                write_i64(buf, us);
+                write_tz_tail(buf, has_tz, off);
             } else if (is_date) {
                 PyObject* ord = PyObject_CallMethod(obj, "toordinal", nullptr);
-                int32_t v = ord ? (int32_t)(PyLong_AsLong(ord) - 719163) : 0;
-                Py_XDECREF(ord);
-                if (PyErr_Occurred()) PyErr_Clear();
+                if (!ord) return;
+                int32_t v = (int32_t)(PyLong_AsLong(ord) - 719163);
+                Py_DECREF(ord);
+                if (PyErr_Occurred()) return;
                 buf.push_back(to_byte(TypeId::DATE)); write_u32(buf, 4); write_i32(buf, v);
             } else if (is_time) {
                 PyObject* h  = PyObject_GetAttrString(obj, "hour");
                 PyObject* m  = PyObject_GetAttrString(obj, "minute");
                 PyObject* s  = PyObject_GetAttrString(obj, "second");
                 PyObject* us = PyObject_GetAttrString(obj, "microsecond");
-                uint64_t val = 0;
-                if (h && m && s && us)
-                    val = (uint64_t)( (long long)PyLong_AsLong(h)  * 3600000000LL
-                                    + (long long)PyLong_AsLong(m)  *   60000000LL
-                                    + (long long)PyLong_AsLong(s)  *    1000000LL
-                                    + (long long)PyLong_AsLong(us) );
+                bool ok = h && m && s && us;
+                int64_t val = 0;
+                if (ok) {
+                    val = (int64_t)PyLong_AsLong(h)  * 3600000000LL
+                        + (int64_t)PyLong_AsLong(m)  *   60000000LL
+                        + (int64_t)PyLong_AsLong(s)  *    1000000LL
+                        + (int64_t)PyLong_AsLong(us);
+                    ok = !PyErr_Occurred();
+                }
                 Py_XDECREF(h); Py_XDECREF(m); Py_XDECREF(s); Py_XDECREF(us);
-                if (PyErr_Occurred()) PyErr_Clear();
-                buf.push_back(to_byte(TypeId::TIME)); write_u32(buf, 8); write_u64(buf, val);
+                if (!ok) return;  // PyErr set
+                bool has_tz = false;
+                int32_t off = read_utcoffset_seconds(obj, &has_tz);
+                buf.push_back(to_byte(TypeId::TIME));
+                write_u32(buf, (uint32_t)(8 + TEMPORAL_TZ_TAIL));
+                write_i64(buf, val);
+                write_tz_tail(buf, has_tz, off);
+            } else if (is_td) {
+                int64_t us = 0;
+                if (!timedelta_to_us(obj, &us)) return;  // PyErr set
+                buf.push_back(to_byte(TypeId::TIMEDELTA)); write_u32(buf, 8); write_i64(buf, us);
             } else {
-                buf.push_back(to_byte(TypeId::NONE)); write_u32(buf, 0);
+                // timezone / tzinfo / anything else from the datetime module:
+                // not a value we store — fail loud, never a silent None.
+                goto fallback_none;
             }
             return;
         }
@@ -592,22 +775,46 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
 
         case TypeId::DATETIME: {
             int64_t us = read_i64(ptr);
-            PyObject* dt_mod = PyImport_ImportModule("datetime");
-            PyObject* dt_cls = dt_mod ? PyObject_GetAttrString(dt_mod, "datetime") : nullptr;
-            double secs = (double)us / 1e6;
-            result = dt_cls ? PyObject_CallMethod(dt_cls, "fromtimestamp", "d", secs) : nullptr;
-            Py_XDECREF(dt_cls); Py_XDECREF(dt_mod);
+            ensure_std_ctors();
+            // epoch + timedelta(microseconds=us) — pure integer path, exact
+            // for the whole year-1..9999 range; the old fromtimestamp(float)
+            // route was the source of the tz-shift / pre-1970 / precision bugs.
+            PyObject* delta = (s_std.timedelta_cls && s_std.epoch_naive)
+                ? PyObject_CallFunction(s_std.timedelta_cls, "iiL", 0, 0, (long long)us) : nullptr;
+            result = delta ? PyNumber_Add(s_std.epoch_naive, delta) : nullptr;
+            Py_XDECREF(delta);
+            // New-format record carries a tz tail; an old 8-byte record is
+            // naive by construction (its tz was already lost on write).
+            if (result && length >= 8 + TEMPORAL_TZ_TAIL) {
+                bool has_tz = (*ptr++ != 0);
+                int32_t off = read_i32(ptr);
+                if (has_tz) {
+                    PyObject* tz = make_tzinfo(off);
+                    PyObject* aware = tz ? replace_tzinfo(result, tz) : nullptr;
+                    Py_XDECREF(tz);
+                    Py_DECREF(result);
+                    result = aware;
+                }
+            }
+            if (!result) PyErr_Clear();
+            break;
+        }
+
+        case TypeId::TIMEDELTA: {
+            int64_t us = read_i64(ptr);
+            ensure_std_ctors();
+            result = s_std.timedelta_cls
+                ? PyObject_CallFunction(s_std.timedelta_cls, "iiL", 0, 0, (long long)us) : nullptr;
             if (!result) PyErr_Clear();
             break;
         }
 
         case TypeId::DATE: {
             int32_t days = read_i32(ptr);
-            PyObject* dt_mod = PyImport_ImportModule("datetime");
-            PyObject* dt_cls = dt_mod ? PyObject_GetAttrString(dt_mod, "date") : nullptr;
+            ensure_std_ctors();
             PyObject* ord = PyLong_FromLong(days + 719163);
-            result = (dt_cls && ord) ? PyObject_CallMethod(dt_cls, "fromordinal", "O", ord) : nullptr;
-            Py_XDECREF(ord); Py_XDECREF(dt_cls); Py_XDECREF(dt_mod);
+            result = (s_std.date_cls && ord) ? PyObject_CallMethod(s_std.date_cls, "fromordinal", "O", ord) : nullptr;
+            Py_XDECREF(ord);
             if (!result) PyErr_Clear();
             break;
         }
@@ -618,20 +825,26 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
             int m  = (int)(us_total /   60000000ULL); us_total %=   60000000ULL;
             int s  = (int)(us_total /    1000000ULL); us_total %=    1000000ULL;
             int us = (int)us_total;
-            PyObject* dt_mod = PyImport_ImportModule("datetime");
-            PyObject* dt_cls = dt_mod ? PyObject_GetAttrString(dt_mod, "time") : nullptr;
-            result = dt_cls ? PyObject_CallFunction(dt_cls, "iiii", h, m, s, us) : nullptr;
-            Py_XDECREF(dt_cls); Py_XDECREF(dt_mod);
+            ensure_std_ctors();
+            if (length >= 8 + TEMPORAL_TZ_TAIL) {
+                bool has_tz = (*ptr++ != 0);
+                int32_t off = read_i32(ptr);
+                PyObject* tz = has_tz ? make_tzinfo(off) : (Py_INCREF(Py_None), Py_None);
+                result = (s_std.time_cls && tz)
+                    ? PyObject_CallFunction(s_std.time_cls, "iiiiO", h, m, s, us, tz) : nullptr;
+                Py_XDECREF(tz);
+            } else {
+                result = s_std.time_cls ? PyObject_CallFunction(s_std.time_cls, "iiii", h, m, s, us) : nullptr;
+            }
             if (!result) PyErr_Clear();
             break;
         }
 
         case TypeId::DECIMAL: {
-            PyObject* dec_mod = PyImport_ImportModule("decimal");
-            PyObject* dec_cls = dec_mod ? PyObject_GetAttrString(dec_mod, "Decimal") : nullptr;
+            ensure_std_ctors();
             PyObject* sv = PyUnicode_FromStringAndSize((const char*)ptr, (Py_ssize_t)length);
-            result = (dec_cls && sv) ? PyObject_CallOneArg(dec_cls, sv) : nullptr;
-            Py_XDECREF(sv); Py_XDECREF(dec_cls); Py_XDECREF(dec_mod);
+            result = (s_std.decimal_cls && sv) ? PyObject_CallOneArg(s_std.decimal_cls, sv) : nullptr;
+            Py_XDECREF(sv);
             if (!result) PyErr_Clear();
             break;
         }
@@ -639,14 +852,13 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         case TypeId::PATH:
         case TypeId::PATH_POSIX:
         case TypeId::PATH_WINDOWS: {
-            const char* cls_name = (tid == TypeId::PATH_POSIX)   ? "PurePosixPath"
-                                 : (tid == TypeId::PATH_WINDOWS)  ? "PureWindowsPath"
-                                 :                                   "Path";
-            PyObject* path_mod = PyImport_ImportModule("pathlib");
-            PyObject* cls = path_mod ? PyObject_GetAttrString(path_mod, cls_name) : nullptr;
+            ensure_std_ctors();
+            PyObject* cls = (tid == TypeId::PATH_POSIX)   ? s_std.posix_path_cls
+                          : (tid == TypeId::PATH_WINDOWS) ? s_std.windows_path_cls
+                          :                                 s_std.path_cls;
             PyObject* sv = PyUnicode_FromStringAndSize((const char*)ptr, (Py_ssize_t)length);
             result = (cls && sv) ? PyObject_CallOneArg(cls, sv) : nullptr;
-            Py_XDECREF(sv); Py_XDECREF(cls); Py_XDECREF(path_mod);
+            Py_XDECREF(sv);
             if (!result) PyErr_Clear();
             break;
         }
@@ -662,11 +874,10 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         }
 
         case TypeId::UUID: {
-            PyObject* uuid_mod = PyImport_ImportModule("uuid");
-            PyObject* uuid_cls = uuid_mod ? PyObject_GetAttrString(uuid_mod, "UUID") : nullptr;
+            ensure_std_ctors();
             PyObject* sv = PyUnicode_FromStringAndSize((const char*)ptr, (Py_ssize_t)length);
-            result = (uuid_cls && sv) ? PyObject_CallOneArg(uuid_cls, sv) : nullptr;
-            Py_XDECREF(sv); Py_XDECREF(uuid_cls); Py_XDECREF(uuid_mod);
+            result = (s_std.uuid_cls && sv) ? PyObject_CallOneArg(s_std.uuid_cls, sv) : nullptr;
+            Py_XDECREF(sv);
             if (!result) PyErr_Clear();
             break;
         }
