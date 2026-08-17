@@ -203,10 +203,14 @@ mn.load_rows(rows, key="id", path="users")       # пишет в СУЩЕСТВ�
 # одинаково для from_rows/load_rows/cursor.insert_batch:
 md.ModDict.from_rows(rows, key=("user_id", "group_id"))   # {(r["user_id"], r["group_id"]): r for r in rows}
 
-# Сериализация
+# Сериализация — таблица типов в разделе «Сериализация» ниже
 mn.serialize() / mn.deserialize(data)          # data → self, возвращает self для чейнинга
 mn.to_dict()                                   # → обычный dict (минует RowProxy)
 md.dumps(obj) / md.loads(data)                 # сериализация любого объекта; ModDict возвращается как ModDict
+md.register_converter(MyType, fn)              # пользовательские типы, конвертируются при вставке
+md.set_geo_backend("shapely"|"geoalchemy2"|"wkb_bytes")     # во что десериализуется WKB-геометрия
+md.set_row_backend("row"|"dict"|"tuple"|"list")               # во что десериализуется SQLAlchemy Row
+md.set_rowset_backend("list"|"tuple"|"dict"|"mod_dict")       # во что десериализуется fetchall()/mappings().all()
 
 # Управление индексами (опционально — авто-индекс покрывает большинство случаев)
 mn.create_index("field") / mn.drop_index("field") / mn.has_index("field")
@@ -441,8 +445,13 @@ orders.connect("update", lambda payload: qt_model.apply_update(payload))
 orders.connect("delete", lambda old_index: qt_model.apply_delete(old_index))
 orders.connect("reorder", lambda diff: qt_model.apply_reorder(diff))
 # "reorder" — единственное событие, которое отдаёт полный list[(old,new)] —
-# оно летит СИБЛИНГ-курсору в ответ на чужую мутацию, а сиблинг не знает,
-# какая именно строка стала причиной изменения
+# оно летит, когда данные изменились любым путём, кроме собственных
+# insert/update_row/delete ЭТОГО курсора: сиблинг-курсор, запись через root
+# mn["u1"]["orders"][...], сырое cursor[key] = row — а слушатель не знает,
+# какая именно строка стала причиной. Тот же словарь (old_index, new_index),
+# что возвращают set_sort()/set_group()/set_filter(): только сдвинувшиеся
+# строки, позиции такие, какими их считают at(i)/len() (при фильтре — плотные
+# по видимым строкам), None с той стороны, где строка не видна.
 
 orders.disconnect("insert", handler)  # -> сколько регистраций снято (0 = ничего не совпало)
 orders.disconnect("reorder")          # снять все слушатели одного события
@@ -468,6 +477,13 @@ summary_view.set_group("status")
 grid_view.insert("o9", {"amount": 5, "status": "new"})
 # summary_view тоже получит событие "reorder" — он не знает, что причиной
 # был именно insert(), только то, что его собственный вид изменился
+
+mn["u1"]["orders"]["o10"] = {"amount": 7, "status": "new"}
+# запись через root по mn[key] тоже доходит до курсоров: пока жив хоть один
+# курсор, mn[key] отдаёт RowProxy (тот же механизм, что у field-индексов),
+# так что оба вида ресинкаются и получают "reorder". Строки, взятые через
+# at()/values()/to_dict(), — сырые dict: после записи через них нужен
+# mn.reindex(key).
 ```
 
 **Что курсор поддерживает:** полный raw dict-протокол (`cursor[key]`,
@@ -538,25 +554,63 @@ orders.keys()                      # ВСЕ ключи, в собственно�
 Полная документация методов (формы возврата, payload событий, крайние
 случаи) — в `src/mod_dict.pyi`.
 
+## Сериализация
+
+`mn.serialize()` → `bytes` и `md.ModDict().deserialize(data)` прогоняют
+весь ModDict туда-обратно в компактном бинарном формате; `md.dumps(obj)` /
+`md.loads(data)` делают то же для любого одиночного поддерживаемого значения
+(обычный dict, список, скаляр… — ModDict возвращается как ModDict, всё
+остальное — как есть).
+
+```python
+data = mn.serialize()
+mn2  = md.ModDict().deserialize(data)          # возвращает self, чейнится
+
+blob = md.dumps({"rows": [1, 2.5, "x", None]})  # любое поддерживаемое значение
+md.loads(blob)                                  # → {"rows": [1, 2.5, "x", None]}
+```
+
+**Поддерживаемые типы** — каждый проходит round-trip точно, включая тип:
+
+| Группа | Типы |
+|--------|------|
+| скаляры | `None` `bool` `int` (диапазон int64) `float` (NaN/±inf/-0.0 сохраняются) `str` `bytes` `bytearray` |
+| контейнеры | `dict` `list` `tuple` `set` `frozenset` — вложенность любой глубины; ключи dict — любой хешируемый поддерживаемый тип (str, int, bytes, кортежи, …) |
+| время | `datetime.datetime` — naive возвращается **как записан** (без интерпретации в локальный пояс ни на одной стороне); tz-aware сохраняет UTC-offset; любой год 1..9999, микросекундная точность · `datetime.date` · `datetime.time` (сохраняет `tzinfo`) · `datetime.timedelta` |
+| stdlib | `decimal.Decimal` `uuid.UUID` `pathlib.Path` / `PurePosixPath` / `PureWindowsPath` |
+| геометрия | геометрии shapely, `geoalchemy2.WKBElement` — хранятся как WKB, SRID сохраняется (см. ниже) |
+| SQL-результаты | SQLAlchemy `Row`, `RowMapping` и их списки (`fetchall()`, `mappings().all()`, …) — записываются имена колонок и первичный ключ (см. ниже) |
+| пользовательские | всё, что зарегистрировано через `md.register_converter()` (см. ниже) |
+
+Всё остальное кидает `TypeError` в момент `serialize()`/`dumps()` — значение
+никогда не выбрасывается молча и не пишется как `None`. Объекты-не-значения
+вроде `datetime.timezone` / `tzinfo` тоже в этой категории.
+
 ### Конвертеры типов
 
-Конвертеры применяются **при вставке** — значения конвертируются до сохранения, поэтому они переживают `serialize()`.
-MRO обходится: конвертер для базового класса применяется и к подклассам.
+Конвертеры применяются **при вставке** — значения конвертируются до
+сохранения, поэтому они переживают `serialize()` и всё остальное, что читает
+строку. MRO обходится: конвертер для базового класса применяется и к
+подклассам.
 
 ```python
 md.register_converter(MyType, lambda obj: obj.to_dict())
 mn["key"] = {"value": MyType(...)}   # → хранится как dict, сериализуется
 ```
 
-Тип без зарегистрированного конвертера и без встроенной поддержки кидает
-`TypeError` при `serialize()`/`dumps()` — он никогда не отбрасывается молча
-и не превращается в `None`.
+Результат конвертера сам должен быть поддерживаемым типом (любым из таблицы
+выше). Конвертеры — точка расширения для доменных типов; встроенная
+обработка геометрии и SQL ниже — два случая, где mod_dict знает тип
+достаточно хорошо, чтобы сделать лучше односторонней конвертации: они
+восстанавливаются при чтении в *выбранный* тип, а не сплющиваются.
 
 ### Геометрия (WKB) — shapely / geoalchemy2
 
 Значение типа `shapely`-геометрии или `geoalchemy2.WKBElement` сериализуется
-как сырые байты WKB независимо от того, какая библиотека его создала. На
-стороне чтения то, во что это превратится обратно, управляется
+как сырые байты WKB независимо от того, какая библиотека его создала. Если
+геометрия несёт SRID атрибутом (а не внутри байтов), он при записи
+вкладывается в байты как EWKB — так он переживает round-trip. На стороне
+чтения то, во что это превратится обратно, управляется
 `md.set_geo_backend(...)`, а не тем, кто это записал:
 
 ```python
@@ -587,6 +641,68 @@ md.set_geo_backend(None)            # сбросить -> автоопредел
 `md.ShapelyWKB(raw_bytes)` / `md.GeoAlchemyWKB(raw_bytes)` позволяют
 пометить сырые байты WKB для хранения без установленной библиотеки на
 стороне записи — те же правила восстановления действуют при чтении.
+
+### SQL-результаты — SQLAlchemy Row / RowMapping
+
+Всё, что отдаёт запрос, сериализуется **как есть** — без предварительного
+`dict(row)` / `._mapping` — в любой форме, какую производит SQLAlchemy:
+
+| Передаёшь | Что это | Сериализуется как |
+|-----------|---------|-------------------|
+| `fetchone()`, `first()`, `one()`, `one_or_none()` | `Row` | одна строка |
+| `mappings().first()` / `.one()` | `RowMapping` | одна строка |
+| `fetchall()`, `all()`, `fetchmany(n)`, `list(result)`, `tuples().all()` | `list[Row]` | rowset |
+| `mappings().all()` / `.fetchall()` / `.fetchmany(n)` / `list(mappings())` | `list[RowMapping]` | rowset |
+| сам живой `Result` / `MappingResult` / `ScalarResult`, не выбранный | курсор результата | дренируется на месте (`.all()`), дальше как выше — потребляется в любом случае, ровно как при твоём собственном fetch |
+| `scalar()`, `scalar_one()`, `scalars().all()` | обычные значения / их список | как обычные значения — без rowset |
+
+```python
+with engine.connect() as c:
+    one  = c.execute(select(users).where(users.c.id == 1)).fetchone()   # Row
+    many = c.execute(select(users)).fetchall()                          # list[Row]
+    maps = c.execute(select(users)).mappings().all()                    # list[RowMapping]
+    live = c.execute(select(users))                                     # не выбранный Result
+
+blob = md.dumps({"one": one, "many": many, "maps": maps, "live": live})
+```
+
+Одиночная строка записывается с **именами колонок, значениями и колонками
+первичного ключа**; список строк одного запроса — как **rowset**: имена и pk
+один раз, дальше только значения на строку (таблица из 3 колонок стоит
+~36 байт/строка против ~71 для тех же строк как plain-списка словарей и
+пишется ~в 3× быстрее). Первичный ключ берётся **автоматически** из
+`Column`-метаданных, которые SQLAlchemy прикрепляет к запросу, построенному
+из `Table`/ORM-объектов — ты его не называешь; составной ключ становится
+кортежем в порядке колонок. `text()`-запрос или колонки без таблицы
+(агрегаты) pk не несут.
+
+Что вернётся — выбор на стороне чтения, зеркально `set_geo_backend()`:
+
+```python
+md.set_row_backend("row")       # по умолчанию — настоящий sqlalchemy.engine.Row (._fields, ._mapping, доступ по атрибутам);
+                                # кидает ImportError, если sqlalchemy на стороне чтения не импортируется
+md.set_row_backend("dict")      # {колонка: значение}
+md.set_row_backend("tuple")     # позиционные значения, имена отброшены
+md.set_row_backend("list")      # позиционные, изменяемые
+
+md.set_rowset_backend("list")   # по умолчанию — список строк в форме set_row_backend()
+md.set_rowset_backend("tuple")
+md.set_rowset_backend("dict")   # {pk: строка} по автоматически найденному первичному ключу
+md.set_rowset_backend("mod_dict")  # ModDict по pk, строки как dict — filter()/cursor() сразу с проводов
+```
+
+`"dict"` / `"mod_dict"` кидают `TypeError` на rowset без первичного ключа
+(`text()`, агрегаты) — намеренно: pk и есть то, что делает keyed-форму
+осмысленной; используй `"list"` или собери ключ сам через
+`md.from_rows(rows, key=...)`. Результаты `scalar()` / `scalars().all()` —
+обычные значения и сериализуются как таковые, без rowset.
+
+Сама сериализация не параметризуется: строка всегда пишется полностью, так
+что любой бэкенд можно выбрать при чтении. Обычные `dict`/`list`/`tuple`,
+собранные тобой, всё это не затрагивает. Значения *внутри* строки (временные
+колонки, геометрия, …) проходят ту же обработку типов, что и везде —
+PostgreSQL `INTERVAL` приезжает как `timedelta` и проходит round-trip,
+геометрия PostGIS — как WKB со своим SRID.
 
 Полные type stubs с документацией находятся в `src/mod_dict.pyi` — видны в IDE при наведении и через `help()`.
 

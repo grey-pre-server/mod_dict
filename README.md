@@ -204,10 +204,14 @@ mn.load_rows(rows, key="id", path="users")       # writes into an EXISTING mn: m
 # same for from_rows/load_rows/cursor.insert_batch:
 md.ModDict.from_rows(rows, key=("user_id", "group_id"))   # {(r["user_id"], r["group_id"]): r for r in rows}
 
-# Serialize
+# Serialize — see "Serialization" below for the type table
 mn.serialize() / mn.deserialize(data)          # data → self, returned for chaining
 mn.to_dict()                                   # → plain dict (bypasses RowProxy)
 md.dumps(obj) / md.loads(data)                 # serialize any object; ModDict round-trips as ModDict
+md.register_converter(MyType, fn)              # custom types, converted at insert time
+md.set_geo_backend("shapely"|"geoalchemy2"|"wkb_bytes")     # what a WKB geometry deserializes into
+md.set_row_backend("row"|"dict"|"tuple"|"list")               # what a SQLAlchemy Row deserializes into
+md.set_rowset_backend("list"|"tuple"|"dict"|"mod_dict")       # what a fetchall()/mappings().all() deserializes into
 
 # Index management (optional — auto-index handles most cases)
 mn.create_index("field") / mn.drop_index("field") / mn.has_index("field")
@@ -441,8 +445,13 @@ orders.connect("update", lambda payload: qt_model.apply_update(payload))
 orders.connect("delete", lambda old_index: qt_model.apply_delete(old_index))
 orders.connect("reorder", lambda diff: qt_model.apply_reorder(diff))
 # "reorder" is the one event that DOES carry a full list[(old,new)] diff —
-# it fires on a SIBLING cursor reacting to someone else's mutation, and
-# that sibling has no way to know which single row triggered the change.
+# it fires when the data changed by any means other than THIS cursor's own
+# insert/update_row/delete: a sibling cursor, a root-side mn["u1"]["orders"][...]
+# write, a raw cursor[key] = row — and the listener has no way to know which
+# single row triggered the change. Same (old_index, new_index) vocabulary as
+# set_sort()/set_group()/set_filter() return: only rows that moved,
+# positions as at(i)/len() count them (dense over the visible rows under a
+# filter), None on the side a row isn't visible on.
 
 orders.disconnect("insert", handler)  # -> how many registrations were removed (0 = nothing matched)
 orders.disconnect("reorder")          # drop all of one event's listeners
@@ -466,6 +475,12 @@ summary_view.set_group("status")
 grid_view.insert("o9", {"amount": 5, "status": "new"})
 # summary_view gets a "reorder" event too — it doesn't know insert() caused
 # it, only that its own view changed
+
+mn["u1"]["orders"]["o10"] = {"amount": 7, "status": "new"}
+# root-side writes through mn[key] reach cursors as well: while any cursor is
+# alive, mn[key] hands out a RowProxy (same mechanism field indices use), so
+# both views resync and fire "reorder". Rows taken via at()/values()/to_dict()
+# are raw dicts — writes through those need mn.reindex(key) afterwards.
 ```
 
 **What a cursor supports:** the full raw dict protocol (`cursor[key]`,
@@ -533,26 +548,62 @@ that the current sort/filter is being honored — same rows, same order, that
 Full method docs (return shapes, event payloads, edge cases) are in
 `src/mod_dict.pyi`.
 
+## Serialization
+
+`mn.serialize()` → `bytes` and `md.ModDict().deserialize(data)` round-trip a
+whole ModDict in a compact binary format; `md.dumps(obj)` / `md.loads(data)`
+do the same for any single supported value (a plain dict, a list, a scalar…
+— a ModDict comes back as a ModDict, anything else as itself).
+
+```python
+data = mn.serialize()
+mn2  = md.ModDict().deserialize(data)          # returns self, chainable
+
+blob = md.dumps({"rows": [1, 2.5, "x", None]})  # any supported value
+md.loads(blob)                                  # → {"rows": [1, 2.5, "x", None]}
+```
+
+**Supported types** — every one round-trips exactly, type included:
+
+| Group | Types |
+|-------|-------|
+| scalars | `None` `bool` `int` (int64 range) `float` (NaN/±inf/-0.0 preserved) `str` `bytes` `bytearray` |
+| containers | `dict` `list` `tuple` `set` `frozenset` — nested to any depth; dict keys may be any hashable supported type (str, int, bytes, tuples, …) |
+| temporal | `datetime.datetime` — naive comes back **as written** (no local-timezone interpretation on either side); tz-aware keeps its UTC offset; any year 1..9999, microsecond precision · `datetime.date` · `datetime.time` (keeps `tzinfo`) · `datetime.timedelta` |
+| stdlib | `decimal.Decimal` `uuid.UUID` `pathlib.Path` / `PurePosixPath` / `PureWindowsPath` |
+| geometry | shapely geometries, `geoalchemy2.WKBElement` — stored as WKB, SRID preserved (see below) |
+| SQL results | SQLAlchemy `Row`, `RowMapping`, and lists of them (`fetchall()`, `mappings().all()`, …) — column names and primary key recorded (see below) |
+| custom | anything you register via `md.register_converter()` (see below) |
+
+Anything else raises `TypeError` at `serialize()`/`dumps()` time — a value
+is never silently dropped or written as `None`. Non-value objects such as
+`datetime.timezone` / `tzinfo` are in that category too.
+
 ### Custom type converters
 
-Converters are applied **at insert time** — values are converted before storage, so they survive `serialize()`.
-MRO is walked: a converter for a base class also applies to subclasses.
+Converters are applied **at insert time** — values are converted before
+storage, so they survive `serialize()` and everything else that reads the
+row. MRO is walked: a converter for a base class also applies to subclasses.
 
 ```python
 md.register_converter(MyType, lambda obj: obj.to_dict())
-mn["key"] = {"value": MyType(...)}   # → stored as dict, serializable
+mn["key"] = {"value": MyType(...)}   # → stored as the dict, serializable
 ```
 
-A type with no registered converter and no built-in support raises
-`TypeError` at `serialize()`/`dumps()` time — it's never silently dropped or
-turned into `None`.
+The converter's output must itself be a supported type (any of the table
+above). Converters are the extension point for domain types; the built-in
+geometry and SQL handling below are the two cases where mod_dict knows the
+type well enough to do better than a one-way conversion — they are
+reconstructed on read into a *chosen* type, not flattened.
 
 ### Geometry (WKB) — shapely / geoalchemy2
 
 A `shapely` geometry or `geoalchemy2.WKBElement` value serializes as raw WKB
-bytes regardless of which library produced it. On the reading side, what it
-turns back into is controlled by `md.set_geo_backend(...)`, not by which one
-wrote it:
+bytes regardless of which library produced it. If the geometry carries an
+SRID as an attribute (rather than inside the bytes), it is folded into the
+bytes as EWKB on write, so it survives the round-trip. On the reading side,
+what it turns back into is controlled by `md.set_geo_backend(...)`, not by
+which library wrote it:
 
 ```python
 md.set_geo_backend("shapely")       # -> shapely geometry
@@ -582,6 +633,67 @@ Without an explicit choice, reconstruction depends on the reading side:
 `md.ShapelyWKB(raw_bytes)` / `md.GeoAlchemyWKB(raw_bytes)` let you tag raw
 WKB bytes for storage without either library installed on the writing side —
 same reconstruction rules apply on read.
+
+### SQL query results — SQLAlchemy Row / RowMapping
+
+Whatever a query hands back can be serialized **as is** — no `dict(row)` /
+`._mapping` conversion first — in any of the forms SQLAlchemy produces:
+
+| You pass | What it is | Serialized as |
+|----------|------------|---------------|
+| `fetchone()`, `first()`, `one()`, `one_or_none()` | a `Row` | one row |
+| `mappings().first()` / `.one()` | a `RowMapping` | one row |
+| `fetchall()`, `all()`, `fetchmany(n)`, `list(result)`, `tuples().all()` | `list[Row]` | a rowset |
+| `mappings().all()` / `.fetchall()` / `.fetchmany(n)` / `list(mappings())` | `list[RowMapping]` | a rowset |
+| the live `Result` / `MappingResult` / `ScalarResult` itself, un-fetched | a result cursor | drained on the spot (`.all()`), then as above — consumed either way, exactly as your own fetch would |
+| `scalar()`, `scalar_one()`, `scalars().all()` | plain values / a list of them | as the plain values they are — no rowset involved |
+
+```python
+with engine.connect() as c:
+    one  = c.execute(select(users).where(users.c.id == 1)).fetchone()   # Row
+    many = c.execute(select(users)).fetchall()                          # list[Row]
+    maps = c.execute(select(users)).mappings().all()                    # list[RowMapping]
+    live = c.execute(select(users))                                     # un-fetched Result
+
+blob = md.dumps({"one": one, "many": many, "maps": maps, "live": live})
+```
+
+A single row is written with its **column names, values, and primary-key
+columns**; a list of rows from one query is written as a **rowset** —
+names and pk once, then only values per row (a 3-column table costs
+~36 bytes/row vs ~71 for the same rows as a plain list of dicts, and writes
+~3× faster). The primary key is taken **automatically** from the `Column`
+metadata SQLAlchemy attaches to a query built from `Table`/ORM objects — you
+never name it; a composite key becomes a tuple key in column order. A
+`text()` query, or columns from no table (aggregates), carry no pk.
+
+What comes back is a reading-side choice, mirroring `set_geo_backend()`:
+
+```python
+md.set_row_backend("row")       # default — a real sqlalchemy.engine.Row (._fields, ._mapping, attribute access);
+                                # raises ImportError if sqlalchemy isn't importable on the reading side
+md.set_row_backend("dict")      # {column: value}
+md.set_row_backend("tuple")     # positional values, names dropped
+md.set_row_backend("list")      # positional, mutable
+
+md.set_rowset_backend("list")   # default — list of rows shaped per set_row_backend()
+md.set_rowset_backend("tuple")
+md.set_rowset_backend("dict")   # {pk: row} keyed by the auto-detected primary key
+md.set_rowset_backend("mod_dict")  # a ModDict keyed by pk, rows as dicts — filter()/cursor() straight off the wire
+```
+
+`"dict"` / `"mod_dict"` raise `TypeError` on a rowset that carries no primary
+key (`text()`, aggregates) — deliberately, since the pk is what makes the keyed
+form meaningful; use `"list"`, or key it yourself with
+`md.from_rows(rows, key=...)`. `scalar()` / `scalars().all()` results are
+plain values and serialize as such — no rowset involved.
+
+Serialization itself is not parametrized: a row is always written complete,
+so any backend can be chosen at read time. Plain `dict`/`list`/`tuple`
+values you built yourself are never touched by any of this. Values *inside*
+a row (temporal columns, geometry columns, …) go through the same type
+handling as everywhere else — a PostgreSQL `INTERVAL` arrives as
+`timedelta` and round-trips, a PostGIS geometry as WKB with its SRID.
 
 Full type stubs with docstrings are in `src/mod_dict.pyi` — visible in IDE on hover and via `help()`.
 

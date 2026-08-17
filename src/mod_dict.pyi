@@ -571,9 +571,10 @@ class ModDict:
             exactly like ``dict.update()``. Returns ``None``.
 
         ``mn.update(other, to_path=...)``
-            Path-based update where *from_path* defaults to *to_path*.
-            Useful when both collections share the same field layout.
-            Returns the number of matched rows.
+            Path-based update where *from_path* defaults to *to_path*
+            (and vice versa — one path given alone, positionally or by
+            keyword, stands for both). Useful when both collections share
+            the same field layout. Returns the number of matched rows.
 
         ``mn.update(other, from_path, to_path)``
             Full control: *from_path* navigates *self* to find the join key,
@@ -1175,6 +1176,17 @@ class ModDict:
         underlying data and notify each other when any one of them mutates
         it (a "reorder" event — see ``connect()``).
 
+        Root-side writes reach cursors too, as long as they go through
+        ``mn[key]``: while any cursor is alive (or a field index exists),
+        ``mn[key]`` hands out a ``RowProxy`` instead of the raw row dict, so
+        ``mn["u1"]["orders"]["o9"] = {...}`` / ``del mn["u1"]["orders"]["o9"]``
+        / ``mn["u1"]["orders"]["o1"]["amount"] = 5`` at any depth are seen —
+        every cursor under ``"u1"`` resyncs and fires "reorder". Rows
+        obtained any other way (``at()``, ``values()``, ``items()``,
+        ``to_dict()``, iteration) are the raw dicts: a write through those
+        bypasses cursors and field indices alike — call ``mn.reindex(key)``
+        afterwards, exactly as for indices.
+
         The full raw dict protocol works on a cursor, reading/writing the
         anchored table directly and staying blind to ``set_sort()``/
         ``set_filter()``: ``[key]``, ``in``, ``del``, ``get``, ``pop``,
@@ -1225,40 +1237,50 @@ class ModDict:
         ...
 
     def set_sort(
-        self, field: str | tuple[str, ...], reverse: bool = False,
-    ) -> list[tuple[int | None, int]]:
+        self, path: str | tuple[str, ...], reverse: bool = False,
+    ) -> list[tuple[int | None, int | None]]:
         """
         Activate (or reconfigure) incremental sort on a cursor.
 
-        Maintains a private ordered view of this cursor's rows by `field`'s
-        value, kept incrementally in sync by ``insert()``/``update_row()``/
-        ``delete()``/``insert_batch()`` afterward (and by mutations made
-        through a *different* cursor on the same anchor — see ``connect()``
-        "reorder"). This call itself does a full, explicit rebuild — cheap
-        and rare relative to per-mutation maintenance.
+        Maintains a private ordered view of this cursor's rows by the value
+        `path` reaches in each row, kept incrementally in sync by
+        ``insert()``/``update_row()``/``delete()``/``insert_batch()``
+        afterward (and by mutations made elsewhere — a *different* cursor on
+        the same anchor, or a root-side ``mn[key][...]`` write — see
+        ``connect()`` "reorder"). This call itself does a full, explicit
+        rebuild — cheap and rare relative to per-mutation maintenance.
 
         If ``set_group()`` is also active, sort is the **secondary** key
-        (tie-breaker) within each group, not the primary order.
+        (tie-breaker) within each group, not the primary order. Rows with
+        equal values keep their insertion order (stable), and a row inserted
+        later lands after the rows it ties with.
 
         A field value missing on a given row, or not comparable to another
         row's value for that field (e.g. ``None`` vs ``int``), sorts after
         every comparable value — never raises.
 
         Args:
-            field:   Field name or dot-notation path (see the module
-                     docstring for path syntax) — a literal path within each
-                     row, no ``?`` wildcard.
+            path:    Field name or dot-notation path (or tuple of segments)
+                     **into each row** — the same path form ``set_group()``
+                     and ``set_filter()`` take. Literal only: no ``?``
+                     wildcard segments, no ``->`` hops.
             reverse: Descending order if True.
 
         Returns:
-            A list of ``(old_index, new_index)`` pairs describing exactly
-            what moved, versus whatever presentation order (a prior
+            ``(old_index, new_index)`` pairs — **only for rows whose position
+            changed**, versus whatever presentation order (a prior
             sort/group, or natural insertion order if this is the first
-            call) existed immediately before — ``old_index=None`` means the
-            row had no defined position before (not applicable here on a
-            reconfigure of an already-populated cursor, but shared
-            vocabulary with ``insert()``/``insert_batch()``). Feed straight
-            into Qt's ``changePersistentIndexList``.
+            call) existed immediately before. Positions are the cursor's
+            presentation positions — the same coordinates ``at(i)``/
+            ``len()``/``view_keys()`` and ``insert()``/``update_row()``/
+            ``delete()`` use, so with an active ``set_filter()`` they are
+            dense over the *visible* rows and hidden rows never appear in
+            the diff. An empty list means the order is unchanged. Feed
+            straight into Qt's ``changePersistentIndexList``. (``None`` on
+            either side is the shared vocabulary with ``set_filter()`` and
+            the "reorder" event: not visible on that side — it can't
+            actually occur here, since a sort neither hides nor reveals
+            rows.)
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``.
@@ -1269,16 +1291,17 @@ class ModDict:
             orders.set_sort("amount")               # ascending by amount
             orders.at(0)                              # smallest amount
             orders.set_sort("amount", reverse=True)  # re-sort descending
+            orders.set_sort("meta.priority")         # nested field, same as set_filter's path
         """
         ...
 
     def set_group(
-        self, field: str | tuple[str, ...] | None,
-    ) -> list[tuple[int | None, int]]:
+        self, path: str | tuple[str, ...] | None,
+    ) -> list[tuple[int | None, int | None]]:
         """
         Activate (or clear) incremental grouping on a cursor.
 
-        Rows sharing the same `field` value become contiguous — the sort
+        Rows sharing the same value at `path` become contiguous — the sort
         order (if ``set_sort()`` is also active) becomes secondary, applied
         *within* each group; without an active sort, each group's internal
         order is plain insertion order. Groups themselves are ordered by the
@@ -1291,11 +1314,14 @@ class ModDict:
         each row's own group field to detect a boundary.
 
         Args:
-            field: Field name or dot-notation path, or ``None`` to clear
-                   grouping (falls back to plain sort, or natural order).
+            path: Field name or dot-notation path (or tuple of segments)
+                  into each row — same form as ``set_sort()``/``set_filter()``
+                  — or ``None`` to clear grouping (falls back to plain sort,
+                  or natural order).
 
         Returns:
-            Same ``(old_index, new_index)`` diff vocabulary as ``set_sort()``.
+            Same ``(old_index, new_index)`` diff as ``set_sort()`` — only the
+            rows that moved, in presentation positions.
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``.
@@ -1312,7 +1338,7 @@ class ModDict:
     @overload
     def set_filter(self, path: str | tuple | list) -> FilterBuilder: ...
     @overload
-    def set_filter(self, path: None) -> list[tuple[int | None, int]]: ...
+    def set_filter(self, path: None) -> list[tuple[int | None, int | None]]: ...
     def set_filter(self, path):
         """
         Choose the row-visibility condition of a cursor — same builder, same
@@ -1354,12 +1380,20 @@ class ModDict:
         — see ``view_keys()``.
 
         Returns (from the operator, or from ``set_filter(None)``):
-            ``(old_index, new_index)`` pairs — a row hidden by the previous
-            filter (or untracked because none was active) that becomes
-            visible reports ``old_index=None``; a formerly-visible row the
-            new condition excludes reports ``new_index=None``. Several rows
-            may share ``old_index=None`` in one call — hence a **list**, not
-            a ``{old: new}`` dict.
+            ``(old_index, new_index)`` pairs in presentation positions
+            (dense over the visible rows on each side, exactly what
+            ``at(i)``/``len()`` mean before and after the call): a row hidden
+            by the previous filter that becomes visible reports
+            ``old_index=None``; a formerly-visible row the new condition
+            excludes reports ``new_index=None``; a row visible on both sides
+            whose dense position shifted reports ``(old, new)``. Rows whose
+            position didn't change are omitted. Several rows may share
+            ``old_index=None`` in one call — hence a **list**, not a
+            ``{old: new}`` dict.
+
+        If a ``predicate()`` raises while the condition is being installed,
+        the exception propagates and the cursor is left **unfiltered** (never
+        half-installed).
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``. Passing a callable directly (the pre-0.8.22 form) raises
@@ -1392,15 +1426,24 @@ class ModDict:
           2-tuple it returns.
         - ``"delete"`` — fired by this cursor's own ``delete()``. Payload:
           the same ``int | None`` former-position it returns.
-        - ``"reorder"`` — fired on a cursor when a *different* cursor
-          anchored at the same location mutates the data (the listener
-          doesn't know the precise operation that changed this view, so
-          this is the one event that DOES carry the full picture).
-          Payload: ``list[(old_index, new_index)]`` — every row whose
-          position or visibility actually changed. (Internally the diff is
-          built incrementally from the sibling's mutation when possible,
+        - ``"reorder"`` — fired on a cursor when the anchored data changes
+          by any means **other than this cursor's own point-mutation
+          methods**: a *different* cursor on the same anchor, a root-side
+          write through ``mn[key][...]`` (see ``cursor()``), a root bulk
+          operation, or a raw ``cursor[key] = row`` / ``del cursor[key]``.
+          The listener doesn't know the precise operation that changed
+          this view, so this is the one event that DOES carry the full
+          picture. Payload: ``list[(old_index | None, new_index | None)]``
+          — every row whose presentation position or visibility actually
+          changed (same coordinates and vocabulary as ``set_sort()``'s
+          return value: dense over the visible rows under an active
+          filter; ``None`` = not visible on that side). Internally the diff
+          is built incrementally from the sibling's mutation when possible,
           with a full re-diff as the fallback — the payload shape is the
-          same either way.)
+          same either way. Registering a "reorder" listener makes the
+          cursor keep a maintained order snapshot from then on (natural
+          order if no ``set_sort()``/``set_group()``), which is what the
+          diff is computed against.
 
         A listener's exception propagates normally when it's this cursor's
         own direct mutation call; during a "reorder" broadcast to several
@@ -1848,15 +1891,21 @@ class ModDict:
         ...
 
     def reindex(self, key: Any) -> None:
-        """Rebuild field indices for one row after a deep nested write.
+        """Rebuild field indices for one row after a nested write that bypassed
+        ``mn[key]``, and resync/notify every cursor anchored under it.
 
-        `mn[k]["age"] = 99` and `mn[k].update({...})` update the index
-        automatically via RowProxy. For deeper writes that bypass RowProxy::
+        Writes that start at ``mn[k]`` (any depth: ``mn[k]["age"] = 99``,
+        ``mn[k]["meta"]["details"]["rank"] = 99``, ``mn[k].update({...})``)
+        are seen automatically via RowProxy whenever a field index or a live
+        cursor exists. Writes through a raw row dict obtained some other way
+        (``at()``, ``values()``, ``to_dict()``, iteration, or a reference
+        taken before the first index/cursor existed) are not::
 
-            mn[k]["meta"]["details"]["rank"] = 99  # RowProxy only sees "meta"
-            mn.reindex(k)                           # explicitly resync indices
+            row = mn.at(0)
+            row["meta"]["rank"] = 99   # raw dict — nobody saw this
+            mn.reindex(k)              # resync indices + cursors under k
 
-        Calling this when no indices exist is a no-op.
+        Calling this when no indices and no cursors exist is a no-op.
         """
         ...
 

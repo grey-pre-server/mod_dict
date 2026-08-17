@@ -14,12 +14,13 @@ PyObject* ModDict_wrap_owned(ModDict* internal);
 // Returns the internal ModDict* if obj is a ModDict instance, else nullptr.
 ModDict* ModDict_unwrap(PyObject* obj);
 
-// Converts a ModDict::IndexDiff (old==-1 means "newly appeared") into a
-// Python list of (old_index_or_None, new_index) tuples — the shared
-// vocabulary for set_sort/set_filter/set_group/insert/update_row/delete/
-// insert_batch and the "reorder" event notify_live_cursors() fires on
-// sibling cursors. Implemented in mod_dict.cpp (core), declared here so
-// both mod_dict.cpp and mod_dict_type.cpp can use it.
+// Converts a ModDict::IndexDiff (-1 on either side = not visible on that
+// side: old==-1 newly appeared, new==-1 disappeared) into a Python list of
+// (old_index|None, new_index|None) tuples — the shared vocabulary for
+// set_sort/set_filter/set_group and the "reorder" event
+// notify_live_cursors() fires on sibling cursors. Implemented in
+// mod_dict.cpp (core), declared here so both mod_dict.cpp and
+// mod_dict_type.cpp can use it.
 PyObject* index_diff_to_pylist(const ModDict::IndexDiff& diff);
 
 // -1 -> None, else a PyLong — the single-index return vocabulary for

@@ -106,6 +106,16 @@ public:
     // wrapper to already exist).
     void register_live_cursor(PyObject* weakref);
 
+    // True while at least one cursor on this root is alive. Decides whether a
+    // row handed out by root [key]/get() must be wrapped in RowProxy so a
+    // nested write through it reaches reindex_row() → notify_live_cursors():
+    // without that hook a root-side write under a cursor's anchor never
+    // reaches the cursor, whose maintained sort_index/visible_index then
+    // silently drift from the dict (len() one thing, at()/view_keys()
+    // another). Prunes dead weakrefs it meets, so a long-gone cursor stops
+    // costing anything; O(1) once the first live one is found.
+    bool has_live_cursors();
+
     // Per-cursor derived state — only meaningful when root != nullptr.
     PyObject* cached_anchor_dict = nullptr;      // borrowed; last-resolved anchor dict, for rebind detection
     uint64_t  cached_top_hash = 0;               // path[0]'s outer hash, set alongside cached_anchor_dict
@@ -152,7 +162,15 @@ public:
     std::vector<PyObject*> visible_index;
     PyObject* live_connect_listeners = nullptr;  // dict of event_type -> list[callback]
 
-    // old==-1: newly appeared. new==-1: disappeared (filtered out/removed).
+    // (old_index, new_index) pairs — the ONE vocabulary set_sort()/set_group()/
+    // set_filter() return and the "reorder" event carries. Positions are
+    // PRESENTATION positions: exactly the coordinates len()/at()/iteration/
+    // view_keys() and insert()/update_row()/delete()'s own return values use
+    // — dense over the visible rows while a filter is active (position 0 is
+    // the first VISIBLE row), raw order otherwise. -1 (None in Python) on a
+    // side the row isn't visible on: old==-1 newly appeared, new==-1
+    // disappeared (filtered out/removed). Rows whose position didn't change
+    // are omitted — an empty diff means "nothing moved".
     using IndexDiff = std::vector<std::pair<Py_ssize_t,Py_ssize_t>>;
 
     // Bootstraps/reconfigures; each is an O(n log n) rebuild (rare, explicit
@@ -163,6 +181,8 @@ public:
     // Installs the condition (path already split into segments; empty =
     // "?" = the row itself), bootstraps membership, returns the diff. A null
     // `operand` with op==EQ and empty path clears the filter (set_filter(None)).
+    // If bootstrapping raises (a predicate() that throws), the exception
+    // propagates and the cursor is left UNFILTERED — never half-installed.
     IndexDiff set_filter(const std::vector<std::string>& path, FilterOp op,
                          PyObject* operand, PyObject* operand2 = nullptr);
     void clear_filter_condition();  // drops the stored operands/path (not membership)
@@ -170,12 +190,27 @@ public:
 
     // Rebuilds sort_index from cached_anchor_dict using group_field (primary)
     // + sort_field (secondary); natural PyDict order if both empty. Missing/
-    // incomparable values sort last, never raise.
+    // incomparable values sort last, never raise. Stable: rows that tie keep
+    // their dict (insertion) order — the same order the incremental
+    // bisect-insert produces (a new row lands after the rows it ties with).
     void rebuild_sort_index();
 
-    // Keys in current presentation order — used to snapshot "old" positions
-    // before a reconfigure.
-    std::vector<PyObject*> current_presentation_order(PyObject* d) const;
+    // Keys in RAW order — sort_index when a maintained snapshot exists, else
+    // the dict's own order. Filter-blind: this is the sequence
+    // rebuild_visible_index() filters down to visible_index.
+    std::vector<PyObject*> raw_order(PyObject* d) const;
+
+    // Content hashes of the keys in PRESENTATION order (visible_index under
+    // an active filter, else raw_order()) — the "before" side of every diff.
+    // Hashes rather than pointers on purpose: a key freed by the mutation in
+    // between (deleted row, rebuilt sort_index dropping its last reference)
+    // must never be dereferenced again.
+    std::vector<uint64_t> presentation_snapshot(PyObject* d) const;
+
+    // Diffs two presentation snapshots into IndexDiff (see its comment for
+    // the vocabulary). O(n) with two hash maps.
+    static IndexDiff diff_snapshots(const std::vector<uint64_t>& before,
+                                    const std::vector<uint64_t>& after);
 
     // The ordering rule (group primary, sort secondary) over already-
     // extracted values — shared by sort_index_less() and rebuild_sort_index()
@@ -191,7 +226,10 @@ public:
     // Bisect-inserts `key` (caller guarantees it isn't already in sort_index)
     // — O(log n) search + O(shift) pointer-only vector::insert. Requires the
     // write to have already happened, since it reads the row's field
-    // value(s). Deliberately does NOT also maintain a key->position hash map
+    // value(s). Lands AFTER every row it ties with (upper_bound): ties keep
+    // insertion order, and a cursor with no sort/group field — where every
+    // row ties — appends, i.e. natural insertion order (lower_bound would
+    // put every new row at position 0). Deliberately does NOT also maintain a key->position hash map
     // during the shift: touching a hashmap entry per shifted element is far
     // more expensive than the memmove vector::insert already does (an
     // earlier attempt at this regressed insert() 100x+ at 50k-100k rows).
@@ -206,6 +244,9 @@ public:
     // (insert of a new or overwritten key, or update_row) — every other row's
     // relative order is unaffected, so no full rebuild_sort_index() is
     // needed. O(log n) search + O(shift distance), vs. a full O(n log n) rebuild.
+    // Stays put when it can: if the old slot is still inside the run of rows
+    // equal to the row's current values, the row goes back exactly there —
+    // an update to an unrelated field never reports a move.
     Py_ssize_t reposition_in_sort_index(PyObject* key, Py_ssize_t old_pos);
 
     // A row's sort-relevant field values, captured BEFORE a mutation so the
@@ -240,7 +281,7 @@ public:
     // be non-null. Returns false (PyErr set) if the predicate raises.
     bool update_filter_membership_one(uint64_t key_hash, PyObject* row);
 
-    // Rebuilds visible_index from current_presentation_order() filtered down
+    // Rebuilds visible_index from raw_order() filtered down
     // to filter_membership — O(n). Call wherever rebuild_filter_membership()
     // is called for a full reconfigure (set_filter/resync/rebind), and
     // wherever rebuild_sort_index() runs while a filter is active (the
@@ -250,14 +291,24 @@ public:
 
     // visible_index counterparts to bisect_insert_sort_index()/
     // erase_from_sort_index()/reposition_in_sort_index()/
-    // find_sort_index_position() above — same shape, same reasoning
-    // (shifting a second *vector* is cheap, same cost class as sort_index's
-    // own memmove; kept as parallel functions rather than unified via a
-    // vector-reference parameter, matching this project's preference for
-    // simple duplication over premature abstraction).
-    Py_ssize_t bisect_insert_visible_index(PyObject* key);
+    // find_sort_index_position() above — same shape (shifting a second
+    // *vector* is cheap, same cost class as sort_index's own memmove) and,
+    // with a sort/group comparator, the same bisect rules (O(log n); a
+    // reposition stays in its old slot while that slot is still inside its
+    // tie run). Without a comparator (natural order) every row "ties", so a
+    // value bisect would put a newly visible row at the END of the list —
+    // wrong: visible_index is the filtered SUBSEQUENCE of sort_index, and a
+    // row revealed by a filter change must reappear in its dict-order place.
+    // Natural order therefore derives the slot from the row's (already
+    // final) position `raw_pos` in sort_index: right after the nearest
+    // visible row that precedes it there (visible_position_from_raw). A
+    // sorted cursor uses the same look-back, bounded, only for a row
+    // REVEALED mid-run by a filter flip — see place_in_visible_index() in
+    // the .cpp for the exact rules.
+    Py_ssize_t visible_position_from_raw(PyObject* key, Py_ssize_t raw_pos, Py_ssize_t max_walk) const;
+    Py_ssize_t bisect_insert_visible_index(PyObject* key, Py_ssize_t raw_pos);
     void erase_from_visible_index(Py_ssize_t pos);
-    Py_ssize_t reposition_in_visible_index(PyObject* key, Py_ssize_t old_pos);
+    Py_ssize_t reposition_in_visible_index(PyObject* key, Py_ssize_t old_pos, Py_ssize_t raw_pos);
     Py_ssize_t find_visible_index_position(PyObject* key, const SortKeyValues* old_vals = nullptr) const;
 
     // Re-resolves the anchored dict fresh every call (never cache the raw
@@ -267,11 +318,13 @@ public:
     // set) if the anchor no longer resolves at all.
     PyObject* resolve_cursor_dict();
 
-    // Recomputes sort_index/filter_membership against cached_anchor_dict's
-    // current contents and diffs against their prior state — the full-O(n)
-    // fallback for sibling notification when no mutation hint is available
-    // (RowProxy writes, wholesale rebinds, insert_batch). Assumes
-    // resolve_cursor_dict() has already been called.
+    // Recomputes sort_index/filter_membership/visible_index against
+    // cached_anchor_dict's current contents and diffs against their prior
+    // state — the full-O(n) fallback for sibling notification when no
+    // mutation hint is available (RowProxy writes, wholesale rebinds,
+    // insert_batch). Assumes resolve_cursor_dict() has already been called.
+    // Only meaningful with a maintained snapshot (has_derived_order or an
+    // active filter): without one there is no "before" to diff against.
     IndexDiff resync_and_diff();
 
     // A mutation's identity, carried from the originating cursor's method to
@@ -290,13 +343,21 @@ public:
         PyObject* key;
         bool key_existed;
         // The row AS IT WAS before the mutation (borrowed for the notify
-        // call; nullptr for a brand-new Insert). Siblings need it to locate
-        // the row's OLD position by bisect on their OWN sort fields — which
-        // the originator can't precompute for them, since every cursor sorts
-        // by its own field. Update mutates the row dict in place, so the
-        // originator hands over a shallow snapshot; Remove keeps the removed
-        // row alive across the notify with an INCREF.
+        // call; nullptr for a brand-new Insert, or when the originator has
+        // no snapshot — a sibling then falls back to a linear scan for the
+        // old position, still far cheaper than a full resync). Siblings need
+        // it to locate the row's OLD position by bisect on their OWN sort
+        // fields — which the originator can't precompute for them, since
+        // every cursor sorts by its own field. Update mutates the row dict
+        // in place, so the originator hands over a shallow snapshot; Remove
+        // keeps the removed row alive across the notify with an INCREF.
         PyObject* old_row;
+        // The dict `key` lives in (borrowed). A sibling applies the hint only
+        // if this is its OWN anchored dict — a mutation under the same
+        // top-level key but at another level (a different sub-table, or a
+        // field write inside a row) is not this table's row insert/update/
+        // remove, and such a sibling takes the full resync instead.
+        PyObject* dict;
     };
 
     // Applies one hinted mutation to THIS (sibling) cursor's derived state —
@@ -304,11 +365,11 @@ public:
     // cursor_update_row()/cursor_delete() post-write maintenance, so both
     // cursors converge on identical index states. Requires has_derived_order
     // (a maintained snapshot to update); the anchored dict already contains
-    // the mutation. Returns the same diff convention resync_and_diff()
-    // produces (raw sort_index positions, hidden rows omitted, -1 = absent
-    // side) — built only when want_diff (someone listens for "reorder");
-    // index maintenance happens either way. May leave PyErr set (filter
-    // predicate raised) — caller decides whether to clear.
+    // the mutation. Returns the same diff resync_and_diff() would (IndexDiff
+    // vocabulary: presentation positions, only what moved) — built only when
+    // want_diff (someone listens for "reorder"); index maintenance happens
+    // either way. May leave PyErr set (filter predicate raised) — caller
+    // decides whether to clear.
     IndexDiff sibling_apply_hint(const CursorMutationHint& hint, bool want_diff);
 
     void dispatch_event(const char* event_type, PyObject* payload);
@@ -388,7 +449,10 @@ public:
     PyObject* get_row_ref(uint64_t outer_hash) const;
 
     bool remove(const ModValue& key);
-    void reindex_row(uint64_t outer_hash);
+    // `hint`: set by a RowProxy write that inserted/overwrote/removed ONE key
+    // of ONE dict under this row (see CursorMutationHint) — lets cursors
+    // anchored on exactly that dict update incrementally; nullptr elsewhere.
+    void reindex_row(uint64_t outer_hash, const CursorMutationHint* hint = nullptr);
 
     // Same field-index rebuild as reindex_row(), but skips the link-validation
     // pass. Used internally by delete_with_link_semantics() for the reindex

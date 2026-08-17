@@ -202,6 +202,13 @@ static PyObject* RowProxy_create(ModDictObject* owner, PyObject* row, uint64_t o
     p->row = row; p->owner = owner; p->outer_hash = oh; p->is_root = is_root;
     return (PyObject*)p;
 }
+// Whether a row handed out by root [key]/get() must be a RowProxy: someone
+// has to hear about a nested write through it — a field index to keep in
+// sync, or a live cursor whose sort_index/visible_index would otherwise
+// drift silently from the dict. Neither → the raw dict, no wrapper cost.
+static inline bool row_writes_observed(ModDictObject* s) {
+    return !s->internal->indices.by_field.empty() || s->internal->has_live_cursors();
+}
 static void RowProxy_dealloc(RowProxyObject* s) {
     Py_XDECREF(s->row); Py_XDECREF(s->owner);
     Py_TYPE(s)->tp_free((PyObject*)s);
@@ -232,20 +239,38 @@ static bool try_link_delete(RowProxyObject* s, PyObject* key, int& out_r) {
     out_r = s->owner->internal->delete_with_link_semantics(std::string(table), key) ? 0 : -1;
     return true;
 }
+// A single-key write through a RowProxy is exactly the shape a cursor
+// anchored on that very dict can apply incrementally (see
+// CursorMutationHint): capture what a cursor needs BEFORE the write — did the
+// key exist, and the value it had (INCREF'd across the notify: for a delete
+// the dict's own reference is gone by then).
+struct RowWriteHint {
+    ModDict::CursorMutationHint hint;
+    PyObject* held = nullptr;
+    RowWriteHint(PyObject* dict, PyObject* key, ModDict::CursorMutationHint::Kind kind) {
+        bool existed = PyDict_Check(dict) && PyDict_Contains(dict, key) == 1;
+        PyObject* old = existed ? PyDict_GetItem(dict, key) : nullptr;  // borrowed
+        Py_XINCREF(old); held = old;
+        hint = ModDict::CursorMutationHint{kind, key, existed, old, dict};
+    }
+    ~RowWriteHint() { Py_XDECREF(held); }
+};
 static int RowProxy_setitem(RowProxyObject* s, PyObject* key, PyObject* value) {
     if (!value) {
         int r;
         if (try_link_delete(s, key, r)) return r;  // deletion (+ reindex) already applied inside
+        RowWriteHint h(s->row, key, ModDict::CursorMutationHint::Kind::Remove);
         int dr = PyObject_DelItem(s->row, key);
         if (dr == 0 && s->owner->internal) {
-            s->owner->internal->reindex_row(s->outer_hash);
+            s->owner->internal->reindex_row(s->outer_hash, &h.hint);
             if (PyErr_Occurred()) return -1;  // reindex_row may raise (link validation)
         }
         return dr;
     }
+    RowWriteHint h(s->row, key, ModDict::CursorMutationHint::Kind::Insert);
     int r = PyObject_SetItem(s->row, key, value);
     if (r == 0 && s->owner->internal) {
-        s->owner->internal->reindex_row(s->outer_hash);
+        s->owner->internal->reindex_row(s->outer_hash, &h.hint);
         if (PyErr_Occurred()) return -1;  // reindex_row may raise (link validation)
     }
     return r;
@@ -285,12 +310,15 @@ static PyObject* RowProxy_pop(RowProxyObject* s, PyObject* args) {
         }
     }
 
+    RowWriteHint h(s->row, key, ModDict::CursorMutationHint::Kind::Remove);
     PyObject* fn = PyObject_GetAttrString(s->row, "pop");
     if (!fn) return nullptr;
     PyObject* res = PyObject_Call(fn, args, nullptr);
     Py_DECREF(fn);
     if (res && s->owner->internal) {
-        s->owner->internal->reindex_row(s->outer_hash);
+        // pop() of a missing key with a default removed nothing — a Remove
+        // hint for a key that was never there is a no-op for every cursor.
+        s->owner->internal->reindex_row(s->outer_hash, &h.hint);
         if (PyErr_Occurred()) { Py_DECREF(res); return nullptr; }
     }
     return res;
@@ -325,7 +353,7 @@ static PyObject* ModDict_getitem(ModDictObject* s,PyObject* key) {
     uint64_t oh=content_hash_pyobj(key);
     auto* e=s->internal->outer.find(oh);
     if(!e){PyErr_SetObject(PyExc_KeyError,key);return nullptr;}
-    if(e->is_row && !s->internal->indices.by_field.empty())
+    if(e->is_row && row_writes_observed(s))
         return RowProxy_create(s, e->val_py, oh);
     Py_INCREF(e->val_py); return e->val_py;
 }
@@ -333,6 +361,12 @@ static int ModDict_setitem(ModDictObject* s,PyObject* key,PyObject* value) {
     if (s->internal->root) {
         PyObject* d = s->internal->resolve_cursor_dict();
         if (!d) return -1;
+        // Same single-key hint a RowProxy write carries. No originator: a
+        // raw write is "someone else" from this cursor's own presentation
+        // state's point of view — it updates itself through the same
+        // sibling path (and fires its own "reorder" if it listens).
+        RowWriteHint h(d, key, value ? ModDict::CursorMutationHint::Kind::Insert
+                                     : ModDict::CursorMutationHint::Kind::Remove);
         if (!value) {  // del cursor[key]
             if (PyDict_DelItem(d, key) != 0) return -1;
         } else if (PyDict_SetItem(d, key, value) != 0) {
@@ -340,7 +374,7 @@ static int ModDict_setitem(ModDictObject* s,PyObject* key,PyObject* value) {
         }
         // Keep the root's own field-indices consistent, same as RowProxy
         // does for root-level nested writes.
-        s->internal->true_root()->reindex_row_no_validate(s->internal->cached_top_hash);
+        s->internal->true_root()->reindex_row_no_validate(s->internal->cached_top_hash, nullptr, &h.hint);
         return 0;
     }
     ModValue mk=ModValue::from_pyobject(key);
@@ -399,7 +433,7 @@ static PyObject* ModDict_get(ModDictObject* s,PyObject* args){
     uint64_t oh=content_hash_pyobj(key);
     auto* e=s->internal->outer.find(oh);
     if(!e){Py_INCREF(def);return def;}
-    if(e->is_row && !s->internal->indices.by_field.empty())
+    if(e->is_row && row_writes_observed(s))
         return RowProxy_create(s, e->val_py, oh);
     Py_INCREF(e->val_py); return e->val_py;
 }
@@ -450,7 +484,10 @@ static PyObject* ModDict_update(ModDictObject* s,PyObject* args,PyObject* kwargs
 
     // Path mode: mn.update(other, to_path=...) — from_path defaults to to_path
     // mn.update(other, '?', '?.geo')  →  match self[?] with other[?].geo
+    // Either one given alone stands for both (mn.update(other, "?") is the
+    // positional spelling of to_path="?").
     if(!os) os=ot;  // from_path defaults to to_path
+    if(!ot) ot=os;  // ...and vice versa — never a null path into the parser
     std::vector<std::string> ss,ts;
     auto ons=parse_merge_path(os,ss), ont=parse_merge_path(ot,ts);
     if(ons.empty()) MOD_DICT_RAISE(PyExc_TypeError,"from_path must be str or tuple");
@@ -1292,16 +1329,32 @@ static PyObject* ModDict_has_index(ModDictObject* s,PyObject* args){
     return PyBool_FromLong(wc?s->internal->has_index(pat):s->internal->has_index(simple));
 }
 
-/* Cursor flags: set_sort/set_filter/set_group */
+/* Cursor flags: set_sort/set_filter/set_group — all three take the same
+   `path` INTO each row (field name, dotted path, or tuple of segments), via
+   the same parser; a wildcard `?` segment makes no sense for a per-row path
+   and is rejected. */
+static bool parse_row_path(PyObject* obj, const char* who, std::vector<std::string>& out) {
+    std::string simple; std::vector<std::string> pattern; bool wc = false;
+    if (!parse_field_or_pattern(obj, simple, pattern, wc)) {
+        PyErr_Format(PyExc_TypeError, "%s: path must be str or tuple", who);
+        return false;
+    }
+    out = wc ? pattern : std::vector<std::string>{simple};
+    for (auto& seg : out)
+        if (seg == "__pass_key__" || seg == "__scan_key__" || seg == "__follow_link__") {
+            PyErr_Format(PyExc_ValueError, "%s: path is a literal path into each row - no '?' wildcard segments or '->' hops", who);
+            return false;
+        }
+    return true;
+}
 static PyObject* ModDict_set_sort(ModDictObject* s, PyObject* args, PyObject* kw) {
     MOD_DICT_REQUIRE_CURSOR(s, "set_sort()");
     PyObject* fo; int rev = 0;
-    static const char* kwl[] = {"field", "reverse", nullptr};
+    static const char* kwl[] = {"path", "reverse", nullptr};
     if (!PyArg_ParseTupleAndKeywords(args, kw, "O|p", (char**)kwl, &fo, &rev)) return nullptr;
-    std::string simple; std::vector<std::string> pattern; bool wc = false;
-    if (!parse_field_or_pattern(fo, simple, pattern, wc)) MOD_DICT_RAISE(PyExc_TypeError, "set_sort: field must be str or tuple");
-    std::vector<std::string> field = wc ? pattern : std::vector<std::string>{simple};
-    auto diff = s->internal->set_sort(field, (bool)rev);
+    std::vector<std::string> path;
+    if (!parse_row_path(fo, "set_sort", path)) return nullptr;
+    auto diff = s->internal->set_sort(path, (bool)rev);
     if (PyErr_Occurred()) return nullptr;
     return index_diff_to_pylist(diff);
 }
@@ -1309,13 +1362,9 @@ static PyObject* ModDict_set_group(ModDictObject* s, PyObject* args) {
     MOD_DICT_REQUIRE_CURSOR(s, "set_group()");
     PyObject* fo;
     if (!PyArg_ParseTuple(args, "O", &fo)) return nullptr;
-    std::vector<std::string> field;
-    if (fo != Py_None) {
-        std::string simple; std::vector<std::string> pattern; bool wc = false;
-        if (!parse_field_or_pattern(fo, simple, pattern, wc)) MOD_DICT_RAISE(PyExc_TypeError, "set_group: field must be str, tuple, or None");
-        field = wc ? pattern : std::vector<std::string>{simple};
-    }
-    auto diff = s->internal->set_group(field);
+    std::vector<std::string> path;
+    if (fo != Py_None && !parse_row_path(fo, "set_group", path)) return nullptr;
+    auto diff = s->internal->set_group(path);
     if (PyErr_Occurred()) return nullptr;
     return index_diff_to_pylist(diff);
 }
@@ -1374,6 +1423,15 @@ static PyObject* ModDict_connect(ModDictObject* s, PyObject* args) {
     }
     Py_DECREF(key);
     if (PyList_Append(listeners, cb) != 0) return nullptr;
+    // A "reorder" listener wants (old_index, new_index) diffs for mutations
+    // made elsewhere — that needs a maintained "before" snapshot to diff
+    // against, which a cursor that never sorted/filtered/mutated doesn't
+    // have yet (its presentation order IS the dict, already post-mutation
+    // by the time it's notified). Bootstrap it now, natural order.
+    if (strcmp(event, "reorder") == 0 && !s->internal->has_derived_order) {
+        if (!s->internal->resolve_cursor_dict()) return nullptr;
+        s->internal->rebuild_sort_index();
+    }
     Py_RETURN_NONE;
 }
 
@@ -2386,8 +2444,9 @@ static PyObject* ModDict_pop(ModDictObject* s, PyObject* args){
             return nullptr;
         }
         Py_INCREF(val);  // keep it alive past the delete below
+        ModDict::CursorMutationHint hint{ModDict::CursorMutationHint::Kind::Remove, key, true, val, d};
         if (PyDict_DelItem(d, key) != 0) { Py_DECREF(val); return nullptr; }
-        s->internal->true_root()->reindex_row_no_validate(s->internal->cached_top_hash);
+        s->internal->true_root()->reindex_row_no_validate(s->internal->cached_top_hash, nullptr, &hint);
         return val;
     }
     PyObject* val = ModDict_getitem(s, key);
@@ -2424,9 +2483,9 @@ static PyMethodDef ModDict_methods[]={
     {"select_mass",(PyCFunction)ModDict_select_mass,METH_VARARGS|METH_KEYWORDS,"select_mass(fields,returns='rows')->ModDict|list[list] — multiple fields, one column/sub-dict per field"},
     {"group_by",(PyCFunction)ModDict_group_by,METH_VARARGS,"group_by(field)->dict"},
     {"cursor",(PyCFunction)ModDict_cursor,METH_VARARGS,"cursor(path)->ModDict — live handle anchored at an existing nested table; path must already exist"},
-    {"set_sort",(PyCFunction)(PyCFunctionWithKeywords)ModDict_set_sort,METH_VARARGS|METH_KEYWORDS,"set_sort(field,reverse=False)->list[(old_index|None,new_index)] — cursor only"},
-    {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(field_or_None)->list[(old_index|None,new_index)] — cursor only"},
-    {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(path)->FilterBuilder; then .eq/.ne/.lt/.lte/.gt/.gte/.between/.in_/.text_search/.predicate(...) -> list[(old_index|None,new_index)] installs the condition; path '?' = the row itself; set_filter(None) clears; cursor only"},
+    {"set_sort",(PyCFunction)(PyCFunctionWithKeywords)ModDict_set_sort,METH_VARARGS|METH_KEYWORDS,"set_sort(path,reverse=False)->list[(old_index|None,new_index|None)] — cursor only; only rows that moved"},
+    {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(path_or_None)->list[(old_index|None,new_index|None)] — cursor only; only rows that moved"},
+    {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(path)->FilterBuilder; then .eq/.ne/.lt/.lte/.gt/.gte/.between/.in_/.text_search/.predicate(...) -> list[(old_index|None,new_index|None)] installs the condition; path '?' = the row itself; set_filter(None) clears; cursor only"},
     {"connect",(PyCFunction)ModDict_connect,METH_VARARGS,"connect(event_type,callback)->None — cursor only; events: insert/update/delete/reorder"},
     {"disconnect",(PyCFunction)ModDict_disconnect,METH_VARARGS,"disconnect(event_type=None,callback=None)->int — (event,cb): drop that callback; (event): drop the event's listeners; (): drop everything; returns how many were removed (0 = nothing matched); cursor only"},
     {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->(int|None,dict) — (new_index, row); cursor only"},
