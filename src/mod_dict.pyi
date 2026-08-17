@@ -216,6 +216,36 @@ class FilterBuilder:
         """
         ...
 
+    def text_search(
+        self, needle: str,
+        mode: Literal["contains", "startswith", "endswith"] = "contains",
+        returns: Literal["rows", "rows_here", "values"] = "rows",
+        value_field: Any | None = None,
+    ) -> ModDict | list[Any]:
+        """Return rows whose **str** field contains / starts with / ends with
+        *needle* — **case-insensitive** (both sides casefolded, so ``"É"``
+        matches ``"é"``, ``"ß"`` matches ``"ss"``).
+
+        Always a **scan**: no index can answer a substring predicate, and
+        none is built as a side effect. A field whose value isn't a ``str``
+        never matches. An empty *needle* matches every str field (same as
+        Python's ``"" in s``).
+
+        Same path grammar and result shapes as the other operators — dotted
+        paths, wildcard ``"table.?.field"``, ``->`` link hops, chaining, and
+        the ``returns`` / ``value_field`` parameters (see :meth:`eq`) all
+        work identically.
+
+        Example::
+
+            mn.filter("name").text_search("ali")                       # "Alice", "Natalia", ...
+            mn.filter("name").text_search("al", mode="startswith")     # "Alice", "Alan"
+            mn.filter("email").text_search("@example.com", mode="endswith")
+            mn.filter("orders.?.note").text_search("urgent")           # wildcard path
+            mn.filter("name").text_search("ali", returns="values", value_field="id")
+        """
+        ...
+
 
 class ModDict:
     """

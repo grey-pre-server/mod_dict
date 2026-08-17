@@ -310,8 +310,51 @@ bool ModDict::remove(const ModValue& key) {
 
 // ── compare helper ───────────────────────────────────────────────────────────
 
+// Case-insensitive substring/prefix/suffix test of `field` (any PyObject —
+// non-str never matches) against `needle`, which the CALLER has already
+// casefolded once (so only the field value is folded here, per row).
+// ASCII fast path: both compact-ASCII → byte compare with tolower, no
+// allocation; anything else → PyUnicode casefold + PyUnicode_Tailmatch/Find.
+bool text_match(PyObject* field, FilterOp op, PyObject* needle) {
+    if (!field || !PyUnicode_Check(field)) return false;
+    Py_ssize_t nlen = PyUnicode_GET_LENGTH(needle);
+    if (nlen == 0) return true;  // empty needle matches every string, like Python's `"" in s`
+    if (PyUnicode_IS_COMPACT_ASCII(field) && PyUnicode_IS_COMPACT_ASCII(needle)) {
+        const unsigned char* h = (const unsigned char*)PyUnicode_DATA(field);
+        const unsigned char* n = (const unsigned char*)PyUnicode_DATA(needle);
+        Py_ssize_t hlen = PyUnicode_GET_LENGTH(field);
+        if (nlen > hlen) return false;
+        auto eq_at = [&](Py_ssize_t off) {
+            for (Py_ssize_t i = 0; i < nlen; i++)
+                if (tolower(h[off + i]) != n[i]) return false;  // needle already lowercase
+            return true;
+        };
+        switch (op) {
+            case FilterOp::TEXT_STARTSWITH: return eq_at(0);
+            case FilterOp::TEXT_ENDSWITH:   return eq_at(hlen - nlen);
+            default: for (Py_ssize_t off = 0; off + nlen <= hlen; off++) if (eq_at(off)) return true; return false;
+        }
+    }
+    PyObject* folded = PyObject_CallMethod(field, "casefold", nullptr);
+    if (!folded) { PyErr_Clear(); return false; }
+    Py_ssize_t flen = PyUnicode_GET_LENGTH(folded);
+    bool r;
+    switch (op) {
+        case FilterOp::TEXT_STARTSWITH: r = PyUnicode_Tailmatch(folded, needle, 0, flen, -1) == 1; break;
+        case FilterOp::TEXT_ENDSWITH:   r = PyUnicode_Tailmatch(folded, needle, 0, flen,  1) == 1; break;
+        default:                        r = PyUnicode_Find(folded, needle, 0, flen, 1) >= 0; break;
+    }
+    Py_DECREF(folded);
+    if (PyErr_Occurred()) { PyErr_Clear(); return false; }
+    return r;
+}
+
 static bool compare_values(const ModValue& a, FilterOp op, const ModValue& b) {
     switch (op) {
+        case FilterOp::TEXT_CONTAINS:
+        case FilterOp::TEXT_STARTSWITH:
+        case FilterOp::TEXT_ENDSWITH:
+            return text_match(a.obj, op, b.obj);
         case FilterOp::EQ: return  a.equals(b);
         case FilterOp::NE: return !a.equals(b);
         case FilterOp::LT:
@@ -490,6 +533,19 @@ static PyObject* prune_match(PyObject* cur,
 ModDict* ModDict::filter(const std::string& field, FilterOp op, const ModValue& value) const {
     ModDict* result = new ModDict();
 
+    // Text ops: no index can serve a substring predicate — straight to the
+    // scan, and don't build a FieldIndex as a side effect either.
+    if (is_text_op(op)) {
+        for (auto& e : outer.occupied()) {
+            if (!e.value.is_row || !e.value.val_py) continue;
+            PyObject* fv_obj = get_nested(e.value.val_py, {field});
+            if (!fv_obj) continue;
+            ModValue fv = ModValue::from_pyobject_for_compare(fv_obj);
+            if (compare_values(fv, op, value)) filter_add_row(result, this, e.key);
+        }
+        return result;
+    }
+
     auto* idx_ptr = indices.by_field.find(field);
     if (!idx_ptr) {
         const_cast<ModDict*>(this)->create_index(field);
@@ -619,12 +675,18 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
 
     ModDict* result = new ModDict();
 
-    auto* idx_ptr = indices.by_field.find(key);
-    if (!idx_ptr) {
-        const_cast<ModDict*>(this)->create_index(pattern);
-        idx_ptr = indices.by_field.find(key);
+    // Text ops never use the index (see the flat overload) — skip building
+    // one; the scan branches below only need `idx` for the EQ fast paths,
+    // which a text op never enters.
+    FieldIndex* idx = nullptr;
+    if (!is_text_op(op)) {
+        auto* idx_ptr = indices.by_field.find(key);
+        if (!idx_ptr) {
+            const_cast<ModDict*>(this)->create_index(pattern);
+            idx_ptr = indices.by_field.find(key);
+        }
+        idx = *idx_ptr;
     }
-    FieldIndex* idx = *idx_ptr;
 
     // For wildcard patterns, compute anchor once (used in all paths below)
     bool anchored = (!pattern.empty() && pattern[0] != "__pass_key__");
@@ -689,7 +751,7 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
     } else if (op == FilterOp::EQ) {
         auto* bucket = idx->find_eq(value.hash());
         if (bucket) for (uint64_t oh : *bucket) filter_add_row(result, this, oh);
-    } else if (op != FilterOp::NE && idx->is_numeric_range_supported(value)) {
+    } else if (idx && op != FilterOp::NE && idx->is_numeric_range_supported(value)) {
         if (!idx->is_wildcard) {
             for (uint64_t oh : idx->find_range(op, value)) filter_add_row(result, this, oh);
         } else {

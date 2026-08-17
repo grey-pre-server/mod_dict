@@ -10,7 +10,15 @@
 #include <algorithm>
 
 enum class MergeConflict { KEEP_LEFT, KEEP_RIGHT, MERGE, CONCAT };
-enum class FilterOp      { EQ, NE, LT, LE, GT, GE };
+// The three TEXT_* ops are substring predicates over str fields — always a
+// scan (no index can serve them), case-insensitive via casefold, and a
+// non-str field value simply doesn't match. Exposed as
+// filter(path).text_search(needle, mode=...).
+enum class FilterOp      { EQ, NE, LT, LE, GT, GE, TEXT_CONTAINS, TEXT_STARTSWITH, TEXT_ENDSWITH };
+inline bool is_text_op(FilterOp op) { return op >= FilterOp::TEXT_CONTAINS; }
+// The text-op predicate (defined in mod_dict.cpp): `needle` must already be
+// casefolded by the caller; a non-str `field` never matches.
+bool text_match(PyObject* field, FilterOp op, PyObject* needle);
 enum class LinkOnDelete  { RESTRICT, CASCADE, SET_NULL };
 
 // ──────────────────────────────────────────────────────────────────────────────

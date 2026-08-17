@@ -582,6 +582,7 @@ static void FilterBuilder_dealloc(FilterBuilderObject* s){Py_XDECREF(s->owner);f
 
 /* ── scan_here helpers for returns="rows_here"/"values" ── */
 static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
+    if (is_text_op(op)) return text_match(pyobj, op, fval.obj);
     ModValue v = ModValue::from_pyobject(pyobj);
     if (op == FilterOp::EQ) return v.equals(fval);
     if (op == FilterOp::NE) return !v.equals(fval);
@@ -717,6 +718,39 @@ static PyObject* FB_lt(FilterBuilderObject* s,PyObject* a,PyObject* kw){return f
 static PyObject* FB_lte(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::LE);}
 static PyObject* FB_gt(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::GT);}
 static PyObject* FB_gte(FilterBuilderObject* s,PyObject* a,PyObject* kw){return fb_op(s,a,kw,FilterOp::GE);}
+// text_search(needle, mode="contains"|"startswith"|"endswith", *, returns=, value_field=)
+// Case-insensitive substring/prefix/suffix over str fields — a SCAN (no index
+// can answer it, none is built as a side effect). The needle is casefolded
+// ONCE here; the per-row side folds only the field value (text_match in
+// mod_dict.cpp). Rides the same fb_op path as eq()/gte(), so returns=,
+// wildcard paths, "->" hops and chaining all behave exactly as they do there.
+static PyObject* FB_text_search(FilterBuilderObject* s,PyObject* args,PyObject* kw){
+    PyObject* needle; const char* mode="contains"; const char* ret="rows"; PyObject* vf_obj=nullptr;
+    static const char* kwl[]={"needle","mode","returns","value_field",nullptr};
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|ssO",(char**)kwl,&needle,&mode,&ret,&vf_obj)) return nullptr;
+    if(!PyUnicode_Check(needle)) MOD_DICT_RAISE(PyExc_TypeError,"text_search: needle must be a str");
+    FilterOp op;
+    if(!strcmp(mode,"contains")) op=FilterOp::TEXT_CONTAINS;
+    else if(!strcmp(mode,"startswith")) op=FilterOp::TEXT_STARTSWITH;
+    else if(!strcmp(mode,"endswith")) op=FilterOp::TEXT_ENDSWITH;
+    else MOD_DICT_RAISE(PyExc_ValueError,"text_search: mode must be 'contains', 'startswith', or 'endswith'");
+    PyObject* folded=PyObject_CallMethod(needle,"casefold",nullptr);
+    if(!folded) return nullptr;
+    // Re-enter through fb_op with the folded needle as the value, so every
+    // downstream path (rows / rows_here / values, wildcard, "->", relay)
+    // is the shared one.
+    PyObject* nargs=PyTuple_Pack(1,folded);
+    Py_DECREF(folded);
+    if(!nargs) return nullptr;
+    PyObject* nkw=PyDict_New();
+    if(!nkw){Py_DECREF(nargs);return nullptr;}
+    PyObject* rs=PyUnicode_FromString(ret);
+    if(rs){PyDict_SetItemString(nkw,"returns",rs);Py_DECREF(rs);}
+    if(vf_obj) PyDict_SetItemString(nkw,"value_field",vf_obj);
+    PyObject* r=fb_op(s,nargs,nkw,op);
+    Py_DECREF(nargs); Py_DECREF(nkw);
+    return r;
+}
 // FB_between/FB_in_ "rows" paths normally compose multiple filter() calls by
 // chaining (between: re-filter the previous result) or by outer-key de-dup
 // (in_: skip if the anchor hash is already present). Both assumptions break
@@ -924,6 +958,7 @@ static PyMethodDef FB_methods[]={
     {"gte",(PyCFunction)(PyCFunctionWithKeywords)FB_gte,METH_VARARGS|METH_KEYWORDS,"gte(value,*,returns='rows',value_field=None)"},
     {"between",(PyCFunction)(PyCFunctionWithKeywords)FB_between,METH_VARARGS|METH_KEYWORDS,"between(lo,hi,*,returns='rows',value_field=None)"},
     {"in_",(PyCFunction)(PyCFunctionWithKeywords)FB_in_,METH_VARARGS|METH_KEYWORDS,"in_(values,*,returns='rows',value_field=None)"},
+    {"text_search",(PyCFunction)(PyCFunctionWithKeywords)FB_text_search,METH_VARARGS|METH_KEYWORDS,"text_search(needle,mode='contains',*,returns='rows',value_field=None) — case-insensitive substring/startswith/endswith over str fields; always a scan"},
     {NULL,NULL,0,NULL}};
 PyTypeObject FilterBuilder_Type={
     .tp_name="mod_dict.FilterBuilder",.tp_basicsize=sizeof(FilterBuilderObject),
