@@ -622,6 +622,22 @@ static FilterOp parse_op(const char* s){
 struct FilterBuilderObject{PyObject_HEAD ModDictObject* owner;char* field;std::vector<std::string>* pattern;bool cursor_mode;};
 static void FilterBuilder_dealloc(FilterBuilderObject* s){Py_XDECREF(s->owner);free(s->field);delete s->pattern;Py_TYPE(s)->tp_free(s);}
 
+// set_sort()/set_group()/set_filter(): the diff is RETURNED and also fired
+// as this cursor's own "reorder" event with the same payload — the same
+// rule insert()/update_row()/delete() follow with their typed events: the
+// return value serves the caller, the event serves a listener elsewhere (a
+// GUI model applying every presentation change from one place, whoever
+// triggered it). Fires even when nothing moved (empty list), like the
+// sibling path does. A listener's exception propagates, as for the other
+// own-call events.
+static PyObject* return_and_fire_reorder(ModDictObject* s, const ModDict::IndexDiff& diff){
+    PyObject* payload=index_diff_to_pylist(diff);
+    if(!payload) return nullptr;
+    s->internal->dispatch_event("reorder",payload);
+    if(PyErr_Occurred()){ Py_DECREF(payload); return nullptr; }
+    return payload;
+}
+
 // Installs (op, operand[, operand2]) as the cursor's filter condition and
 // returns the set_filter() diff. The path is the builder's field/pattern —
 // a plain field name, a dotted path, or empty for "?". A path containing a
@@ -642,7 +658,7 @@ static PyObject* install_cursor_filter(FilterBuilderObject* s, FilterOp op, PyOb
     }
     auto diff=s->owner->internal->set_filter(path,op,operand,operand2);
     if(PyErr_Occurred()) return nullptr;
-    return index_diff_to_pylist(diff);
+    return return_and_fire_reorder(s->owner,diff);
 }
 
 /* ── scan_here helpers for returns="rows_here"/"values" ── */
@@ -1347,16 +1363,22 @@ static bool parse_row_path(PyObject* obj, const char* who, std::vector<std::stri
         }
     return true;
 }
+// The three presentation flags share one reset form: set_sort(None) /
+// set_group(None) / set_filter(None) each clear their own state and return
+// (and fire) the diff back to whatever the other two still impose — natural
+// insertion order once all three are cleared.
 static PyObject* ModDict_set_sort(ModDictObject* s, PyObject* args, PyObject* kw) {
     MOD_DICT_REQUIRE_CURSOR(s, "set_sort()");
     PyObject* fo; int rev = 0;
     static const char* kwl[] = {"path", "reverse", nullptr};
     if (!PyArg_ParseTupleAndKeywords(args, kw, "O|p", (char**)kwl, &fo, &rev)) return nullptr;
     std::vector<std::string> path;
-    if (!parse_row_path(fo, "set_sort", path)) return nullptr;
-    auto diff = s->internal->set_sort(path, (bool)rev);
+    if (fo != Py_None && !parse_row_path(fo, "set_sort", path)) return nullptr;
+    // None clears: empty path = no sort field; reverse is meaningless then
+    // and reset too, so a later set_sort(path) starts ascending as documented.
+    auto diff = s->internal->set_sort(path, fo == Py_None ? false : (bool)rev);
     if (PyErr_Occurred()) return nullptr;
-    return index_diff_to_pylist(diff);
+    return return_and_fire_reorder(s, diff);
 }
 static PyObject* ModDict_set_group(ModDictObject* s, PyObject* args) {
     MOD_DICT_REQUIRE_CURSOR(s, "set_group()");
@@ -1366,7 +1388,7 @@ static PyObject* ModDict_set_group(ModDictObject* s, PyObject* args) {
     if (fo != Py_None && !parse_row_path(fo, "set_group", path)) return nullptr;
     auto diff = s->internal->set_group(path);
     if (PyErr_Occurred()) return nullptr;
-    return index_diff_to_pylist(diff);
+    return return_and_fire_reorder(s, diff);
 }
 // set_filter(path) -> FilterBuilder in cursor mode; the operator called on it
 // (eq/ne/lt/lte/gt/gte/between/in_/text_search/predicate) installs the
@@ -1379,7 +1401,7 @@ static PyObject* ModDict_set_filter(ModDictObject* s, PyObject* args) {
     if (fo == Py_None) {
         auto diff = s->internal->set_filter({}, FilterOp::EQ, nullptr, nullptr);
         if (PyErr_Occurred()) return nullptr;
-        return index_diff_to_pylist(diff);
+        return return_and_fire_reorder(s, diff);
     }
     if (PyCallable_Check(fo) && !PyUnicode_Check(fo))
         MOD_DICT_RAISE(PyExc_TypeError, "set_filter: pass a path, then choose the operator - "
@@ -2483,8 +2505,8 @@ static PyMethodDef ModDict_methods[]={
     {"select_mass",(PyCFunction)ModDict_select_mass,METH_VARARGS|METH_KEYWORDS,"select_mass(fields,returns='rows')->ModDict|list[list] — multiple fields, one column/sub-dict per field"},
     {"group_by",(PyCFunction)ModDict_group_by,METH_VARARGS,"group_by(field)->dict"},
     {"cursor",(PyCFunction)ModDict_cursor,METH_VARARGS,"cursor(path)->ModDict — live handle anchored at an existing nested table; path must already exist"},
-    {"set_sort",(PyCFunction)(PyCFunctionWithKeywords)ModDict_set_sort,METH_VARARGS|METH_KEYWORDS,"set_sort(path,reverse=False)->list[(old_index|None,new_index|None)] — cursor only; only rows that moved"},
-    {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(path_or_None)->list[(old_index|None,new_index|None)] — cursor only; only rows that moved"},
+    {"set_sort",(PyCFunction)(PyCFunctionWithKeywords)ModDict_set_sort,METH_VARARGS|METH_KEYWORDS,"set_sort(path_or_None,reverse=False)->list[(old_index|None,new_index|None)] — cursor only; None clears; only rows that moved; also fired as 'reorder'"},
+    {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(path_or_None)->list[(old_index|None,new_index|None)] — cursor only; None clears; only rows that moved; also fired as 'reorder'"},
     {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(path)->FilterBuilder; then .eq/.ne/.lt/.lte/.gt/.gte/.between/.in_/.text_search/.predicate(...) -> list[(old_index|None,new_index|None)] installs the condition; path '?' = the row itself; set_filter(None) clears; cursor only"},
     {"connect",(PyCFunction)ModDict_connect,METH_VARARGS,"connect(event_type,callback)->None — cursor only; events: insert/update/delete/reorder"},
     {"disconnect",(PyCFunction)ModDict_disconnect,METH_VARARGS,"disconnect(event_type=None,callback=None)->int — (event,cb): drop that callback; (event): drop the event's listeners; (): drop everything; returns how many were removed (0 = nothing matched); cursor only"},

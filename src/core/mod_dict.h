@@ -176,7 +176,9 @@ public:
     // Bootstraps/reconfigures; each is an O(n log n) rebuild (rare, explicit
     // reconfigure cost — per-mutation maintenance is the separate, cheaper
     // incremental path in insert()/insert_batch()). Diffs against whatever
-    // presentation order existed before the call.
+    // presentation order existed before the call. An empty `field` clears
+    // the sort (the same reset form as set_group({}) / set_filter(null)):
+    // group order if grouping is active, else natural insertion order.
     IndexDiff set_sort(const std::vector<std::string>& field, bool reverse);
     // Installs the condition (path already split into segments; empty =
     // "?" = the row itself), bootstraps membership, returns the diff. A null

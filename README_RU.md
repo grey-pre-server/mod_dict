@@ -171,9 +171,10 @@ mn.follow("orders.?.customer_id")                        # → ModDict разр�
 
 # Курсоры — живые виды для GUI-таблиц, см. "Курсоры" ниже
 orders = mn.cursor("u1.orders")                          # anchor должен уже существовать
-orders.set_sort("amount") / orders.set_group("status")
+orders.set_sort("amount") / orders.set_group("status")   # каждый -> list[(old_index, new_index)] сдвинувшихся строк, он же летит событием "reorder"
 orders.set_filter("status").eq("shipped")   # те же операторы, что у filter(): eq/ne/lt/lte/gt/gte/between/in_/text_search — считаются в C++ на строку
 orders.set_filter("?").predicate(lambda r: r["amount"] > 100 and r["status"] == "shipped")  # "?" = вся строка; predicate() — для того, что оператором не выразить
+orders.set_sort(None) / orders.set_group(None) / orders.set_filter(None)   # единая форма сброса у всех трёх — назад к тому, что задают остальные два
 orders.insert(key, row)          # -> (int | None, dict) = (новая позиция, row)
 orders.delete(key)               # -> int | None (прежняя позиция)
 orders.update_row(key, changes)  # -> ((old_index, new_index), changes) — changes: {поле: новое_значение}
@@ -445,13 +446,13 @@ orders.connect("update", lambda payload: qt_model.apply_update(payload))
 orders.connect("delete", lambda old_index: qt_model.apply_delete(old_index))
 orders.connect("reorder", lambda diff: qt_model.apply_reorder(diff))
 # "reorder" — единственное событие, которое отдаёт полный list[(old,new)] —
-# оно летит, когда данные изменились любым путём, кроме собственных
-# insert/update_row/delete ЭТОГО курсора: сиблинг-курсор, запись через root
-# mn["u1"]["orders"][...], сырое cursor[key] = row — а слушатель не знает,
-# какая именно строка стала причиной. Тот же словарь (old_index, new_index),
-# что возвращают set_sort()/set_group()/set_filter(): только сдвинувшиеся
-# строки, позиции такие, какими их считают at(i)/len() (при фильтре — плотные
-# по видимым строкам), None с той стороны, где строка не видна.
+# оно летит, когда вид изменился любым путём, кроме собственных
+# insert/update_row/delete ЭТОГО курсора: его же set_sort()/set_group()/
+# set_filter() (тот же diff, что они возвращают), сиблинг-курсор, запись
+# через root mn["u1"]["orders"][...], сырое cursor[key] = row — а слушатель
+# не знает, какая именно строка стала причиной. Только сдвинувшиеся строки,
+# позиции такие, какими их считают at(i)/len() (при фильтре — плотные по
+# видимым строкам), None с той стороны, где строка не видна.
 
 orders.disconnect("insert", handler)  # -> сколько регистраций снято (0 = ничего не совпало)
 orders.disconnect("reorder")          # снять все слушатели одного события

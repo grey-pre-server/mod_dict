@@ -172,9 +172,10 @@ mn.follow("orders.?.customer_id")                        # → ModDict of resolv
 
 # Cursors — live views for GUI tables, see "Cursors" below
 orders = mn.cursor("u1.orders")                          # anchor must already exist
-orders.set_sort("amount") / orders.set_group("status")
+orders.set_sort("amount") / orders.set_group("status")   # each -> list[(old_index, new_index)] of what moved, also fired as "reorder"
 orders.set_filter("status").eq("shipped")   # same operators as filter(): eq/ne/lt/lte/gt/gte/between/in_/text_search — evaluated in C++ per row
 orders.set_filter("?").predicate(lambda r: r["amount"] > 100 and r["status"] == "shipped")  # "?" = the whole row; predicate() for what no operator expresses
+orders.set_sort(None) / orders.set_group(None) / orders.set_filter(None)   # one reset form for all three — back to what the others still impose
 orders.insert(key, row)          # -> (int | None, dict) = (new_index, row)
 orders.delete(key)               # -> int | None (old_index)
 orders.update_row(key, changes)  # -> ((old_index, new_index), changes) — changes: {field: new_value}
@@ -445,13 +446,13 @@ orders.connect("update", lambda payload: qt_model.apply_update(payload))
 orders.connect("delete", lambda old_index: qt_model.apply_delete(old_index))
 orders.connect("reorder", lambda diff: qt_model.apply_reorder(diff))
 # "reorder" is the one event that DOES carry a full list[(old,new)] diff —
-# it fires when the data changed by any means other than THIS cursor's own
-# insert/update_row/delete: a sibling cursor, a root-side mn["u1"]["orders"][...]
-# write, a raw cursor[key] = row — and the listener has no way to know which
-# single row triggered the change. Same (old_index, new_index) vocabulary as
-# set_sort()/set_group()/set_filter() return: only rows that moved,
-# positions as at(i)/len() count them (dense over the visible rows under a
-# filter), None on the side a row isn't visible on.
+# it fires whenever this view changed by anything other than THIS cursor's
+# own insert/update_row/delete: its own set_sort()/set_group()/set_filter()
+# (same diff they return), a sibling cursor, a root-side
+# mn["u1"]["orders"][...] write, a raw cursor[key] = row — and the listener
+# has no way to know which single row triggered the change. Only rows that
+# moved, positions as at(i)/len() count them (dense over the visible rows
+# under a filter), None on the side a row isn't visible on.
 
 orders.disconnect("insert", handler)  # -> how many registrations were removed (0 = nothing matched)
 orders.disconnect("reorder")          # drop all of one event's listeners

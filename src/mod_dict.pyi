@@ -1237,10 +1237,11 @@ class ModDict:
         ...
 
     def set_sort(
-        self, path: str | tuple[str, ...], reverse: bool = False,
+        self, path: str | tuple[str, ...] | None, reverse: bool = False,
     ) -> list[tuple[int | None, int | None]]:
         """
-        Activate (or reconfigure) incremental sort on a cursor.
+        Activate, reconfigure, or clear (``None``) incremental sort on a
+        cursor.
 
         Maintains a private ordered view of this cursor's rows by the value
         `path` reaches in each row, kept incrementally in sync by
@@ -1259,12 +1260,20 @@ class ModDict:
         row's value for that field (e.g. ``None`` vs ``int``), sorts after
         every comparable value — never raises.
 
+        The three presentation flags reset the same way: ``set_sort(None)``,
+        ``set_group(None)``, ``set_filter(None)`` each clear their own state
+        and return (and fire as "reorder") the diff back to whatever the
+        other two still impose — natural insertion order once all three are
+        cleared. ``set_sort(None)`` also resets ``reverse``.
+
         Args:
             path:    Field name or dot-notation path (or tuple of segments)
                      **into each row** — the same path form ``set_group()``
                      and ``set_filter()`` take. Literal only: no ``?``
-                     wildcard segments, no ``->`` hops.
-            reverse: Descending order if True.
+                     wildcard segments, no ``->`` hops. ``None`` clears the
+                     sort.
+            reverse: Descending order if True. Ignored (and reset) when
+                     clearing.
 
         Returns:
             ``(old_index, new_index)`` pairs — **only for rows whose position
@@ -1282,6 +1291,12 @@ class ModDict:
             actually occur here, since a sort neither hides nor reveals
             rows.)
 
+        The same diff is also fired as this cursor's own ``"reorder"``
+        event (see ``connect()``) — same rule as ``insert()`` and its
+        "insert" event: the return value serves the caller, the event
+        serves a listener elsewhere; a model uses one or the other, not
+        both. Fires even when the list is empty.
+
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``.
 
@@ -1292,6 +1307,7 @@ class ModDict:
             orders.at(0)                              # smallest amount
             orders.set_sort("amount", reverse=True)  # re-sort descending
             orders.set_sort("meta.priority")         # nested field, same as set_filter's path
+            orders.set_sort(None)                    # back to natural (insertion) order
         """
         ...
 
@@ -1317,11 +1333,13 @@ class ModDict:
             path: Field name or dot-notation path (or tuple of segments)
                   into each row — same form as ``set_sort()``/``set_filter()``
                   — or ``None`` to clear grouping (falls back to plain sort,
-                  or natural order).
+                  or natural order) — the same reset form as
+                  ``set_sort(None)`` / ``set_filter(None)``.
 
         Returns:
             Same ``(old_index, new_index)`` diff as ``set_sort()`` — only the
-            rows that moved, in presentation positions.
+            rows that moved, in presentation positions. Also fired as this
+            cursor's ``"reorder"`` event, like ``set_sort()``.
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``.
@@ -1349,7 +1367,7 @@ class ModDict:
             cursor.set_filter("name").text_search("ali")
             cursor.set_filter("meta.tags").in_(["vip", "gold"])
             cursor.set_filter("?").predicate(lambda row: row["a"] > 1 and row["b"])
-            cursor.set_filter(None)          # clear — every row visible again
+            cursor.set_filter(None)          # clear — every row visible again (same reset form as set_sort(None)/set_group(None))
 
         ``set_filter(path)`` returns a ``FilterBuilder``; the operator you
         call on it (``eq``/``ne``/``lt``/``lte``/``gt``/``gte``/``between``/
@@ -1389,7 +1407,8 @@ class ModDict:
             whose dense position shifted reports ``(old, new)``. Rows whose
             position didn't change are omitted. Several rows may share
             ``old_index=None`` in one call — hence a **list**, not a
-            ``{old: new}`` dict.
+            ``{old: new}`` dict. Also fired as this cursor's ``"reorder"``
+            event, like ``set_sort()``.
 
         If a ``predicate()`` raises while the condition is being installed,
         the exception propagates and the cursor is left **unfiltered** (never
@@ -1426,29 +1445,33 @@ class ModDict:
           2-tuple it returns.
         - ``"delete"`` — fired by this cursor's own ``delete()``. Payload:
           the same ``int | None`` former-position it returns.
-        - ``"reorder"`` — fired on a cursor when the anchored data changes
-          by any means **other than this cursor's own point-mutation
-          methods**: a *different* cursor on the same anchor, a root-side
-          write through ``mn[key][...]`` (see ``cursor()``), a root bulk
-          operation, or a raw ``cursor[key] = row`` / ``del cursor[key]``.
-          The listener doesn't know the precise operation that changed
-          this view, so this is the one event that DOES carry the full
-          picture. Payload: ``list[(old_index | None, new_index | None)]``
-          — every row whose presentation position or visibility actually
-          changed (same coordinates and vocabulary as ``set_sort()``'s
-          return value: dense over the visible rows under an active
-          filter; ``None`` = not visible on that side). Internally the diff
-          is built incrementally from the sibling's mutation when possible,
-          with a full re-diff as the fallback — the payload shape is the
-          same either way. Registering a "reorder" listener makes the
-          cursor keep a maintained order snapshot from then on (natural
-          order if no ``set_sort()``/``set_group()``), which is what the
-          diff is computed against.
+        - ``"reorder"`` — fired on a cursor whenever its presentation
+          changed by anything **other than its own point-mutation
+          methods**: its own ``set_sort()``/``set_group()``/``set_filter()``
+          (payload: the same diff they return), a *different* cursor on
+          the same anchor mutating the data, a root-side write through
+          ``mn[key][...]`` (see ``cursor()``), a root bulk operation, or a
+          raw ``cursor[key] = row`` / ``del cursor[key]``. The listener
+          doesn't know the precise operation that changed this view, so
+          this is the one event that DOES carry the full picture. Payload:
+          ``list[(old_index | None, new_index | None)]`` — every row whose
+          presentation position or visibility actually changed (same
+          coordinates and vocabulary as ``set_sort()``'s return value:
+          dense over the visible rows under an active filter; ``None`` =
+          not visible on that side; may be empty when nothing moved).
+          Internally the diff is built incrementally from the sibling's
+          mutation when possible, with a full re-diff as the fallback —
+          the payload shape is the same either way. Registering a "reorder"
+          listener makes the cursor keep a maintained order snapshot from
+          then on (natural order if no ``set_sort()``/``set_group()``),
+          which is what the diff is computed against.
 
         A listener's exception propagates normally when it's this cursor's
-        own direct mutation call; during a "reorder" broadcast to several
-        sibling cursors, one listener raising doesn't stop the others from
-        being notified.
+        own direct call (``insert()``/``update_row()``/``delete()``/
+        ``insert_batch()``, and ``set_sort()``/``set_group()``/
+        ``set_filter()`` for "reorder"); during a "reorder" broadcast to
+        several sibling cursors, one listener raising doesn't stop the
+        others from being notified.
 
         Args:
             event_type: One of ``"insert"``/``"update"``/``"delete"``/``"reorder"``.
