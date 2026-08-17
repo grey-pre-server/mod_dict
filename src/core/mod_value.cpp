@@ -158,16 +158,39 @@ PyObject* ModValue::to_pyobject() const {
     return o;
 }
 
+// int -> int64 without raising: false (and no exception left behind) when
+// the value doesn't fit — the caller then falls back to Python's own rich
+// comparison, which handles arbitrary precision. PyLong_AsLongLong() alone
+// would set OverflowError and return -1, which the old fast paths silently
+// compared as a value and leaked as an exception into an unrelated later
+// call ("OverflowError: int too big to convert" out of filter().eq(2**70)).
+static inline bool as_int64(PyObject* o, long long& out) {
+    int overflow = 0;
+    out = PyLong_AsLongLongAndOverflow(o, &overflow);
+    if (overflow != 0) return false;
+    if (out == -1 && PyErr_Occurred()) { PyErr_Clear(); return false; }
+    return true;
+}
+// int/float -> double for the mixed numeric fast paths; a big int converts
+// exactly enough for ordering (PyLong_AsDouble), false only beyond ~1e308.
+static inline bool as_double(PyObject* o, ValueType t, double& out) {
+    if (t == ValueType::FLOAT) { out = PyFloat_AsDouble(o); return true; }
+    out = PyLong_AsDouble(o);
+    if (out == -1.0 && PyErr_Occurred()) { PyErr_Clear(); return false; }
+    return true;
+}
+
 bool ModValue::equals(const ModValue& other) const {
     if (hash_val != other.hash_val) return false;
     if (obj == other.obj) return true;
-    if (type == ValueType::INT && other.type == ValueType::INT)
-        return PyLong_AsLongLong(obj) == PyLong_AsLongLong(other.obj);
-    if ((type == ValueType::INT || type == ValueType::FLOAT) &&
-        (other.type == ValueType::INT || other.type == ValueType::FLOAT)) {
-        double a = (type == ValueType::FLOAT) ? PyFloat_AsDouble(obj)       : (double)PyLong_AsLongLong(obj);
-        double b = (other.type == ValueType::FLOAT) ? PyFloat_AsDouble(other.obj) : (double)PyLong_AsLongLong(other.obj);
-        return a == b;
+    if (type == ValueType::INT && other.type == ValueType::INT) {
+        long long a, b;
+        if (as_int64(obj, a) && as_int64(other.obj, b)) return a == b;
+        // out of int64 range: generic path below
+    } else if ((type == ValueType::INT || type == ValueType::FLOAT) &&
+               (other.type == ValueType::INT || other.type == ValueType::FLOAT)) {
+        double a, b;
+        if (as_double(obj, type, a) && as_double(other.obj, other.type, b)) return a == b;
     }
     PyObject* a = obj      ? obj      : Py_None;
     PyObject* b = other.obj ? other.obj : Py_None;
@@ -179,15 +202,15 @@ bool ModValue::equals(const ModValue& other) const {
 int ModValue::compare(const ModValue& other, bool* ok) const {
     if (ok) *ok = true;
     if (type == ValueType::INT && other.type == ValueType::INT) {
-        long long a = PyLong_AsLongLong(obj);
-        long long b = PyLong_AsLongLong(other.obj);
-        return (a < b) ? -1 : (a > b) ? 1 : 0;
-    }
-    if ((type == ValueType::INT || type == ValueType::FLOAT) &&
-        (other.type == ValueType::INT || other.type == ValueType::FLOAT)) {
-        double a = (type == ValueType::FLOAT) ? PyFloat_AsDouble(obj)       : (double)PyLong_AsLongLong(obj);
-        double b = (other.type == ValueType::FLOAT) ? PyFloat_AsDouble(other.obj) : (double)PyLong_AsLongLong(other.obj);
-        return (a < b) ? -1 : (a > b) ? 1 : 0;
+        long long a, b;
+        if (as_int64(obj, a) && as_int64(other.obj, b))
+            return (a < b) ? -1 : (a > b) ? 1 : 0;
+        // out of int64 range: generic rich-compare path below
+    } else if ((type == ValueType::INT || type == ValueType::FLOAT) &&
+               (other.type == ValueType::INT || other.type == ValueType::FLOAT)) {
+        double a, b;
+        if (as_double(obj, type, a) && as_double(other.obj, other.type, b))
+            return (a < b) ? -1 : (a > b) ? 1 : 0;
     }
     // One direct call instead of the two generic PyObject_RichCompareBool
     // dispatches (LT then GT) below — PyUnicode_Compare returns -1/0/1 and

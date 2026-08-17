@@ -129,7 +129,7 @@ mn.filter("age").lte(18)                         # age <= 18
 mn.filter("age").gt(18)                          # age >  18
 mn.filter("age").gte(18)                         # age >= 18
 mn.filter("age").between(18, 30)                 # 18 <= age <= 30
-mn.filter("city").in_(["NY", "LA"])              # city в списке
+mn.filter("city").in_({"NY", "LA"})              # city среди значений любого iterable (list/tuple/set/…; str отвергается)
 mn.filter("orders.?.status").eq("shipped")       # ? пропускает один уровень ключей
 mn.filter("?").eq("orders")                      # терминальный ?: строки с ключом "orders"
 mn.filter("g1.?.status").eq("shipped")           # anchor: сканирование ограничено ключом "g1"

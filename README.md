@@ -129,7 +129,7 @@ mn.filter("age").lte(18)                         # age <= 18
 mn.filter("age").gt(18)                          # age >  18
 mn.filter("age").gte(18)                         # age >= 18
 mn.filter("age").between(18, 30)                 # 18 <= age <= 30
-mn.filter("city").in_(["NY", "LA"])              # city in [...]
+mn.filter("city").in_({"NY", "LA"})              # city in any iterable of values (list/tuple/set/...; str rejected)
 mn.filter("orders.?.status").eq("shipped")       # ? skips one key, checks value
 mn.filter("?").eq("orders")                      # terminal ?: outer rows that HAVE key "orders"
 mn.filter("g1.?.status").eq("shipped")           # anchor: first segment scopes scan to key "g1"

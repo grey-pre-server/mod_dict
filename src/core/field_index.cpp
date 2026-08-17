@@ -10,21 +10,34 @@ static bool is_numeric(const ModValue& v) {
     return v.type == ValueType::INT || v.type == ValueType::FLOAT;
 }
 
+// Numeric payload of a SortedEntry. An int outside int64 (Python ints are
+// arbitrary precision) is stored as a FLOAT entry via PyLong_AsDouble —
+// ordering stays right against every other number, and nothing is raised:
+// PyLong_AsLongLong() would return -1 AND leave an OverflowError set, which
+// then surfaced out of some unrelated later call.
+static void set_numeric(SortedEntry& e, PyObject* obj, bool is_int) {
+    if (is_int) {
+        int overflow = 0;
+        long long v = PyLong_AsLongLongAndOverflow(obj, &overflow);
+        if (overflow == 0 && !(v == -1 && PyErr_Occurred())) { e.type = ValueType::INT; e.int_val = v; return; }
+        PyErr_Clear();
+        e.type = ValueType::FLOAT;
+        e.float_val = PyLong_AsDouble(obj);
+        if (e.float_val == -1.0 && PyErr_Occurred()) { PyErr_Clear(); e.float_val = 0.0; }
+        return;
+    }
+    e.type = ValueType::FLOAT;
+    e.float_val = PyFloat_AsDouble(obj);
+}
+
 static SortedEntry make_sorted_entry(uint64_t outer_key_hash, const ModValue& field_val) {
     SortedEntry e;
     e.outer_key_hash = outer_key_hash;
     e.slot = SIZE_MAX;
     e.type = field_val.type;
-    if (field_val.obj) {
-        if (field_val.type == ValueType::INT)
-            e.int_val = PyLong_AsLongLong(field_val.obj);
-        else if (field_val.type == ValueType::FLOAT)
-            e.float_val = PyFloat_AsDouble(field_val.obj);
-        else
-            e.int_val = 0;
-    } else {
-        e.int_val = 0;
-    }
+    e.int_val = 0;
+    if (field_val.obj && (field_val.type == ValueType::INT || field_val.type == ValueType::FLOAT))
+        set_numeric(e, field_val.obj, field_val.type == ValueType::INT);
     return e;
 }
 
@@ -60,13 +73,7 @@ void FieldIndex::build(ModDict* owner, const std::string& fname) {
             SortedEntry se;
             se.outer_key_hash = oh;
             se.slot           = SIZE_MAX;
-            if (PyLong_Check(fv_obj)) {
-                se.type    = ValueType::INT;
-                se.int_val = PyLong_AsLongLong(fv_obj);
-            } else {
-                se.type      = ValueType::FLOAT;
-                se.float_val = PyFloat_AsDouble(fv_obj);
-            }
+            set_numeric(se, fv_obj, PyLong_Check(fv_obj));
             sorted_index.push_back(se);
         }
     }

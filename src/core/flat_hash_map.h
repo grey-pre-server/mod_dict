@@ -19,33 +19,6 @@
 #endif
 
 /* ============================================================================
-   Быстрый компаратор для PyObject*
-   ============================================================================ */
-struct PyObjectEqual {
-    bool operator()(PyObject* a, PyObject* b) const {
-        if (a == b) return true;
-
-        if (PyLong_Check(a) && PyLong_Check(b)) {
-            long va = PyLong_AsLong(a);
-            long vb = PyLong_AsLong(b);
-            return va != -1 && vb != -1 && va == vb;
-        }
-
-        if (PyUnicode_Check(a) && PyUnicode_Check(b)) {
-            const char* sa = PyUnicode_AsUTF8(a);
-            const char* sb = PyUnicode_AsUTF8(b);
-            if (sa && sb) return strcmp(sa, sb) == 0;
-        }
-
-        if (PyFloat_Check(a) && PyFloat_Check(b)) {
-            return PyFloat_AsDouble(a) == PyFloat_AsDouble(b);
-        }
-
-        return PyObject_RichCompareBool(a, b, Py_EQ) == 1;
-    }
-};
-
-/* ============================================================================
    Хешер для PyObject* — хеширует ЗНАЧЕНИЕ, а не указатель
    ============================================================================ */
 struct PyObjectHash {
@@ -262,7 +235,7 @@ private:
     size_t size_;
 
     std::hash<K> hash_;      // вместо PyObjectHash
-    std::equal_to<K> equal_;  // вместо PyObjectEqual
+    std::equal_to<K> equal_;
 
     static constexpr double GROW_THRESHOLD = 0.70;
 

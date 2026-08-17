@@ -42,7 +42,7 @@ Path strings (used by filter/sort_by/group_by/select/update/create_index/...):
   field literally named ``"geo.city"``, not nesting into ``geo`` then ``city``.
 """
 from __future__ import annotations
-from typing import Any, Callable, Iterator, Literal, Sequence, overload
+from typing import Any, Callable, Iterable, Iterator, Literal, Sequence, overload
 
 
 class FilterBuilder:
@@ -198,21 +198,31 @@ class FilterBuilder:
         ...
 
     def in_(
-        self, values: Sequence[Any],
+        self, values: Iterable[Any],
         returns: Literal["rows", "rows_here", "values"] = "rows",
         value_field: Any | None = None,
     ) -> ModDict | list[Any]:
-        """Return rows where field matches **any** value in the sequence.
+        """Return rows where field matches **any** of *values*.
 
-        Performs one ``eq`` lookup per value and unions the results.
-        An index on the field makes each lookup O(1).
+        *values* is any iterable of values — list, tuple, set, frozenset,
+        dict keys, generator — snapshotted once (mutating your container
+        afterwards changes nothing). A ``str``/``bytes`` argument raises
+        ``TypeError`` rather than being iterated character by character.
+
+        On the root: one ``eq`` lookup per value, results unioned; an index
+        on the field makes each lookup O(1). On a cursor
+        (``set_filter(path).in_(...)``): the values are hashed once at
+        install time and every row is one hash + one lookup — O(1) per row
+        regardless of how many values there are, matching what a series of
+        ``eq()`` calls would match.
 
         See :meth:`eq` for the ``returns`` / ``value_field`` parameters.
 
         Example::
 
             gold_silver = mn.filter("meta.badge").in_(["gold", "silver"])
-            ages        = mn.filter("age").in_([25, 30, 35, 40])
+            ages        = mn.filter("age").in_({25, 30, 35, 40})
+            orders.set_filter("status").in_({"shipped", "paid"})   # cursor: O(1) per row
         """
         ...
 

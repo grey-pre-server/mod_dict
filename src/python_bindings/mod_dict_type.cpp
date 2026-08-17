@@ -1005,45 +1005,57 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
     PyObject* r1=apply_filter(s->owner,simple,pat,wc,FilterOp::GE,lo); if(!r1) return nullptr;
     PyObject* r2=apply_filter((ModDictObject*)r1,simple,pat,wc,FilterOp::LE,hi); Py_DECREF(r1); return r2;
 }
+// A tuple snapshot of in_()'s `values` — any iterable of values (list,
+// tuple, set, frozenset, dict keys, generator), taken once so the caller
+// mutating their container afterwards changes nothing. A str/bytes argument
+// is rejected rather than iterated: `in_("abc")` would silently mean "one
+// of the characters a, b, c", never what anyone intends.
+static PyObject* in_values_tuple(PyObject* seq){
+    if(PyUnicode_Check(seq)||PyBytes_Check(seq)||PyByteArray_Check(seq))
+        MOD_DICT_RAISE(PyExc_TypeError,"in_: argument must be an iterable of values (a list/tuple/set), not a str/bytes - wrap a single value in a list");
+    PyObject* frozen=PySequence_Tuple(seq);
+    if(!frozen && PyErr_ExceptionMatches(PyExc_TypeError)){
+        PyErr_Clear();
+        MOD_DICT_RAISE(PyExc_TypeError,"in_: argument must be an iterable of values (a list/tuple/set)");
+    }
+    return frozen;
+}
 static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
-    PyObject* seq; const char* ret="rows"; PyObject* vf_obj=nullptr;
+    PyObject* seq_arg; const char* ret="rows"; PyObject* vf_obj=nullptr;
     static const char* kwl[]={"values","returns","value_field",nullptr};
-    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|sO",(char**)kwl,&seq,&ret,&vf_obj)) return nullptr;
-    if(!PySequence_Check(seq)) MOD_DICT_RAISE(PyExc_TypeError,"in_: argument must be a sequence");
+    if(!PyArg_ParseTupleAndKeywords(args,kw,"O|sO",(char**)kwl,&seq_arg,&ret,&vf_obj)) return nullptr;
+    PyObject* seq=in_values_tuple(seq_arg);  // owned tuple from here on
+    if(!seq) return nullptr;
     if(s->cursor_mode){
-        if(strcmp(ret,"rows")!=0||vf_obj) MOD_DICT_RAISE(PyExc_TypeError,"set_filter: returns=/value_field= do not apply to a cursor filter");
-        // snapshot the sequence — the caller may mutate their list afterwards
-        PyObject* frozen=PySequence_Tuple(seq);
-        if(!frozen) return nullptr;
-        PyObject* r=install_cursor_filter(s,FilterOp::IN,frozen,nullptr);
-        Py_DECREF(frozen);
+        if(strcmp(ret,"rows")!=0||vf_obj){ Py_DECREF(seq); MOD_DICT_RAISE(PyExc_TypeError,"set_filter: returns=/value_field= do not apply to a cursor filter"); }
+        PyObject* r=install_cursor_filter(s,FilterOp::IN,seq,nullptr);
+        Py_DECREF(seq);
         return r;
     }
     std::string simple(s->field); bool wc=(s->pattern!=nullptr); std::vector<std::string> empty;
     const std::vector<std::string>& pat=wc?*s->pattern:empty;
     if (strcmp(ret,"rows")!=0) {
         bool want_values=(strcmp(ret,"values")==0);
-        if (want_values && !vf_obj) MOD_DICT_RAISE(PyExc_ValueError,"returns='values' requires value_field");
-        PyObject* result=PyList_New(0); if(!result) return nullptr;
-        Py_ssize_t n=PySequence_Size(seq);
+        if (want_values && !vf_obj){ Py_DECREF(seq); MOD_DICT_RAISE(PyExc_ValueError,"returns='values' requires value_field"); }
+        PyObject* result=PyList_New(0); if(!result){Py_DECREF(seq);return nullptr;}
+        Py_ssize_t n=PyTuple_GET_SIZE(seq);
         for(Py_ssize_t i=0;i<n;i++){
-            PyObject* item=PySequence_GetItem(seq,i); if(!item){Py_DECREF(result);return nullptr;}
-            ModValue mv=ModValue::from_pyobject(item); Py_DECREF(item);
+            ModValue mv=ModValue::from_pyobject(PyTuple_GET_ITEM(seq,i));
             PyObject* part=apply_filter_here(s->owner,simple,pat,wc,FilterOp::EQ,mv,want_values,vf_obj);
-            if(!part){Py_DECREF(result);return nullptr;}
+            if(!part){Py_DECREF(result);Py_DECREF(seq);return nullptr;}
             Py_ssize_t m=PyList_GET_SIZE(part);
             for(Py_ssize_t j=0;j<m;j++){PyObject* r=PyList_GET_ITEM(part,j);Py_INCREF(r);PyList_Append(result,r);Py_DECREF(r);}
             Py_DECREF(part);
         }
+        Py_DECREF(seq);
         return result;
     }
     ModDict* merged=new ModDict();
-    Py_ssize_t n=PySequence_Size(seq);
+    Py_ssize_t n=PyTuple_GET_SIZE(seq);
     for(Py_ssize_t i=0;i<n;i++){
-        PyObject* item=PySequence_GetItem(seq,i); if(!item){delete merged;return nullptr;}
-        ModValue mv=ModValue::from_pyobject(item); Py_DECREF(item);
+        ModValue mv=ModValue::from_pyobject(PyTuple_GET_ITEM(seq,i));
         ModDict* part=filter_maybe_relay(s->owner,simple,pat,wc,FilterOp::EQ,mv);
-        if(!part){delete merged;return nullptr;}
+        if(!part){delete merged;Py_DECREF(seq);return nullptr;}
         if(wc && pattern_has_link_hop(pat)){
             // Every part shares the SAME single anchor hash (an anchored
             // "->" result is always {table: {...}}) -- union inner rows
@@ -1055,6 +1067,7 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         }
         delete part;
     }
+    Py_DECREF(seq);
     ModDictObject* w=PyObject_New(ModDictObject,&ModDict_Type); if(!w){delete merged;return nullptr;}
     w->internal=merged;w->owns_internal=true;w->parent_ref=(PyObject*)s->owner;Py_INCREF(s->owner);w->weakreflist=nullptr;merged->py_wrapper=w;
     return (PyObject*)w;

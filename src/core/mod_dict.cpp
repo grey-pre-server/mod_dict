@@ -1804,6 +1804,7 @@ Py_ssize_t ModDict::find_sort_index_position(PyObject* key, const SortKeyValues*
 }
 
 void ModDict::clear_filter_condition() {
+    filter_in_set = FlatHashMap<uint64_t, PyObject*>();  // before dropping the tuple its entries borrow from
     Py_CLEAR(filter_predicate);
     Py_CLEAR(filter_operand2);
     for (PyObject* p : filter_path_py) Py_XDECREF(p);
@@ -1832,19 +1833,16 @@ bool ModDict::filter_row_passes(PyObject* row) const {
             return t == 1;  // t<0 leaves PyErr set, reported as "doesn't pass"
         }
         case FilterOp::IN: {
-            // operand is the sequence handed to in_(); ModValue-equality per
-            // element, so 1 == 1.0 and str/bytes stay distinct, matching eq().
-            ModValue sv = ModValue::from_pyobject(subject);
-            Py_ssize_t n = PySequence_Size(filter_predicate);
-            if (n < 0) { PyErr_Clear(); return false; }
-            for (Py_ssize_t i = 0; i < n; i++) {
-                PyObject* item = PySequence_GetItem(filter_predicate, i);
-                if (!item) { PyErr_Clear(); return false; }
-                bool eq = sv.equals(ModValue::from_pyobject(item));
-                Py_DECREF(item);
-                if (eq) return true;
-            }
-            return false;
+            // One content hash + one lookup in filter_in_set (built at
+            // set_filter()), then a real equality check against the element
+            // found — the same test ModValue::equals() applies for eq()
+            // (equal content hash first, then value equality), so `in_`
+            // matches exactly what a series of eq() calls would.
+            PyObject* const* item = filter_in_set.find(content_hash_pyobj(subject));
+            if (!item) return false;
+            int r = PyObject_RichCompareBool(subject, *item, Py_EQ);
+            if (r < 0) { PyErr_Clear(); return false; }
+            return r == 1;
         }
         case FilterOp::BETWEEN: {
             ModValue sv = ModValue::from_pyobject(subject);
@@ -2041,6 +2039,20 @@ ModDict::IndexDiff ModDict::set_filter(const std::vector<std::string>& path, Fil
         filter_operand2 = operand2;
         filter_op = op;
         replace_field_py_segments(filter_path_py, path);  // empty path = "?" = the row itself
+        if (op == FilterOp::IN) {
+            // Index the operand once (it is the tuple snapshot in_() made,
+            // so element pointers stay valid as long as filter_predicate
+            // does). Duplicate values collapse onto one entry.
+            Py_ssize_t n = PySequence_Size(operand);
+            if (n < 0) { clear_filter_condition(); rebuild_visible_index(); return {}; }  // PyErr set
+            filter_in_set.reserve((size_t)n);
+            for (Py_ssize_t i = 0; i < n; i++) {
+                PyObject* item = PySequence_GetItem(operand, i);
+                if (!item) { clear_filter_condition(); rebuild_visible_index(); return {}; }
+                filter_in_set.insert(content_hash_pyobj(item), item);  // borrowed: the tuple owns it
+                Py_DECREF(item);
+            }
+        }
         rebuild_filter_membership();
         if (PyErr_Occurred()) {
             // Bootstrap raised (predicate() threw): leave the cursor

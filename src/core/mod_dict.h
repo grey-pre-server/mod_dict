@@ -148,6 +148,12 @@ public:
     FilterOp  filter_op = FilterOp::EQ;
     std::vector<PyObject*> filter_path_py;      // owned PyUnicode segments; empty = "?" (row itself)
     PyObject* filter_operand2 = nullptr;        // BETWEEN's `hi` (filter_predicate is `lo`); nullptr otherwise
+    // IN only: content hash -> that operand element (borrowed from the
+    // operand tuple filter_predicate holds), built once at set_filter() —
+    // membership is then one hash + one lookup per row instead of an
+    // equality test against every element (which made in_() slower than a
+    // Python `x in {…}` predicate as soon as the list grew past a few values).
+    FlatHashMap<uint64_t, PyObject*> filter_in_set;
     // True when the row (or the field value at filter_path) passes the
     // active condition. Leaves PyErr set (predicate() raised, or a
     // comparison failed hard) and returns false in that case — callers that
