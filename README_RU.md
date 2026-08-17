@@ -2,6 +2,8 @@
 
 Python-расширение на C++, которое хранит вложенные словари по ссылке и предоставляет индексированную фильтрацию, сортировку, группировку и обновление данных — без конвертации в DataFrame или базу данных. А также живые, реагирующие на мутации **курсоры** для реактивных GUI-таблиц (Qt или любых других) — без ручного ведения индексов и порядка.
 
+**[English version](https://github.com/grey-pre-server/mod_dict/blob/master/README.md)** · **[Бенчмарки](https://github.com/grey-pre-server/mod_dict/blob/master/BENCHMARK_RU.md)** · **[Справочник API (type stubs)](https://github.com/grey-pre-server/mod_dict/blob/master/src/mod_dict.pyi)** · **[PyPI](https://pypi.org/project/mod_dict/)**
+
 ```python
 import mod_dict as md
 
@@ -169,7 +171,9 @@ mn.follow("orders.?.customer_id")                        # → ModDict разр�
 
 # Курсоры — живые виды для GUI-таблиц, см. "Курсоры" ниже
 orders = mn.cursor("u1.orders")                          # anchor должен уже существовать
-orders.set_sort("amount") / orders.set_filter(pred) / orders.set_group("status")
+orders.set_sort("amount") / orders.set_group("status")
+orders.set_filter("status").eq("shipped")   # те же операторы, что у filter(): eq/ne/lt/lte/gt/gte/between/in_/text_search — считаются в C++ на строку
+orders.set_filter("?").predicate(lambda r: r["amount"] > 100 and r["status"] == "shipped")  # "?" = вся строка; predicate() — для того, что оператором не выразить
 orders.insert(key, row)          # -> (int | None, dict) = (новая позиция, row)
 orders.delete(key)               # -> int | None (прежняя позиция)
 orders.update_row(key, changes)  # -> ((old_index, new_index), changes) — changes: {поле: новое_значение}
@@ -507,7 +511,7 @@ grid_view.insert("o9", {"amount": 5, "status": "new"})
 
 ```python
 orders.set_sort("amount")
-orders.set_filter(lambda r: r["status"] == "shipped")
+orders.set_filter("status").eq("shipped")
 
 for key in orders:                 # только ключи, тот же видимый/отсортированный порядок, что и .at(i)
     ...
@@ -611,4 +615,4 @@ async def startup():
         cache[key] = row
 ```
 
-См. [BENCHMARK_RU.md](BENCHMARK_RU.md) для подробных замеров.
+См. [BENCHMARK_RU.md](https://github.com/grey-pre-server/mod_dict/blob/master/BENCHMARK_RU.md) для подробных замеров.

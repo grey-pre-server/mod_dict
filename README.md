@@ -2,6 +2,8 @@
 
 A Python extension (C++) that stores nested dictionaries by reference and provides indexed filtering, sorting, grouping and merging — without converting to a DataFrame or a database. Also provides live, mutation-aware **cursors** for backing reactive GUI tables (Qt or otherwise) without hand-rolling index bookkeeping.
 
+**[Русская версия](https://github.com/grey-pre-server/mod_dict/blob/master/README_RU.md)** · **[Benchmarks](https://github.com/grey-pre-server/mod_dict/blob/master/BENCHMARK.md)** · **[API reference (type stubs)](https://github.com/grey-pre-server/mod_dict/blob/master/src/mod_dict.pyi)** · **[PyPI](https://pypi.org/project/mod_dict/)**
+
 ```python
 import mod_dict as md
 
@@ -170,7 +172,9 @@ mn.follow("orders.?.customer_id")                        # → ModDict of resolv
 
 # Cursors — live views for GUI tables, see "Cursors" below
 orders = mn.cursor("u1.orders")                          # anchor must already exist
-orders.set_sort("amount") / orders.set_filter(pred) / orders.set_group("status")
+orders.set_sort("amount") / orders.set_group("status")
+orders.set_filter("status").eq("shipped")   # same operators as filter(): eq/ne/lt/lte/gt/gte/between/in_/text_search — evaluated in C++ per row
+orders.set_filter("?").predicate(lambda r: r["amount"] > 100 and r["status"] == "shipped")  # "?" = the whole row; predicate() for what no operator expresses
 orders.insert(key, row)          # -> (int | None, dict) = (new_index, row)
 orders.delete(key)               # -> int | None (old_index)
 orders.update_row(key, changes)  # -> ((old_index, new_index), changes) — changes: {field: new_value}
@@ -502,7 +506,7 @@ present in the underlying data, just absent from the positional/iteration view.
 
 ```python
 orders.set_sort("amount")
-orders.set_filter(lambda r: r["status"] == "shipped")
+orders.set_filter("status").eq("shipped")
 
 for key in orders:                 # keys only, same visible/sorted order as .at(i)
     ...
@@ -606,4 +610,4 @@ async def startup():
         cache[key] = row
 ```
 
-See [BENCHMARK.md](BENCHMARK.md) for detailed numbers.
+See [BENCHMARK.md](https://github.com/grey-pre-server/mod_dict/blob/master/BENCHMARK.md) for detailed numbers.

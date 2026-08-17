@@ -116,7 +116,7 @@ ModDict::~ModDict() {
     if (!root) for (auto& fi : indices.by_field.occupied()) delete fi.value;
     Py_XDECREF(on_change_cb);
     Py_XDECREF(on_merge_cb);
-    Py_XDECREF(filter_predicate);
+    clear_filter_condition();
     Py_XDECREF(live_connect_listeners);
     for (PyObject* k : sort_index) Py_XDECREF(k);
     for (PyObject* k : visible_index) Py_XDECREF(k);
@@ -1705,28 +1705,83 @@ Py_ssize_t ModDict::find_sort_index_position(PyObject* key, const SortKeyValues*
     return locate_key(this, sort_index, key, old_vals);
 }
 
+void ModDict::clear_filter_condition() {
+    Py_CLEAR(filter_predicate);
+    Py_CLEAR(filter_operand2);
+    for (PyObject* p : filter_path_py) Py_XDECREF(p);
+    filter_path_py.clear();
+    filter_op = FilterOp::EQ;
+}
+
+// The ONE place a cursor filter condition is evaluated — bootstrap
+// (rebuild_filter_membership) and incremental (update_filter_membership_one)
+// both come here, so every operator behaves identically on both paths.
+bool ModDict::filter_row_passes(PyObject* row) const {
+    // Subject: the row itself for "?" (empty path), else the field the path
+    // reaches; a row lacking the field simply doesn't pass (same as root
+    // filter(), where a missing field never matches).
+    PyObject* subject = row;
+    if (!filter_path_py.empty()) {
+        subject = read_field_path(row, filter_path_py);
+        if (!subject) return false;
+    }
+    switch (filter_op) {
+        case FilterOp::PREDICATE: {
+            PyObject* res = PyObject_CallOneArg(filter_predicate, subject);
+            if (!res) return false;  // PyErr set
+            int t = PyObject_IsTrue(res);
+            Py_DECREF(res);
+            return t == 1;  // t<0 leaves PyErr set, reported as "doesn't pass"
+        }
+        case FilterOp::IN: {
+            // operand is the sequence handed to in_(); ModValue-equality per
+            // element, so 1 == 1.0 and str/bytes stay distinct, matching eq().
+            ModValue sv = ModValue::from_pyobject(subject);
+            Py_ssize_t n = PySequence_Size(filter_predicate);
+            if (n < 0) { PyErr_Clear(); return false; }
+            for (Py_ssize_t i = 0; i < n; i++) {
+                PyObject* item = PySequence_GetItem(filter_predicate, i);
+                if (!item) { PyErr_Clear(); return false; }
+                bool eq = sv.equals(ModValue::from_pyobject(item));
+                Py_DECREF(item);
+                if (eq) return true;
+            }
+            return false;
+        }
+        case FilterOp::BETWEEN: {
+            ModValue sv = ModValue::from_pyobject(subject);
+            bool ok = true;
+            int lo = sv.compare(ModValue::from_pyobject(filter_predicate), &ok);
+            if (!ok || lo < 0) return false;
+            int hi = sv.compare(ModValue::from_pyobject(filter_operand2), &ok);
+            return ok && hi <= 0;
+        }
+        default: {
+            // eq/ne/lt/le/gt/ge/text_* — the same compare_values() root
+            // filter() uses; text ops expect the operand pre-casefolded.
+            ModValue sv = is_text_op(filter_op) ? ModValue::from_pyobject_for_compare(subject)
+                                                : ModValue::from_pyobject(subject);
+            return compare_values(sv, filter_op, ModValue::from_pyobject(filter_predicate));
+        }
+    }
+}
+
 void ModDict::rebuild_filter_membership() {
     filter_membership = FlatHashMap<uint64_t, char>();
     if (!filter_predicate || !cached_anchor_dict) return;
     filter_membership.reserve((size_t)PyDict_Size(cached_anchor_dict));
     PyObject *k, *v; Py_ssize_t pos = 0;
     while (PyDict_Next(cached_anchor_dict, &pos, &k, &v)) {
-        PyObject* res = PyObject_CallOneArg(filter_predicate, v);
-        if (!res) return;  // PyErr set — caller must check
-        int truthy = PyObject_IsTrue(res);
-        Py_DECREF(res);
-        if (truthy < 0) return;  // PyErr set
-        if (truthy) filter_membership.insert(content_hash_pyobj(k), 1);
+        bool passes = filter_row_passes(v);
+        if (PyErr_Occurred()) return;  // caller must check
+        if (passes) filter_membership.insert(content_hash_pyobj(k), 1);
     }
 }
 
 bool ModDict::update_filter_membership_one(uint64_t key_hash, PyObject* row) {
-    PyObject* res = PyObject_CallOneArg(filter_predicate, row);
-    if (!res) return false;
-    int truthy = PyObject_IsTrue(res);
-    Py_DECREF(res);
-    if (truthy < 0) return false;
-    if (truthy) filter_membership.insert(key_hash, 1);
+    bool passes = filter_row_passes(row);
+    if (PyErr_Occurred()) return false;
+    if (passes) filter_membership.insert(key_hash, 1);
     else filter_membership.erase(key_hash);
     return true;
 }
@@ -1812,7 +1867,8 @@ ModDict::IndexDiff ModDict::set_group(const std::vector<std::string>& group_by_f
     return diff;
 }
 
-ModDict::IndexDiff ModDict::set_filter(PyObject* predicate) {
+ModDict::IndexDiff ModDict::set_filter(const std::vector<std::string>& path, FilterOp op,
+                                       PyObject* operand, PyObject* operand2) {
     IndexDiff diff;
     PyObject* d = resolve_cursor_dict();
     if (!d) return diff;
@@ -1827,9 +1883,15 @@ ModDict::IndexDiff ModDict::set_filter(PyObject* predicate) {
     FlatHashMap<uint64_t, char> old_membership = std::move(filter_membership);
     bool had_filter = (filter_predicate != nullptr);
 
-    Py_XDECREF(filter_predicate);
-    Py_XINCREF(predicate);
-    filter_predicate = predicate;
+    clear_filter_condition();
+    if (operand) {
+        Py_INCREF(operand);
+        filter_predicate = operand;
+        Py_XINCREF(operand2);
+        filter_operand2 = operand2;
+        filter_op = op;
+        replace_field_py_segments(filter_path_py, path);  // empty path = "?" = the row itself
+    }
     if (filter_predicate) {
         rebuild_filter_membership();
         if (PyErr_Occurred()) return diff;

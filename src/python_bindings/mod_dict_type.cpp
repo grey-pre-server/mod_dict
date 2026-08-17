@@ -577,8 +577,36 @@ static FilterOp parse_op(const char* s){
 }
 
 /* FilterBuilder */
-struct FilterBuilderObject{PyObject_HEAD ModDictObject* owner;char* field;std::vector<std::string>* pattern;};
+// cursor_mode: built by cursor.set_filter(path) instead of root.filter(path).
+// Same object, same operator names — but each operator INSTALLS the
+// condition on the cursor (incremental membership from then on) rather than
+// scanning the root and returning rows. `?` as the path means "the row
+// itself" (empty pattern, cursor mode only). predicate(fn) is cursor-only.
+struct FilterBuilderObject{PyObject_HEAD ModDictObject* owner;char* field;std::vector<std::string>* pattern;bool cursor_mode;};
 static void FilterBuilder_dealloc(FilterBuilderObject* s){Py_XDECREF(s->owner);free(s->field);delete s->pattern;Py_TYPE(s)->tp_free(s);}
+
+// Installs (op, operand[, operand2]) as the cursor's filter condition and
+// returns the set_filter() diff. The path is the builder's field/pattern —
+// a plain field name, a dotted path, or empty for "?". A path containing a
+// wildcard "?" segment mid-way or a "->" hop is rejected: a cursor filter
+// is evaluated on ONE anchored table's rows, so its path is a path INTO the
+// row, never across tables (use root filter() for that).
+static PyObject* install_cursor_filter(FilterBuilderObject* s, FilterOp op, PyObject* operand, PyObject* operand2){
+    std::vector<std::string> path;
+    if(s->pattern){
+        for(auto& seg:*s->pattern){
+            if(seg=="__pass_key__"||seg=="__scan_key__"||seg=="__follow_link__")
+                MOD_DICT_RAISE(PyExc_ValueError,"set_filter: the path is a path into each row of the anchored table - "
+                    "no wildcard '?' segments (except a lone '?' meaning the row itself) and no '->' hops");
+            path.push_back(seg);
+        }
+    } else if(s->field && *s->field){
+        path.push_back(s->field);
+    }
+    auto diff=s->owner->internal->set_filter(path,op,operand,operand2);
+    if(PyErr_Occurred()) return nullptr;
+    return index_diff_to_pylist(diff);
+}
 
 /* ── scan_here helpers for returns="rows_here"/"values" ── */
 static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
@@ -702,6 +730,10 @@ static PyObject* fb_op(FilterBuilderObject* s,PyObject* args,PyObject* kw,Filter
     PyObject* v; const char* ret="rows"; PyObject* vf_obj=nullptr;
     static const char* kwl[]={"value","returns","value_field",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"O|sO",(char**)kwl,&v,&ret,&vf_obj)) return nullptr;
+    if(s->cursor_mode){
+        if(strcmp(ret,"rows")!=0||vf_obj) MOD_DICT_RAISE(PyExc_TypeError,"set_filter: returns=/value_field= do not apply to a cursor filter (it installs a condition, it doesn't return rows)");
+        return install_cursor_filter(s,op,v,nullptr);
+    }
     std::string simple(s->field); bool wc=(s->pattern!=nullptr);
     std::vector<std::string> empty; const std::vector<std::string>& pat=wc?*s->pattern:empty;
     if (strcmp(ret,"rows")!=0) {
@@ -744,12 +776,24 @@ static PyObject* FB_text_search(FilterBuilderObject* s,PyObject* args,PyObject* 
     if(!nargs) return nullptr;
     PyObject* nkw=PyDict_New();
     if(!nkw){Py_DECREF(nargs);return nullptr;}
-    PyObject* rs=PyUnicode_FromString(ret);
-    if(rs){PyDict_SetItemString(nkw,"returns",rs);Py_DECREF(rs);}
+    // forward returns=/value_field= only when explicitly non-default, so the
+    // cursor-mode check in fb_op sees them only if the caller really passed them
+    if(strcmp(ret,"rows")!=0){PyObject* rs=PyUnicode_FromString(ret);if(rs){PyDict_SetItemString(nkw,"returns",rs);Py_DECREF(rs);}}
     if(vf_obj) PyDict_SetItemString(nkw,"value_field",vf_obj);
     PyObject* r=fb_op(s,nargs,nkw,op);
     Py_DECREF(nargs); Py_DECREF(nkw);
     return r;
+}
+// predicate(fn) — cursor only: fn(subject) -> truthy, where subject is the
+// field at the path, or the whole row for set_filter("?"). The one operator
+// that isn't expressible as a stored comparison; everything else should
+// prefer eq()/text_search()/... which run without re-entering Python per row.
+static PyObject* FB_predicate(FilterBuilderObject* s,PyObject* args){
+    PyObject* fn;
+    if(!PyArg_ParseTuple(args,"O",&fn)) return nullptr;
+    if(!s->cursor_mode) MOD_DICT_RAISE(PyExc_NotImplementedError,"predicate() is only available on a cursor's set_filter(path) - root filter() has no callable form");
+    if(!PyCallable_Check(fn)) MOD_DICT_RAISE(PyExc_TypeError,"predicate: argument must be callable");
+    return install_cursor_filter(s,FilterOp::PREDICATE,fn,nullptr);
 }
 // FB_between/FB_in_ "rows" paths normally compose multiple filter() calls by
 // chaining (between: re-filter the previous result) or by outer-key de-dup
@@ -849,6 +893,10 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
     PyObject *lo,*hi; const char* ret="rows"; PyObject* vf_obj=nullptr;
     static const char* kwl[]={"lo","hi","returns","value_field",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"OO|sO",(char**)kwl,&lo,&hi,&ret,&vf_obj)) return nullptr;
+    if(s->cursor_mode){
+        if(strcmp(ret,"rows")!=0||vf_obj) MOD_DICT_RAISE(PyExc_TypeError,"set_filter: returns=/value_field= do not apply to a cursor filter");
+        return install_cursor_filter(s,FilterOp::BETWEEN,lo,hi);
+    }
     std::string simple(s->field); bool wc=(s->pattern!=nullptr); std::vector<std::string> empty;
     const std::vector<std::string>& pat=wc?*s->pattern:empty;
     if (strcmp(ret,"rows")!=0) {
@@ -909,6 +957,15 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
     static const char* kwl[]={"values","returns","value_field",nullptr};
     if(!PyArg_ParseTupleAndKeywords(args,kw,"O|sO",(char**)kwl,&seq,&ret,&vf_obj)) return nullptr;
     if(!PySequence_Check(seq)) MOD_DICT_RAISE(PyExc_TypeError,"in_: argument must be a sequence");
+    if(s->cursor_mode){
+        if(strcmp(ret,"rows")!=0||vf_obj) MOD_DICT_RAISE(PyExc_TypeError,"set_filter: returns=/value_field= do not apply to a cursor filter");
+        // snapshot the sequence — the caller may mutate their list afterwards
+        PyObject* frozen=PySequence_Tuple(seq);
+        if(!frozen) return nullptr;
+        PyObject* r=install_cursor_filter(s,FilterOp::IN,frozen,nullptr);
+        Py_DECREF(frozen);
+        return r;
+    }
     std::string simple(s->field); bool wc=(s->pattern!=nullptr); std::vector<std::string> empty;
     const std::vector<std::string>& pat=wc?*s->pattern:empty;
     if (strcmp(ret,"rows")!=0) {
@@ -959,6 +1016,7 @@ static PyMethodDef FB_methods[]={
     {"between",(PyCFunction)(PyCFunctionWithKeywords)FB_between,METH_VARARGS|METH_KEYWORDS,"between(lo,hi,*,returns='rows',value_field=None)"},
     {"in_",(PyCFunction)(PyCFunctionWithKeywords)FB_in_,METH_VARARGS|METH_KEYWORDS,"in_(values,*,returns='rows',value_field=None)"},
     {"text_search",(PyCFunction)(PyCFunctionWithKeywords)FB_text_search,METH_VARARGS|METH_KEYWORDS,"text_search(needle,mode='contains',*,returns='rows',value_field=None) — case-insensitive substring/startswith/endswith over str fields; always a scan"},
+    {"predicate",(PyCFunction)FB_predicate,METH_VARARGS,"predicate(fn) — cursor set_filter() only: fn(field_value) (or fn(row) for path '?') decides membership"},
     {NULL,NULL,0,NULL}};
 PyTypeObject FilterBuilder_Type={
     .tp_name="mod_dict.FilterBuilder",.tp_basicsize=sizeof(FilterBuilderObject),
@@ -981,7 +1039,7 @@ static PyObject* FilterBuilder_new_obj(ModDictObject* owner,PyObject* fo){
     }
     FilterBuilderObject* fb=(FilterBuilderObject*)FilterBuilder_Type.tp_alloc(&FilterBuilder_Type,0);
     if(!fb){delete pat;return nullptr;}
-    fb->owner=owner;Py_INCREF(owner);fb->field=portable_strdup(simple.c_str());fb->pattern=pat;
+    fb->owner=owner;Py_INCREF(owner);fb->field=portable_strdup(simple.c_str());fb->pattern=pat;fb->cursor_mode=false;
     return (PyObject*)fb;
 }
 
@@ -1261,15 +1319,36 @@ static PyObject* ModDict_set_group(ModDictObject* s, PyObject* args) {
     if (PyErr_Occurred()) return nullptr;
     return index_diff_to_pylist(diff);
 }
+// set_filter(path) -> FilterBuilder in cursor mode; the operator called on it
+// (eq/ne/lt/lte/gt/gte/between/in_/text_search/predicate) installs the
+// condition and returns the diff. set_filter(None) clears the filter and
+// returns that diff directly. Path "?" = the row itself.
 static PyObject* ModDict_set_filter(ModDictObject* s, PyObject* args) {
     MOD_DICT_REQUIRE_CURSOR(s, "set_filter()");
-    PyObject* pred;
-    if (!PyArg_ParseTuple(args, "O", &pred)) return nullptr;
-    if (pred == Py_None) pred = nullptr;
-    else if (!PyCallable_Check(pred)) MOD_DICT_RAISE(PyExc_TypeError, "set_filter: predicate must be callable or None");
-    auto diff = s->internal->set_filter(pred);
-    if (PyErr_Occurred()) return nullptr;
-    return index_diff_to_pylist(diff);
+    PyObject* fo;
+    if (!PyArg_ParseTuple(args, "O", &fo)) return nullptr;
+    if (fo == Py_None) {
+        auto diff = s->internal->set_filter({}, FilterOp::EQ, nullptr, nullptr);
+        if (PyErr_Occurred()) return nullptr;
+        return index_diff_to_pylist(diff);
+    }
+    if (PyCallable_Check(fo) && !PyUnicode_Check(fo))
+        MOD_DICT_RAISE(PyExc_TypeError, "set_filter: pass a path, then choose the operator - "
+                       "set_filter('?').predicate(fn) replaces the old set_filter(fn)");
+    // A lone "?" means "the row itself": an empty path, cursor mode.
+    if (PyUnicode_Check(fo)) {
+        const char* raw = PyUnicode_AsUTF8(fo);
+        if (raw && strcmp(raw, "?") == 0) {
+            FilterBuilderObject* fb = (FilterBuilderObject*)FilterBuilder_Type.tp_alloc(&FilterBuilder_Type, 0);
+            if (!fb) return nullptr;
+            fb->owner = s; Py_INCREF(s); fb->field = portable_strdup(""); fb->pattern = nullptr; fb->cursor_mode = true;
+            return (PyObject*)fb;
+        }
+    }
+    PyObject* fb = FilterBuilder_new_obj(s, fo);
+    if (!fb) return nullptr;
+    ((FilterBuilderObject*)fb)->cursor_mode = true;
+    return fb;
 }
 
 /* Cursor observability: connect() + point-mutation API */
@@ -2347,7 +2426,7 @@ static PyMethodDef ModDict_methods[]={
     {"cursor",(PyCFunction)ModDict_cursor,METH_VARARGS,"cursor(path)->ModDict — live handle anchored at an existing nested table; path must already exist"},
     {"set_sort",(PyCFunction)(PyCFunctionWithKeywords)ModDict_set_sort,METH_VARARGS|METH_KEYWORDS,"set_sort(field,reverse=False)->list[(old_index|None,new_index)] — cursor only"},
     {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(field_or_None)->list[(old_index|None,new_index)] — cursor only"},
-    {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(predicate_or_None)->list[(old_index|None,new_index)] — cursor only"},
+    {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(path)->FilterBuilder; then .eq/.ne/.lt/.lte/.gt/.gte/.between/.in_/.text_search/.predicate(...) -> list[(old_index|None,new_index)] installs the condition; path '?' = the row itself; set_filter(None) clears; cursor only"},
     {"connect",(PyCFunction)ModDict_connect,METH_VARARGS,"connect(event_type,callback)->None — cursor only; events: insert/update/delete/reorder"},
     {"disconnect",(PyCFunction)ModDict_disconnect,METH_VARARGS,"disconnect(event_type=None,callback=None)->int — (event,cb): drop that callback; (event): drop the event's listeners; (): drop everything; returns how many were removed (0 = nothing matched); cursor only"},
     {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->(int|None,dict) — (new_index, row); cursor only"},

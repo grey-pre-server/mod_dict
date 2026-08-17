@@ -14,8 +14,12 @@ enum class MergeConflict { KEEP_LEFT, KEEP_RIGHT, MERGE, CONCAT };
 // scan (no index can serve them), case-insensitive via casefold, and a
 // non-str field value simply doesn't match. Exposed as
 // filter(path).text_search(needle, mode=...).
-enum class FilterOp      { EQ, NE, LT, LE, GT, GE, TEXT_CONTAINS, TEXT_STARTSWITH, TEXT_ENDSWITH };
-inline bool is_text_op(FilterOp op) { return op >= FilterOp::TEXT_CONTAINS; }
+// IN / BETWEEN / PREDICATE exist for the cursor's set_filter() condition only
+// (root filter() composes in_/between from EQ/GE/LE calls and has no
+// callable form) — root code never sees them.
+enum class FilterOp      { EQ, NE, LT, LE, GT, GE, TEXT_CONTAINS, TEXT_STARTSWITH, TEXT_ENDSWITH,
+                           IN, BETWEEN, PREDICATE };
+inline bool is_text_op(FilterOp op) { return op == FilterOp::TEXT_CONTAINS || op == FilterOp::TEXT_STARTSWITH || op == FilterOp::TEXT_ENDSWITH; }
 // The text-op predicate (defined in mod_dict.cpp): `needle` must already be
 // casefolded by the caller; a non-str `field` never matches.
 bool text_match(PyObject* field, FilterOp op, PyObject* needle);
@@ -121,7 +125,25 @@ public:
     std::vector<PyObject*> sort_field_py;
     std::vector<PyObject*> group_field_py;
     FlatHashMap<uint64_t, char> filter_membership;  // set of currently-passing key hashes (value unused)
-    PyObject* filter_predicate = nullptr;        // callable, or nullptr = inactive
+    // The active filter condition — set_filter(path).<op>(value). Non-null
+    // filter_predicate means "a filter is active" (every `if (filter_predicate)`
+    // check keys off it) and holds the OPERAND: the comparison value for
+    // eq/lt/..., the casefolded needle for text_search, the callable for
+    // predicate(). filter_op says how to apply it, filter_path (already
+    // split, as PyUnicode segments for PyDict_GetItem) says to WHAT — the
+    // whole row when the path is the single "?" segment (filter_path empty),
+    // else the field the path reaches. One evaluation routine,
+    // filter_row_passes(), serves bootstrap and incremental maintenance alike.
+    PyObject* filter_predicate = nullptr;        // operand (see above), or nullptr = inactive
+    FilterOp  filter_op = FilterOp::EQ;
+    std::vector<PyObject*> filter_path_py;      // owned PyUnicode segments; empty = "?" (row itself)
+    PyObject* filter_operand2 = nullptr;        // BETWEEN's `hi` (filter_predicate is `lo`); nullptr otherwise
+    // True when the row (or the field value at filter_path) passes the
+    // active condition. Leaves PyErr set (predicate() raised, or a
+    // comparison failed hard) and returns false in that case — callers that
+    // already check PyErr_Occurred() after the membership routines keep
+    // working unchanged.
+    bool filter_row_passes(PyObject* row) const;
     // Owned/INCREF'd keys — the filtered subsequence of sort_index (same
     // order), populated/maintained ONLY while filter_predicate is set;
     // empty and unused otherwise. Lets len()/iter()/.at() work against a
@@ -138,7 +160,12 @@ public:
     // incremental path in insert()/insert_batch()). Diffs against whatever
     // presentation order existed before the call.
     IndexDiff set_sort(const std::vector<std::string>& field, bool reverse);
-    IndexDiff set_filter(PyObject* predicate);              // nullptr clears the filter
+    // Installs the condition (path already split into segments; empty =
+    // "?" = the row itself), bootstraps membership, returns the diff. A null
+    // `operand` with op==EQ and empty path clears the filter (set_filter(None)).
+    IndexDiff set_filter(const std::vector<std::string>& path, FilterOp op,
+                         PyObject* operand, PyObject* operand2 = nullptr);
+    void clear_filter_condition();  // drops the stored operands/path (not membership)
     IndexDiff set_group(const std::vector<std::string>& group_by_field);  // empty clears
 
     // Rebuilds sort_index from cached_anchor_dict using group_field (primary)

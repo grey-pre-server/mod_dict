@@ -246,6 +246,22 @@ class FilterBuilder:
         """
         ...
 
+    def predicate(self, fn: Callable[[Any], Any]) -> list[tuple[int | None, int]]:
+        """**Cursor ``set_filter()`` only.** Install *fn* as the visibility
+        condition: it receives the value at the builder's path (or the whole
+        row for ``set_filter("?")``) and returns truthy to keep the row.
+
+        Raises ``NotImplementedError`` on a root ``filter()`` builder — root
+        filtering has no callable form. Re-enters Python once per evaluated
+        row, so prefer ``eq()``/``text_search()``/… when an operator fits.
+
+        Example::
+
+            cursor.set_filter("?").predicate(lambda r: r["amount"] > 100 and r["status"] == "shipped")
+            cursor.set_filter("email").predicate(lambda v: v is not None and v.endswith(".org"))
+        """
+        ...
+
 
 class ModDict:
     """
@@ -1293,48 +1309,61 @@ class ModDict:
         """
         ...
 
-    def set_filter(
-        self, predicate: Callable[[dict], bool] | None,
-    ) -> list[tuple[int | None, int]]:
+    @overload
+    def set_filter(self, path: str | tuple | list) -> FilterBuilder: ...
+    @overload
+    def set_filter(self, path: None) -> list[tuple[int | None, int]]: ...
+    def set_filter(self, path):
         """
-        Activate (or clear) a row-visibility predicate on a cursor.
+        Choose the row-visibility condition of a cursor — same builder, same
+        operators as root ``filter()``:
 
-        `predicate` is called with each row's dict; rows it rejects are
-        tracked as excluded — maintained incrementally afterward, same as
-        ``set_sort()``/``set_group()``.
+            cursor.set_filter("status").eq("shipped")
+            cursor.set_filter("amount").between(10, 100)
+            cursor.set_filter("name").text_search("ali")
+            cursor.set_filter("meta.tags").in_(["vip", "gold"])
+            cursor.set_filter("?").predicate(lambda row: row["a"] > 1 and row["b"])
+            cursor.set_filter(None)          # clear — every row visible again
+
+        ``set_filter(path)`` returns a ``FilterBuilder``; the operator you
+        call on it (``eq``/``ne``/``lt``/``lte``/``gt``/``gte``/``between``/
+        ``in_``/``text_search``/``predicate``) **installs** the condition on
+        the cursor and returns the visibility diff (below). Membership is
+        maintained incrementally from then on: each insert/update evaluates
+        the condition on that one row only, in C++ — no Python call per row
+        for anything but ``predicate()``.
+
+        *path* is a path **into each row** of the anchored table (a field
+        name or dotted path such as ``"meta.city"``); the condition applies
+        to the value it reaches, and a row lacking the field is hidden.
+        ``"?"`` means the row itself — that's what ``predicate()`` wants when
+        it needs several fields at once. Wildcard ``?`` segments elsewhere and
+        ``->`` hops are rejected: a cursor filter runs on one table's rows,
+        never across tables (use root ``filter()`` for that).
+
+        ``predicate(fn)`` (cursor-only) is for conditions no operator
+        expresses — ``fn`` receives the field value (or the whole row for
+        ``"?"``) and returns truthy to keep the row. It re-enters Python per
+        row, so prefer a real operator when one fits.
 
         Filter membership is composed into ``len()``/iteration/``at()``: with
-        an active filter, they only see the passing rows, densely indexed
-        (position 0 is the first *visible* row, not necessarily the first
-        row under the anchor). ``insert()``/``update_row()``/``delete()``'s
-        returned position(s) agree with this — they report where a row
-        landed among the *visible* rows, not its raw position among every
-        row under the anchor.
+        an active filter they only see the passing rows, densely indexed
+        (position 0 is the first *visible* row). ``insert()``/
+        ``update_row()``/``delete()``'s returned positions agree with this.
+        Raw access (``[key]``/``in``/``get``/``keys()``/…) stays filter-blind
+        — see ``view_keys()``.
 
-        Args:
-            predicate: Callable taking a row dict, returning truthy to keep
-                       the row visible. ``None`` clears the filter (every
-                       row becomes visible again).
-
-        Returns:
-            ``(old_index, new_index)`` pairs — for a reconfigure, a row that
-            was hidden by the *previous* filter (or wasn't tracked because
-            no filter was active) and becomes visible under the new one
-            reports ``old_index=None`` even though the row itself already
-            existed; a formerly-visible row that the new filter now excludes
-            reports ``new_index=None``. Multiple rows can legitimately share
-            ``old_index=None`` in the same call — that's exactly why this is
-            a **list**, not a ``{old: new}`` dict (a dict would collapse
-            them).
+        Returns (from the operator, or from ``set_filter(None)``):
+            ``(old_index, new_index)`` pairs — a row hidden by the previous
+            filter (or untracked because none was active) that becomes
+            visible reports ``old_index=None``; a formerly-visible row the
+            new condition excludes reports ``new_index=None``. Several rows
+            may share ``old_index=None`` in one call — hence a **list**, not
+            a ``{old: new}`` dict.
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
-        ``ModDict``.
-
-        Example::
-
-            orders = mn.cursor("u1.orders")
-            orders.set_filter(lambda row: row["status"] == "shipped")
-            orders.set_filter(None)   # clear
+        ``ModDict``. Passing a callable directly (the pre-0.8.22 form) raises
+        ``TypeError`` pointing at ``set_filter("?").predicate(fn)``.
         """
         ...
 

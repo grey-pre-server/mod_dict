@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "mod_dict"
-version = "0.8.21"
+version = "0.8.22"
 description = "Nested dictionary with indexed field queries, merge and serialization"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +20,12 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.urls]
+Homepage = "https://github.com/grey-pre-server/mod_dict"
+Repository = "https://github.com/grey-pre-server/mod_dict"
+Benchmarks = "https://github.com/grey-pre-server/mod_dict/blob/master/BENCHMARK.md"
+"API Reference" = "https://github.com/grey-pre-server/mod_dict/blob/master/src/mod_dict.pyi"
 
 
 [tool.scikit-build]
