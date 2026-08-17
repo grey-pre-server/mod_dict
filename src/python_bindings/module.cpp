@@ -138,6 +138,28 @@ static PyObject* py_set_geo_backend(PyObject*, PyObject* arg) {
 }
 
 /* ============================================================================
+   set_row_backend / set_rowset_backend — what a deserialized DB row / list of
+   rows turns into. Same shape as set_geo_backend: process-wide, str or None
+   (None = back to the default: "row" / "list").
+   ============================================================================ */
+
+static PyObject* py_set_row_backend(PyObject*, PyObject* arg) {
+    if (arg == Py_None) { Serializer::set_row_backend(nullptr); Py_RETURN_NONE; }
+    if (!PyUnicode_Check(arg)) { PyErr_SetString(PyExc_TypeError, "set_row_backend: name must be a str or None"); return nullptr; }
+    const char* name = PyUnicode_AsUTF8(arg);
+    if (!name || !Serializer::set_row_backend(name)) return nullptr;
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_set_rowset_backend(PyObject*, PyObject* arg) {
+    if (arg == Py_None) { Serializer::set_rowset_backend(nullptr); Py_RETURN_NONE; }
+    if (!PyUnicode_Check(arg)) { PyErr_SetString(PyExc_TypeError, "set_rowset_backend: name must be a str or None"); return nullptr; }
+    const char* name = PyUnicode_AsUTF8(arg);
+    if (!name || !Serializer::set_rowset_backend(name)) return nullptr;
+    Py_RETURN_NONE;
+}
+
+/* ============================================================================
    dumps / loads — module-level serialization for arbitrary objects.
 
    A ModDict is serialized with its own container format (magic+version+outer
@@ -211,6 +233,21 @@ static PyMethodDef module_methods[] = {
      "None to clear the preference and go back to auto-detection. Raises\n"
      "ValueError/ImportError immediately if the name is invalid or that\n"
      "library isn't importable (\"wkb_bytes\" never needs one)."},
+    {"set_row_backend", py_set_row_backend, METH_O,
+     "set_row_backend(name)\n"
+     "What a deserialized DB row (sqlalchemy Row / RowMapping — fetchone(),\n"
+     "first(), one(), or each element of a rowset) turns into: \"row\" (default;\n"
+     "a sqlalchemy.engine.Row — raises if sqlalchemy isn't importable or the\n"
+     "Row can't be rebuilt), \"dict\" ({column: value}), \"tuple\" or \"list\"\n"
+     "(positional values, names dropped). None resets to \"row\"."},
+    {"set_rowset_backend", py_set_rowset_backend, METH_O,
+     "set_rowset_backend(name)\n"
+     "What a deserialized DB rowset (fetchall() / mappings().all()) turns into:\n"
+     "\"list\" (default) or \"tuple\" of rows shaped per set_row_backend();\n"
+     "\"dict\" ({pk: row}) or \"mod_dict\" (a ModDict, rows as dicts) keyed by the\n"
+     "primary key recorded from the query's Column metadata — composite pk ->\n"
+     "tuple key; raises if the rowset carries no pk (text() queries, columns\n"
+     "from no table). None resets to \"list\"."},
     {nullptr, nullptr, 0, nullptr}
 };
 

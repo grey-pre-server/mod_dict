@@ -51,6 +51,27 @@ void                 deserialize_interned(const uint8_t* data, size_t len, ModDi
 bool        set_geo_backend(const char* name);
 const char* get_geo_backend();  // nullptr if unset
 
+// ── DB row / rowset deserialize backend preference ───────────────────────────
+// What a serialized sqlalchemy Row (fetchone/first/one, or each element of
+// fetchall/mappings().all()) turns into on read:
+//   "row"   (default) sqlalchemy.engine.Row — raises ImportError/RuntimeError
+//           if sqlalchemy isn't importable or Row can't be constructed
+//   "dict"  {column: value}
+//   "tuple" positional values, names dropped
+//   "list"  positional values, mutable
+// And what a serialized ROWSET (a list of Rows/RowMappings) turns into:
+//   "list"  (default) list of whatever set_row_backend() yields per row
+//   "tuple" same, as a tuple
+//   "dict"  {pk: row} keyed by the primary key found in the row metadata
+//           (composite pk -> tuple key); raises if the rowset carries no pk
+//   "mod_dict" a ModDict keyed the same way (rows as dicts regardless of
+//           set_row_backend — a ModDict row must be a dict)
+// Both raise (Python exception set, return false) on an unknown name.
+bool        set_row_backend(const char* name);
+const char* get_row_backend();
+bool        set_rowset_backend(const char* name);
+const char* get_rowset_backend();
+
 } // namespace Serializer
 
 #endif

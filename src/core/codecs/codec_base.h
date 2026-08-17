@@ -39,6 +39,16 @@ enum class TypeId : uint8_t {
     TUPLE               = 26,
     BYTEARRAY           = 27,
     WKB                 = 28,  // raw WKB bytes; shapely/geoalchemy2/ShapelyWKB/GeoAlchemyWKB
+    // DB query results — sqlalchemy Row / RowMapping and lists of them.
+    // Written with column names AND the primary-key column set (pulled from
+    // the Column objects a Row carries in _parent._keymap), so the reader
+    // can rebuild any of dict/tuple/list/Row for a row, and list/tuple/
+    // dict/mod_dict (keyed by pk) for a set — see set_row_backend() /
+    // set_rowset_backend(). Layout:
+    //   ROW    u32 ncols, [STRING name]*ncols, u32 npk, [u32 pk_col_index]*npk, [value]*ncols
+    //   ROWSET u32 ncols, [STRING name]*ncols, u32 npk, [u32 pk_col_index]*npk, u32 nrows, [[value]*ncols]*nrows
+    ROW                 = 29,
+    ROWSET              = 30,
                                // all converge here on write - see reconstruct_wkb() for read
 };
 

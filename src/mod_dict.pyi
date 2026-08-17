@@ -1925,6 +1925,87 @@ def set_geo_backend(name: Literal["shapely", "geoalchemy2", "wkb_bytes"] | None)
     ...
 
 
+def set_row_backend(name: Literal["row", "dict", "tuple", "list"] | None) -> None:
+    """
+    Choose what a deserialized **DB row** turns into.
+
+    A SQLAlchemy ``Row`` (from ``fetchone()``/``first()``/``one()``, or each
+    element of ``fetchall()``) or ``RowMapping`` (``mappings().first()`` /
+    each element of ``mappings().all()``) is serialized with its column
+    names, its values, and which columns form the **primary key** — pulled
+    from the ``Column`` metadata the row carries. What it comes back as is
+    this setting's job:
+
+    - ``"row"`` *(default)* — a ``sqlalchemy.engine.Row`` again (``._fields``,
+      ``._mapping``, attribute access all work). Requires sqlalchemy on the
+      reading side: raises ``ImportError`` if it isn't importable, or
+      ``RuntimeError`` if the Row can't be rebuilt — never a silent
+      fallback. Choose another backend to read without sqlalchemy.
+    - ``"dict"`` — ``{column: value}``.
+    - ``"tuple"`` / ``"list"`` — positional values, names dropped.
+
+    Serialization itself is not parametrized: a row is always written
+    complete (names + values + pk), so any backend can be chosen at read
+    time — the same contract ``set_geo_backend()`` follows for WKB. Only
+    rows carrying result metadata are treated this way; a plain ``dict``,
+    ``tuple`` or ``list`` you built yourself is serialized as itself.
+
+    ``None`` resets to ``"row"``.
+
+    Example::
+
+        with engine.connect() as c:
+            row = c.execute(select(users)).fetchone()
+        blob = md.dumps({"u": {"first": row}})
+
+        md.set_row_backend("dict")
+        md.loads(blob)["u"]["first"]        # {"id": 1, "name": "alice"}
+    """
+    ...
+
+
+def set_rowset_backend(name: Literal["list", "tuple", "dict", "mod_dict"] | None) -> None:
+    """
+    Choose what a deserialized **DB rowset** — ``fetchall()`` /
+    ``mappings().all()`` (or ``.all()``, ``.fetchmany()``, ``list(result)``),
+    i.e. a list of rows from one query — turns into. A live, un-fetched
+    ``Result`` / ``MappingResult`` / ``ScalarResult`` can be handed to
+    ``dumps()``/``serialize()`` directly too: it is drained with ``.all()``
+    on the spot (consumed either way — same as if you'd fetched it) and
+    serialized as the rowset (or, for ``ScalarResult``, a plain list).
+
+    - ``"list"`` *(default)* / ``"tuple"`` — rows shaped per
+      ``set_row_backend()``, in query order.
+    - ``"dict"`` — ``{pk: row}``, keyed by the primary key the query's
+      ``Column`` metadata recorded (a composite pk becomes a tuple key, in
+      column order). Rows shaped per ``set_row_backend()``.
+    - ``"mod_dict"`` — a ``ModDict`` keyed the same way, rows as dicts
+      (a ModDict row must be a dict, so ``set_row_backend()`` is ignored
+      here) — ready for ``filter()``/``cursor()``/… straight off the wire.
+
+    The pk is found **automatically** from the ``Column`` objects SQLAlchemy
+    attaches to a query built from ``Table``/ORM objects — you never name
+    it. A ``text()`` query, or columns from no table (aggregates), carry no
+    pk: ``"dict"``/``"mod_dict"`` then raise ``TypeError`` (use ``"list"``,
+    or key it yourself with ``md.from_rows(rows, key=...)``). Deliberately
+    an error rather than a guess — the pk is what makes the keyed form
+    meaningful.
+
+    ``None`` resets to ``"list"``.
+
+    Example::
+
+        with engine.connect() as c:
+            rows = c.execute(select(users)).fetchall()
+        blob = md.dumps({"users": rows})
+
+        md.set_rowset_backend("mod_dict")
+        users = md.loads(blob)["users"]     # ModDict keyed by users.id
+        users.filter("name").eq("alice")
+    """
+    ...
+
+
 def dumps(obj: Any) -> bytes:
     """
     Serialize any supported object to bytes — not just a ModDict.

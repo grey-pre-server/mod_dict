@@ -154,6 +154,130 @@ const char* get_geo_backend() {
     return s_geo_backend.empty() ? nullptr : s_geo_backend.c_str();
 }
 
+// ── DB row / rowset deserialize backend preference ───────────────────────────
+static std::string s_row_backend    = "row";
+static std::string s_rowset_backend = "list";
+
+bool set_row_backend(const char* name) {
+    if (!name) { s_row_backend = "row"; return true; }
+    if (strcmp(name, "row") && strcmp(name, "dict") && strcmp(name, "tuple") && strcmp(name, "list")) {
+        PyErr_Format(PyExc_ValueError,
+            "set_row_backend: name must be 'row', 'dict', 'tuple', or 'list', got '%s'", name);
+        return false;
+    }
+    s_row_backend = name;
+    return true;
+}
+const char* get_row_backend() { return s_row_backend.c_str(); }
+
+bool set_rowset_backend(const char* name) {
+    if (!name) { s_rowset_backend = "list"; return true; }
+    if (strcmp(name, "list") && strcmp(name, "tuple") && strcmp(name, "dict") && strcmp(name, "mod_dict")) {
+        PyErr_Format(PyExc_ValueError,
+            "set_rowset_backend: name must be 'list', 'tuple', 'dict', or 'mod_dict', got '%s'", name);
+        return false;
+    }
+    s_rowset_backend = name;
+    return true;
+}
+const char* get_rowset_backend() { return s_rowset_backend.c_str(); }
+
+// Detects a sqlalchemy Row / RowMapping and pulls out what the ROW/ROWSET
+// records need: column names in order, values in order, and which columns
+// form the primary key.
+//
+// This reads sqlalchemy INTERNALS — Row._parent (a CursorResultMetaData)
+// and its _keymap, whose keys include the actual Column objects, each with
+// .primary_key. Nothing public exposes pk from a Row (the public API only
+// knows names/indexes). Accepted deliberately, same terms as the "row"
+// backend rebuilding a Row through its internal constructor: if a
+// sqlalchemy upgrade moves these, the failure is LOUD (RuntimeError below),
+// never a silent fallback. Verified against sqlalchemy 2.0.51.
+//
+// A raw text() query yields Rows whose _keymap has no Column objects — no
+// table, no pk — reported as "pk not determinable" only when a pk is
+// actually needed (rowset dict/mod_dict); a text() Row still serializes as
+// a ROW with an empty pk set.
+//
+// Returns 1 = extracted, 0 = not a Row/RowMapping (leave to other branches),
+// -1 = looked like one but the internals didn't line up (PyErr set).
+//
+// Cost: ~25us per call, dominated by the _keymap walk for pk (every column
+// sits under several keymap keys, each probed with GetAttrString). That's
+// fine for a lone fetchone() Row; the ROWSET writer therefore calls this
+// ONCE for element 0 and reads only ._data for the rest.
+struct RowShape {
+    PyObject* names  = nullptr;   // list[str], owned
+    PyObject* values = nullptr;   // list, owned
+    PyObject* pk_idx = nullptr;   // list[int] column indexes, owned
+    ~RowShape() { Py_XDECREF(names); Py_XDECREF(values); Py_XDECREF(pk_idx); }
+};
+
+static int extract_row_shape(PyObject* obj, RowShape& out) {
+    // Row and RowMapping both derive from BaseRow and carry ._parent (the
+    // result metadata) and ._data (values tuple). Anything without _parent
+    // isn't a DB row and is left to the other branches.
+    PyObject* parent = PyObject_GetAttrString(obj, "_parent");
+    if (!parent) { PyErr_Clear(); return 0; }
+    // Column names in result order — public: parent.keys
+    PyObject* keys = PyObject_GetAttrString(parent, "keys");
+    if (!keys) { PyErr_Clear(); Py_DECREF(parent); return 0; }
+    out.names = PySequence_List(keys);
+    Py_DECREF(keys);
+    if (!out.names) { Py_DECREF(parent); return -1; }
+    Py_ssize_t ncols = PyList_GET_SIZE(out.names);
+
+    // Values in column order. Both Row and RowMapping derive from BaseRow,
+    // which keeps them as the `_data` tuple (2.0 — Row is NOT a tuple
+    // subclass anymore, that was 1.4; and RowMapping.__getitem__ is by
+    // name, Row.__getitem__ by index, so neither is a safe generic path).
+    // Fall back to iterating the object as a sequence if _data is absent
+    // (a 1.4 Row IS a tuple, so PySequence_List works there).
+    PyObject* data = PyObject_GetAttrString(obj, "_data");
+    if (data) { out.values = PySequence_List(data); Py_DECREF(data); }
+    else { PyErr_Clear(); out.values = PySequence_List(obj); }
+    if (!out.values) { Py_DECREF(parent); return -1; }
+    if (PyList_GET_SIZE(out.values) != ncols) {
+        Py_DECREF(parent);
+        PyErr_SetString(PyExc_RuntimeError,
+            "serialize Row: value count does not match column count - sqlalchemy internals changed?");
+        return -1;
+    }
+
+    // Primary key: walk _keymap for Column objects with primary_key=True and
+    // map each back to its result index via the keymap entry's index slot
+    // (entry[0] is the index in 2.0's keymap tuples).
+    out.pk_idx = PyList_New(0);
+    PyObject* keymap = PyObject_GetAttrString(parent, "_keymap");
+    Py_DECREF(parent);
+    if (!keymap) { PyErr_Clear(); return 1; }  // no keymap at all → no pk (text query, other driver)
+    if (PyDict_Check(keymap)) {
+        PyObject *k, *v; Py_ssize_t pos = 0;
+        while (PyDict_Next(keymap, &pos, &k, &v)) {
+            PyObject* pk_attr = PyObject_GetAttrString(k, "primary_key");
+            if (!pk_attr) { PyErr_Clear(); continue; }        // a plain str/int key, not a Column
+            int is_pk = PyObject_IsTrue(pk_attr);
+            Py_DECREF(pk_attr);
+            if (is_pk != 1) continue;
+            // index: first slot of the entry tuple
+            if (PyTuple_Check(v) && PyTuple_GET_SIZE(v) > 0) {
+                PyObject* idx = PyTuple_GET_ITEM(v, 0);
+                if (PyLong_Check(idx)) {
+                    // dedupe (the same Column appears under several keymap keys)
+                    int seen = PySequence_Contains(out.pk_idx, idx);
+                    if (seen == 0) PyList_Append(out.pk_idx, idx);
+                }
+            }
+        }
+        // stable order by column index, so a composite key is (col_a, col_b)
+        // in result order regardless of dict iteration order
+        PyList_Sort(out.pk_idx);
+    }
+    Py_DECREF(keymap);
+    if (PyErr_Occurred()) PyErr_Clear();
+    return 1;
+}
+
 // Reconstruct a shapely geometry or geoalchemy2 WKBElement from raw WKB bytes
 // — or hand the bytes straight back under the "wkb_bytes" backend.
 // Honors an explicit set_geo_backend() preference; otherwise auto-detects
@@ -442,6 +566,93 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
         return;
     }
 
+    // A live query result handed over UN-fetched — CursorResult,
+    // MappingResult, ScalarResult (anything sqlalchemy derives from
+    // ResultInternal: has .all() and ._metadata). Drain it with .all() and
+    // serialize what comes out: Rows/RowMappings → ROWSET below, scalars →
+    // a plain LIST. Saves the caller a .fetchall() and rules out an
+    // accidental double-drain; the result is consumed either way, exactly
+    // as it would be by the caller's own .all(). Duck-typed on purpose —
+    // no sqlalchemy import on the write side.
+    if (!PyList_Check(obj) && !PyTuple_Check(obj) && !PyDict_Check(obj)) {
+        PyObject* meta = PyObject_GetAttrString(obj, "_metadata");
+        if (meta) {
+            Py_DECREF(meta);
+            PyObject* all = PyObject_GetAttrString(obj, "all");
+            if (all && PyCallable_Check(all)) {
+                PyObject* drained = PyObject_CallNoArgs(all);
+                Py_DECREF(all);
+                if (!drained) return;  // PyErr set (e.g. result already closed)
+                serialize_pyobj(buf, drained);
+                Py_DECREF(drained);
+                return;
+            }
+            Py_XDECREF(all);
+        }
+        PyErr_Clear();
+    }
+
+    // A list of DB rows (fetchall() / mappings().all()) → one ROWSET record:
+    // names + pk once, then values row by row. Detected by the FIRST element
+    // (must be a Row/RowMapping); every element must share its column set,
+    // which result lists do by construction. A mixed or plain list falls to
+    // the LIST branch below.
+    if (PyList_Check(obj) && PyList_GET_SIZE(obj) > 0) {
+        RowShape first;
+        int r = extract_row_shape(PyList_GET_ITEM(obj, 0), first);
+        if (r < 0) return;  // PyErr set
+        if (r == 1) {
+            buf.push_back(to_byte(TypeId::ROWSET));
+            size_t lp = buf.size(); write_u32(buf, 0);
+            Py_ssize_t ncols = PyList_GET_SIZE(first.names);
+            write_u32(buf, (uint32_t)ncols);
+            for (Py_ssize_t i = 0; i < ncols; i++) { serialize_pyobj(buf, PyList_GET_ITEM(first.names, i)); if (PyErr_Occurred()) return; }
+            Py_ssize_t npk = PyList_GET_SIZE(first.pk_idx);
+            write_u32(buf, (uint32_t)npk);
+            for (Py_ssize_t i = 0; i < npk; i++) write_u32(buf, (uint32_t)PyLong_AsLong(PyList_GET_ITEM(first.pk_idx, i)));
+            Py_ssize_t nrows = PyList_GET_SIZE(obj);
+            write_u32(buf, (uint32_t)nrows);
+            // Names and pk came from element 0 and are shared by the whole
+            // set (one query, one column list) — for every further row read
+            // ONLY its ._data values. Running the full extract_row_shape()
+            // per row (parent lookup, names list, keymap walk for pk) made
+            // ROWSET serialization 12x slower than a plain list of dicts
+            // (bench_serialize_types.py: 16us/row vs 1.3us). A row that
+            // doesn't expose _data, or has a different column count, is a
+            // mixed list -> TypeError, same as before.
+            for (Py_ssize_t ri = 0; ri < nrows; ri++) {
+                PyObject* vals;
+                if (ri == 0) { vals = first.values; Py_INCREF(vals); }
+                else {
+                    PyObject* el = PyList_GET_ITEM(obj, ri);
+                    PyObject* data = PyObject_GetAttrString(el, "_data");
+                    if (!data) { PyErr_Clear(); data = PySequence_Tuple(el); }
+                    if (!data) {
+                        PyErr_Format(PyExc_TypeError,
+                            "serialize: rowset element %zd is not a Row like element 0", ri);
+                        return;
+                    }
+                    vals = PySequence_List(data);
+                    Py_DECREF(data);
+                    if (!vals) return;
+                    if (PyList_GET_SIZE(vals) != ncols) {
+                        Py_DECREF(vals);
+                        PyErr_Format(PyExc_TypeError,
+                            "serialize: rowset element %zd has a different column count than element 0 (%zd)", ri, ncols);
+                        return;
+                    }
+                }
+                for (Py_ssize_t ci = 0; ci < ncols; ci++) {
+                    serialize_pyobj(buf, PyList_GET_ITEM(vals, ci));
+                    if (PyErr_Occurred()) { Py_DECREF(vals); return; }
+                }
+                Py_DECREF(vals);
+            }
+            backfill_length(buf, lp);
+            return;
+        }
+    }
+
     if (PyList_Check(obj)) {
         buf.push_back(to_byte(TypeId::LIST));
         size_t lp = buf.size(); write_u32(buf, 0);
@@ -454,6 +665,31 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
         write_u32_at(buf, cp, count);
         backfill_length(buf, lp);
         return;
+    }
+
+    // A single DB row (fetchone()/first()/one(), or mappings().first()) → a
+    // ROW record with names + pk + values. Runs before the tuple branch: a
+    // 1.4 Row IS a tuple subclass and would be written positionally there,
+    // losing its column names; a 2.0 Row/RowMapping is a Sequence/Mapping
+    // (not tuple, not dict) and would otherwise reach the module-sniff and
+    // fail as unserializable.
+    {
+        RowShape rs;
+        int r = extract_row_shape(obj, rs);
+        if (r < 0) return;  // PyErr set
+        if (r == 1) {
+            buf.push_back(to_byte(TypeId::ROW));
+            size_t lp = buf.size(); write_u32(buf, 0);
+            Py_ssize_t ncols = PyList_GET_SIZE(rs.names);
+            write_u32(buf, (uint32_t)ncols);
+            for (Py_ssize_t i = 0; i < ncols; i++) { serialize_pyobj(buf, PyList_GET_ITEM(rs.names, i)); if (PyErr_Occurred()) return; }
+            Py_ssize_t npk = PyList_GET_SIZE(rs.pk_idx);
+            write_u32(buf, (uint32_t)npk);
+            for (Py_ssize_t i = 0; i < npk; i++) write_u32(buf, (uint32_t)PyLong_AsLong(PyList_GET_ITEM(rs.pk_idx, i)));
+            for (Py_ssize_t i = 0; i < ncols; i++) { serialize_pyobj(buf, PyList_GET_ITEM(rs.values, i)); if (PyErr_Occurred()) return; }
+            backfill_length(buf, lp);
+            return;
+        }
     }
 
     if (PyTuple_Check(obj)) {
@@ -727,6 +963,132 @@ void serialize_value(std::vector<uint8_t>& buf, const ModValue& val) {
 }
 
 /* ============================================================================
+   ROW / ROWSET reconstruction — see set_row_backend()/set_rowset_backend().
+   ============================================================================ */
+
+// sqlalchemy pieces for the "row" backend, resolved once (same reasoning as
+// GeoLibCache — and same fail-loud contract if the internals move).
+struct SqlaCache {
+    bool resolved = false;
+    PyObject* row_cls = nullptr;       // sqlalchemy.engine.Row
+    PyObject* meta_cls = nullptr;      // sqlalchemy.engine.result.SimpleResultMetaData
+    void resolve() {
+        resolved = true;
+        PyObject* m = PyImport_ImportModule("sqlalchemy.engine.result");
+        if (!m) { PyErr_Clear(); return; }
+        row_cls  = PyObject_GetAttrString(m, "Row");            if (!row_cls)  PyErr_Clear();
+        meta_cls = PyObject_GetAttrString(m, "SimpleResultMetaData"); if (!meta_cls) PyErr_Clear();
+        Py_DECREF(m);
+    }
+};
+static SqlaCache s_sqla;
+
+// {name: value} from parallel lists. New ref.
+static PyObject* row_as_dict(PyObject* names, PyObject* vals) {
+    PyObject* d = PyDict_New();
+    if (!d) return nullptr;
+    Py_ssize_t n = PyList_GET_SIZE(names);
+    for (Py_ssize_t i = 0; i < n; i++)
+        if (PyDict_SetItem(d, PyList_GET_ITEM(names, i), PyList_GET_ITEM(vals, i)) != 0) { Py_DECREF(d); return nullptr; }
+    return d;
+}
+
+// One row in the requested shape. New ref; nullptr with PyErr set.
+static PyObject* build_row(const char* backend, PyObject* names, PyObject* vals) {
+    if (strcmp(backend, "dict") == 0)  return row_as_dict(names, vals);
+    if (strcmp(backend, "list") == 0)  return PySequence_List(vals);
+    if (strcmp(backend, "tuple") == 0) return PySequence_Tuple(vals);
+    // "row": Row(SimpleResultMetaData(names), processors, meta._key_to_index, tuple(values))
+    // — verified against sqlalchemy 2.0.51. Internal API by necessity: no
+    // public constructor exists for a Row detached from a real cursor.
+    if (!s_sqla.resolved) s_sqla.resolve();
+    if (!s_sqla.row_cls || !s_sqla.meta_cls) {
+        PyErr_SetString(PyExc_ImportError,
+            "deserialize Row: set_row_backend is 'row' (the default) but sqlalchemy is not "
+            "importable here - install it, or choose md.set_row_backend('dict'|'tuple'|'list')");
+        return nullptr;
+    }
+    PyObject* meta = PyObject_CallOneArg(s_sqla.meta_cls, names);
+    if (!meta) return nullptr;
+    PyObject* k2i = PyObject_GetAttrString(meta, "_key_to_index");
+    PyObject* procs = PyList_New(PyList_GET_SIZE(names));
+    if (procs) for (Py_ssize_t i = 0; i < PyList_GET_SIZE(names); i++) { Py_INCREF(Py_None); PyList_SET_ITEM(procs, i, Py_None); }
+    PyObject* data = PySequence_Tuple(vals);
+    PyObject* row = (k2i && procs && data)
+        ? PyObject_CallFunctionObjArgs(s_sqla.row_cls, meta, procs, k2i, data, nullptr) : nullptr;
+    Py_XDECREF(data); Py_XDECREF(procs); Py_XDECREF(k2i); Py_DECREF(meta);
+    if (!row && !PyErr_Occurred())
+        PyErr_SetString(PyExc_RuntimeError, "deserialize Row: sqlalchemy Row constructor rejected the arguments - internals changed?");
+    if (!row) {
+        // wrap whatever sqlalchemy raised with a hint about the way out
+        PyObject *t, *v, *tb; PyErr_Fetch(&t, &v, &tb); PyErr_NormalizeException(&t, &v, &tb);
+        PyObject* s = v ? PyObject_Str(v) : nullptr;
+        PyErr_Format(PyExc_RuntimeError,
+            "deserialize Row: could not rebuild a sqlalchemy Row (%s) - choose "
+            "md.set_row_backend('dict'|'tuple'|'list') to get plain values instead",
+            s ? PyUnicode_AsUTF8(s) : "unknown error");
+        Py_XDECREF(s); Py_XDECREF(t); Py_XDECREF(v); Py_XDECREF(tb);
+    }
+    return row;
+}
+
+// The pk key for one row: the single pk column's value, or a tuple of them.
+static PyObject* row_pk_key(PyObject* vals, const std::vector<uint32_t>& pk_idx) {
+    if (pk_idx.size() == 1) { PyObject* v = PyList_GET_ITEM(vals, pk_idx[0]); Py_INCREF(v); return v; }
+    PyObject* t = PyTuple_New((Py_ssize_t)pk_idx.size());
+    if (!t) return nullptr;
+    for (size_t i = 0; i < pk_idx.size(); i++) { PyObject* v = PyList_GET_ITEM(vals, pk_idx[i]); Py_INCREF(v); PyTuple_SET_ITEM(t, i, v); }
+    return t;
+}
+
+// list/tuple: accumulate into a list (tuple-ified at finish). dict/mod_dict:
+// accumulate into a dict keyed by pk (mod_dict wraps at finish).
+static PyObject* build_rowset_begin(const char* backend, bool has_pk) {
+    bool keyed = strcmp(backend, "dict") == 0 || strcmp(backend, "mod_dict") == 0;
+    if (keyed && !has_pk) {
+        PyErr_Format(PyExc_TypeError,
+            "deserialize rowset: set_rowset_backend is '%s' but this rowset carries no primary key "
+            "(a text() query, or columns from no table) - use 'list'/'tuple', or build the keyed "
+            "form yourself via md.from_rows(rows, key=...)", backend);
+        return nullptr;
+    }
+    return keyed ? PyDict_New() : PyList_New(0);
+}
+
+static bool build_rowset_add(PyObject* acc, const char* backend, const char* row_backend,
+                             PyObject* names, PyObject* vals, const std::vector<uint32_t>& pk_idx) {
+    bool keyed = PyDict_Check(acc);
+    // A ModDict row must be a dict, whatever set_row_backend says; a plain
+    // dict rowset honours set_row_backend per row like list/tuple do.
+    const char* rb = (strcmp(backend, "mod_dict") == 0) ? "dict" : row_backend;
+    PyObject* row = build_row(rb, names, vals);
+    if (!row) return false;
+    bool ok;
+    if (keyed) {
+        PyObject* k = row_pk_key(vals, pk_idx);
+        ok = k && PyDict_SetItem(acc, k, row) == 0;
+        Py_XDECREF(k);
+    } else {
+        ok = PyList_Append(acc, row) == 0;
+    }
+    Py_DECREF(row);
+    return ok;
+}
+
+// Steals `acc`; returns the final object (new ref) or nullptr with PyErr set.
+static PyObject* build_rowset_finish(PyObject* acc, const char* backend) {
+    if (strcmp(backend, "tuple") == 0) { PyObject* t = PySequence_Tuple(acc); Py_DECREF(acc); return t; }
+    if (strcmp(backend, "mod_dict") == 0) {
+        PyObject* m = PyImport_ImportModule("mod_dict");
+        PyObject* cls = m ? PyObject_GetAttrString(m, "ModDict") : nullptr;
+        PyObject* out = cls ? PyObject_CallOneArg(cls, acc) : nullptr;
+        Py_XDECREF(cls); Py_XDECREF(m); Py_DECREF(acc);
+        return out;
+    }
+    return acc;  // "list" / "dict" as accumulated
+}
+
+/* ============================================================================
    deserialize_value — build PyObject*, return as ModValue.
    Does NOT call content_hash_pyobj (no PyObject_Repr overhead).
    Caller receives a ModValue with obj (refcount=1), type=NONE, hash=0.
@@ -939,6 +1301,59 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
                 PyObject* v = mv.obj ? mv.obj : Py_None;
                 PyDict_SetItem(result, k, v);
             }
+            break;
+        }
+
+        case TypeId::ROW:
+        case TypeId::ROWSET: {
+            // Shared header: names, pk column indexes. Then ROW: one value
+            // per column; ROWSET: nrows × values.
+            if (length < 8) break;
+            const uint8_t* col_end = data_end;
+            uint32_t ncols = read_u32(ptr);
+            PyObject* names = PyList_New((Py_ssize_t)ncols);
+            if (!names) { PyErr_Clear(); break; }
+            for (uint32_t i = 0; i < ncols && ptr < col_end; i++) {
+                ModValue mn = deserialize_value(ptr, col_end, nullptr);
+                PyObject* n = mn.obj ? mn.obj : Py_None; Py_INCREF(n);
+                PyList_SET_ITEM(names, i, n);
+            }
+            uint32_t npk = read_u32(ptr);
+            std::vector<uint32_t> pk_idx;
+            for (uint32_t i = 0; i < npk && ptr + 4 <= col_end; i++) pk_idx.push_back(read_u32(ptr));
+
+            // Reads one row's values into a fresh list.
+            auto read_values = [&]() -> PyObject* {
+                PyObject* vals = PyList_New((Py_ssize_t)ncols);
+                if (!vals) return nullptr;
+                for (uint32_t i = 0; i < ncols; i++) {
+                    if (ptr >= col_end) { Py_INCREF(Py_None); PyList_SET_ITEM(vals, i, Py_None); continue; }
+                    ModValue mv = deserialize_value(ptr, col_end, nullptr);
+                    PyObject* v = mv.obj ? mv.obj : Py_None; Py_INCREF(v);
+                    PyList_SET_ITEM(vals, i, v);
+                }
+                return vals;
+            };
+
+            if (tid == TypeId::ROW) {
+                PyObject* vals = read_values();
+                result = vals ? build_row(get_row_backend(), names, vals) : nullptr;
+                Py_XDECREF(vals);
+            } else {
+                uint32_t nrows = read_u32(ptr);
+                result = build_rowset_begin(get_rowset_backend(), pk_idx.empty() ? false : true);
+                for (uint32_t r = 0; result && r < nrows && ptr < col_end; r++) {
+                    PyObject* vals = read_values();
+                    if (!vals) { Py_CLEAR(result); break; }
+                    if (!build_rowset_add(result, get_rowset_backend(), get_row_backend(), names, vals, pk_idx)) Py_CLEAR(result);
+                    Py_DECREF(vals);
+                }
+                if (result) result = build_rowset_finish(result, get_rowset_backend());
+            }
+            Py_DECREF(names);
+            // A null result here carries a REAL exception (unknown backend
+            // requirements unmet: no sqlalchemy for "row", no pk for a keyed
+            // rowset) — leave it set so it propagates instead of becoming None.
             break;
         }
 
