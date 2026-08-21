@@ -38,7 +38,7 @@ struct GeoLibCache {
     bool resolved = false;
     bool has_shapely = false;
     bool has_geoalchemy = false;
-    PyObject* shapely_loads = nullptr;   // owned: shapely.wkb.loads
+    PyObject* shapely_loads = nullptr;   // owned: shapely.from_wkb (shapely 2.x — the only supported line)
     PyObject* shapely_get_srid = nullptr;// owned: shapely.get_srid (write side; may stay null on old shapely)
     PyObject* wkbelement_cls = nullptr;  // owned: geoalchemy2.WKBElement
     void clear() {
@@ -49,18 +49,24 @@ struct GeoLibCache {
     }
     void resolve() {
         clear();
-        PyObject* sh = PyImport_ImportModule("shapely.wkb");
-        if (sh) {
-            shapely_loads = PyObject_GetAttrString(sh, "loads");
+        // Top-level `import shapely` ONLY — the exact import user code makes,
+        // which matters for frozen builds (Nuitka/PyInstaller): the bundler
+        // traces the app's own `import shapely`, never this C-level probe, so
+        // a SUBMODULE nothing statically references (the 1.x-legacy
+        // shapely.wkb, not pulled in by 2.x's __init__) simply isn't in the
+        // bundle — probing it reported "shapely is not installed" inside a
+        // frozen app whose own code was using shapely fine. from_wkb is the
+        // 2.x top-level API (wkb.loads is a thin wrapper over it); shapely
+        // 1.x has no from_wkb and is deliberately NOT supported — it counts
+        // as "shapely absent".
+        PyObject* top = PyImport_ImportModule("shapely");
+        if (top) {
+            shapely_loads = PyObject_GetAttrString(top, "from_wkb");
+            if (!shapely_loads) PyErr_Clear();
             has_shapely = (shapely_loads != nullptr);
-            if (!has_shapely) PyErr_Clear();
-            Py_DECREF(sh);
-            PyObject* top = PyImport_ImportModule("shapely");
-            if (top) {
-                shapely_get_srid = PyObject_GetAttrString(top, "get_srid");
-                if (!shapely_get_srid) PyErr_Clear();  // pre-2.0 shapely — no SRID to carry
-                Py_DECREF(top);
-            } else PyErr_Clear();
+            shapely_get_srid = PyObject_GetAttrString(top, "get_srid");
+            if (!shapely_get_srid) PyErr_Clear();
+            Py_DECREF(top);
         } else PyErr_Clear();
         PyObject* ga = PyImport_ImportModule("geoalchemy2");
         if (ga) {
@@ -304,7 +310,8 @@ static PyObject* reconstruct_wkb(PyObject* wkb) {
         want_shapely = (strcmp(pref, "shapely") == 0);
         if (want_shapely && !has_shapely) {
             PyErr_SetString(PyExc_ImportError,
-                "reconstruct WKB: geo backend set to 'shapely' but shapely is not installed");
+                "reconstruct WKB: geo backend set to 'shapely' but shapely.from_wkb is not importable "
+                "(needs shapely 2.x)");
             return nullptr;
         }
         if (!want_shapely && !has_geoalchemy) {

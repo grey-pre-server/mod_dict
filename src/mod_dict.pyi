@@ -2019,7 +2019,12 @@ def set_geo_backend(name: Literal["shapely", "geoalchemy2", "wkb_bytes"] | None)
     A serialized geometry only ever remembers that it *is* WKB geometry data.
     What it comes back as is this setting's job:
 
-    - ``"shapely"`` — a shapely geometry object.
+    - ``"shapely"`` — a shapely geometry object (shapely **2.x** — resolved
+      via the top-level ``shapely.from_wkb``; shapely 1.x has no such API
+      and counts as "shapely absent"). Top-level-only resolution is
+      deliberate: it is the same import user code makes, so frozen builds
+      (Nuitka/PyInstaller) that bundle shapely at all work without extra
+      ``--include-module`` flags.
     - ``"geoalchemy2"`` — a ``geoalchemy2.WKBElement``.
 
     **SRID survives.** Both libraries keep the SRID *outside* the WKB bytes
