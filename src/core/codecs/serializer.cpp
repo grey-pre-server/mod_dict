@@ -844,7 +844,11 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
             return;
         }
 
-        if (strcmp(mname, "pathlib") == 0) {
+        // "pathlib" exactly OR any "pathlib." submodule: Python 3.13 moved
+        // the classes into pathlib._local and their __module__ says so
+        // (3.14 reports plain "pathlib" again) — an exact match silently
+        // stopped recognizing every pathlib object on 3.13.
+        if (strcmp(mname, "pathlib") == 0 || strncmp(mname, "pathlib.", 8) == 0) {
             PyObject* tname = PyObject_GetAttrString((PyObject*)Py_TYPE(obj), "__name__");
             const char* n = tname ? PyUnicode_AsUTF8(tname) : nullptr;
             TypeId tid = TypeId::PATH;

@@ -103,7 +103,9 @@ static ValueType detect_type(PyObject* obj) {
             else if (strcmp(n, "time")     == 0) vt = ValueType::TIME;
         }
         Py_XDECREF(tname);
-    } else if (strcmp(mname, "pathlib") == 0) {
+    } else if (strcmp(mname, "pathlib") == 0 || strncmp(mname, "pathlib.", 8) == 0) {
+        // 3.13 reports pathlib._local as the classes' __module__ — see the
+        // matching check in serializer.cpp.
         PyObject* tname = PyObject_GetAttrString((PyObject*)Py_TYPE(obj), "__name__");
         const char* n = tname ? PyUnicode_AsUTF8(tname) : nullptr;
         if (n) {
