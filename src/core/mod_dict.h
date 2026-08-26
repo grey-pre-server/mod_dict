@@ -135,36 +135,49 @@ public:
     std::vector<PyObject*> sort_field_py;
     std::vector<PyObject*> group_field_py;
     FlatHashMap<uint64_t, char> filter_membership;  // set of currently-passing key hashes (value unused)
-    // The active filter condition — set_filter(path).<op>(value). Non-null
-    // filter_predicate means "a filter is active" (every `if (filter_predicate)`
-    // check keys off it) and holds the OPERAND: the comparison value for
-    // eq/lt/..., the casefolded needle for text_search, the callable for
-    // predicate(). filter_op says how to apply it, filter_path (already
-    // split, as PyUnicode segments for PyDict_GetItem) says to WHAT — the
-    // whole row when the path is the single "?" segment (filter_path empty),
-    // else the field the path reaches. One evaluation routine,
-    // filter_row_passes(), serves bootstrap and incremental maintenance alike.
-    PyObject* filter_predicate = nullptr;        // operand (see above), or nullptr = inactive
-    FilterOp  filter_op = FilterOp::EQ;
-    std::vector<PyObject*> filter_path_py;      // owned PyUnicode segments; empty = "?" (row itself)
-    PyObject* filter_operand2 = nullptr;        // BETWEEN's `hi` (filter_predicate is `lo`); nullptr otherwise
-    // IN only: content hash -> that operand element (borrowed from the
-    // operand tuple filter_predicate holds), built once at set_filter() —
-    // membership is then one hash + one lookup per row instead of an
-    // equality test against every element (which made in_() slower than a
-    // Python `x in {…}` predicate as soon as the list grew past a few values).
-    FlatHashMap<uint64_t, PyObject*> filter_in_set;
-    // True when the row (or the field value at filter_path) passes the
-    // active condition. Leaves PyErr set (predicate() raised, or a
-    // comparison failed hard) and returns false in that case — callers that
-    // already check PyErr_Occurred() after the membership routines keep
+    // One installed filter condition — set_filter(path).<op>(value). A cursor
+    // holds a STACK of these (filter_conds), ONE per distinct path, composed
+    // with AND: installing on an already-filtered path REPLACES that path's
+    // condition, a new path ADDS one; clear_filter(path) removes one,
+    // clear_filter() / set_filter(None) remove all. `operand` is the
+    // comparison value for eq/lt/..., the casefolded needle for text_search,
+    // the tuple snapshot for in_, the callable for predicate(); `op` says how
+    // to apply it; `path_py` (already split, as PyUnicode segments for
+    // PyDict_GetItem) says to WHAT — the whole row when the path is the lone
+    // "?" (empty vector), else the field the path reaches. `path_key` is the
+    // canonical dotted form ("?" for the row itself) — the identity that
+    // replace/clear match on. One evaluation routine, filter_row_passes(),
+    // serves bootstrap and incremental maintenance alike.
+    struct FilterCond {
+        FilterOp op = FilterOp::EQ;
+        PyObject* operand = nullptr;             // owned
+        PyObject* operand2 = nullptr;            // owned; BETWEEN's `hi` (operand is `lo`)
+        std::vector<PyObject*> path_py;          // owned PyUnicode segments; empty = "?" (row itself)
+        std::string path_key;                    // dotted path; "?" = the row itself
+        // IN only: content hash -> that operand element (borrowed from the
+        // operand tuple `operand` holds), built once at install — membership
+        // is then one hash + one lookup per row instead of an equality test
+        // against every element.
+        FlatHashMap<uint64_t, PyObject*> in_set;
+        void free_members();                     // DECREFs operand/operand2/path_py (in_set only borrows)
+    };
+    // Active conditions, ANDed; empty = unfiltered. Insertion order is kept
+    // (it's what filters() reports); evaluation runs non-predicate conditions
+    // first (pure C++), predicate() ones last, short-circuiting on the first
+    // miss — see filter_row_passes().
+    std::vector<FilterCond> filter_conds;
+    bool filter_active() const { return !filter_conds.empty(); }
+    // True when the row passes EVERY active condition (AND, short-circuit;
+    // non-predicate conditions first). Leaves PyErr set (predicate() raised,
+    // or a comparison failed hard) and returns false in that case — callers
+    // that already check PyErr_Occurred() after the membership routines keep
     // working unchanged.
     bool filter_row_passes(PyObject* row) const;
     // Owned/INCREF'd keys — the filtered subsequence of sort_index (same
-    // order), populated/maintained ONLY while filter_predicate is set;
-    // empty and unused otherwise. Lets len()/iter()/.at() work against a
-    // ready-made O(1)-indexable sequence instead of recomputing which rows
-    // pass on every read.
+    // order), populated/maintained ONLY while filter_active(); empty and
+    // unused otherwise. Lets len()/iter()/.at() work against a ready-made
+    // O(1)-indexable sequence instead of recomputing which rows pass on
+    // every read.
     std::vector<PyObject*> visible_index;
     PyObject* live_connect_listeners = nullptr;  // dict of event_type -> list[callback]
 
@@ -186,14 +199,25 @@ public:
     // the sort (the same reset form as set_group({}) / set_filter(null)):
     // group order if grouping is active, else natural insertion order.
     IndexDiff set_sort(const std::vector<std::string>& field, bool reverse);
-    // Installs the condition (path already split into segments; empty =
-    // "?" = the row itself), bootstraps membership, returns the diff. A null
-    // `operand` with op==EQ and empty path clears the filter (set_filter(None)).
-    // If bootstrapping raises (a predicate() that throws), the exception
-    // propagates and the cursor is left UNFILTERED — never half-installed.
+    // Installs ONE condition (path already split into segments; empty = "?"
+    // = the row itself) into filter_conds — replacing the condition already
+    // on that same path, adding otherwise (AND) — rebuilds membership, and
+    // returns the diff. A null `operand` clears ALL conditions
+    // (set_filter(None) / clear_filter()). If bootstrapping raises (a
+    // predicate() that throws), the exception propagates and filter_conds is
+    // left exactly as it was BEFORE the call — never half-installed.
     IndexDiff set_filter(const std::vector<std::string>& path, FilterOp op,
                          PyObject* operand, PyObject* operand2 = nullptr);
-    void clear_filter_condition();  // drops the stored operands/path (not membership)
+    // Removes the one condition on `path` (empty = "?") and returns the
+    // diff; no condition on that path — a no-op with an empty diff.
+    IndexDiff clear_filter(const std::vector<std::string>& path);
+    void clear_filter_condition();  // drops ALL stored conditions (not membership)
+    // Rebuilds membership+visible for the current filter_conds; false (PyErr
+    // set) if a predicate raised mid-rebuild.
+    bool refresh_filter_state();
+    // set_filter()'s failure path: swap `restored` back into path_key's slot,
+    // freeing the failed replacement it displaces.
+    void filter_conds_replace_back(const std::string& path_key, FilterCond&& restored);
     IndexDiff set_group(const std::vector<std::string>& group_by_field);  // empty clears
 
     // Rebuilds sort_index from cached_anchor_dict using group_field (primary)
@@ -277,16 +301,16 @@ public:
     // insert() at 50k rows (bench_cursor_vs_root.py, 2026-08-17).
     Py_ssize_t find_sort_index_position(PyObject* key, const SortKeyValues* old_vals = nullptr) const;
 
-    // Rebuilds filter_membership from filter_predicate; leaves PyErr set and
-    // returns early if the predicate raises.
+    // Rebuilds filter_membership from filter_conds; leaves PyErr set and
+    // returns early if a predicate raises.
     void rebuild_filter_membership();
 
-    // Evaluates filter_predicate against `row` and updates filter_membership
+    // Evaluates filter_conds against `row` and updates filter_membership
     // for `key_hash` accordingly (insert if passing, erase if not) — the
     // single-row incremental counterpart to rebuild_filter_membership(),
     // used by insert()/update_row()/delete() so a single mutation doesn't
-    // re-run the predicate against every row. Requires filter_predicate to
-    // be non-null. Returns false (PyErr set) if the predicate raises.
+    // re-run the conditions against every row. Requires filter_active().
+    // Returns false (PyErr set) if a predicate raises.
     bool update_filter_membership_one(uint64_t key_hash, PyObject* row);
 
     // Rebuilds visible_index from raw_order() filtered down
@@ -294,7 +318,7 @@ public:
     // is called for a full reconfigure (set_filter/resync/rebind), and
     // wherever rebuild_sort_index() runs while a filter is active (the
     // *order* changed even though membership didn't). No-op (leaves
-    // visible_index empty) when filter_predicate is null.
+    // visible_index empty) when no filter is active.
     void rebuild_visible_index();
 
     // visible_index counterparts to bisect_insert_sort_index()/

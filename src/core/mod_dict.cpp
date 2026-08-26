@@ -1484,7 +1484,7 @@ PyObject* ModDict::resolve_cursor_dict() {
         // in sync — detected here via identity mismatch instead.
         cached_anchor_dict = cur;
         if (has_derived_order) rebuild_sort_index();
-        if (filter_predicate) {
+        if (filter_active()) {
             rebuild_filter_membership();
             if (PyErr_Occurred()) return nullptr;
             rebuild_visible_index();
@@ -1556,7 +1556,7 @@ std::vector<PyObject*> ModDict::raw_order(PyObject* d) const {
 
 std::vector<uint64_t> ModDict::presentation_snapshot(PyObject* d) const {
     std::vector<uint64_t> out;
-    if (filter_predicate) {
+    if (filter_active()) {
         out.reserve(visible_index.size());
         for (PyObject* k : visible_index) out.push_back(content_hash_pyobj(k));
     } else if (has_derived_order) {
@@ -1803,42 +1803,44 @@ Py_ssize_t ModDict::find_sort_index_position(PyObject* key, const SortKeyValues*
     return locate_key(this, sort_index, key, old_vals);
 }
 
-void ModDict::clear_filter_condition() {
-    filter_in_set = FlatHashMap<uint64_t, PyObject*>();  // before dropping the tuple its entries borrow from
-    Py_CLEAR(filter_predicate);
-    Py_CLEAR(filter_operand2);
-    for (PyObject* p : filter_path_py) Py_XDECREF(p);
-    filter_path_py.clear();
-    filter_op = FilterOp::EQ;
+void ModDict::FilterCond::free_members() {
+    in_set = FlatHashMap<uint64_t, PyObject*>();  // before dropping the tuple its entries borrow from
+    Py_CLEAR(operand);
+    Py_CLEAR(operand2);
+    for (PyObject* p : path_py) Py_XDECREF(p);
+    path_py.clear();
 }
 
-// The ONE place a cursor filter condition is evaluated — bootstrap
-// (rebuild_filter_membership) and incremental (update_filter_membership_one)
-// both come here, so every operator behaves identically on both paths.
-bool ModDict::filter_row_passes(PyObject* row) const {
+void ModDict::clear_filter_condition() {
+    for (FilterCond& c : filter_conds) c.free_members();
+    filter_conds.clear();
+}
+
+// Evaluates ONE installed condition against a row.
+static bool filter_cond_passes(const ModDict::FilterCond& c, PyObject* row) {
     // Subject: the row itself for "?" (empty path), else the field the path
     // reaches; a row lacking the field simply doesn't pass (same as root
     // filter(), where a missing field never matches).
     PyObject* subject = row;
-    if (!filter_path_py.empty()) {
-        subject = read_field_path(row, filter_path_py);
+    if (!c.path_py.empty()) {
+        subject = read_field_path(row, c.path_py);
         if (!subject) return false;
     }
-    switch (filter_op) {
+    switch (c.op) {
         case FilterOp::PREDICATE: {
-            PyObject* res = PyObject_CallOneArg(filter_predicate, subject);
+            PyObject* res = PyObject_CallOneArg(c.operand, subject);
             if (!res) return false;  // PyErr set
             int t = PyObject_IsTrue(res);
             Py_DECREF(res);
             return t == 1;  // t<0 leaves PyErr set, reported as "doesn't pass"
         }
         case FilterOp::IN: {
-            // One content hash + one lookup in filter_in_set (built at
-            // set_filter()), then a real equality check against the element
+            // One content hash + one lookup in the condition's in_set (built
+            // at install), then a real equality check against the element
             // found — the same test ModValue::equals() applies for eq()
             // (equal content hash first, then value equality), so `in_`
             // matches exactly what a series of eq() calls would.
-            PyObject* const* item = filter_in_set.find(content_hash_pyobj(subject));
+            PyObject* const* item = c.in_set.find(content_hash_pyobj(subject));
             if (!item) return false;
             int r = PyObject_RichCompareBool(subject, *item, Py_EQ);
             if (r < 0) { PyErr_Clear(); return false; }
@@ -1847,24 +1849,42 @@ bool ModDict::filter_row_passes(PyObject* row) const {
         case FilterOp::BETWEEN: {
             ModValue sv = ModValue::from_pyobject(subject);
             bool ok = true;
-            int lo = sv.compare(ModValue::from_pyobject(filter_predicate), &ok);
+            int lo = sv.compare(ModValue::from_pyobject(c.operand), &ok);
             if (!ok || lo < 0) return false;
-            int hi = sv.compare(ModValue::from_pyobject(filter_operand2), &ok);
+            int hi = sv.compare(ModValue::from_pyobject(c.operand2), &ok);
             return ok && hi <= 0;
         }
         default: {
             // eq/ne/lt/le/gt/ge/text_* — the same compare_values() root
             // filter() uses; text ops expect the operand pre-casefolded.
-            ModValue sv = is_text_op(filter_op) ? ModValue::from_pyobject_for_compare(subject)
-                                                : ModValue::from_pyobject(subject);
-            return compare_values(sv, filter_op, ModValue::from_pyobject(filter_predicate));
+            ModValue sv = is_text_op(c.op) ? ModValue::from_pyobject_for_compare(subject)
+                                           : ModValue::from_pyobject(subject);
+            return compare_values(sv, c.op, ModValue::from_pyobject(c.operand));
         }
     }
 }
 
+// The ONE place the filter stack is evaluated — bootstrap
+// (rebuild_filter_membership) and incremental (update_filter_membership_one)
+// both come here, so every operator behaves identically on both paths.
+// AND with short-circuit, in two passes: all non-predicate conditions first
+// (pure C++ — cheap), predicate() ones last — a row already excluded by an
+// operator condition never re-enters Python at all.
+bool ModDict::filter_row_passes(PyObject* row) const {
+    for (const FilterCond& c : filter_conds) {
+        if (c.op == FilterOp::PREDICATE) continue;
+        if (!filter_cond_passes(c, row)) return false;
+    }
+    for (const FilterCond& c : filter_conds) {
+        if (c.op != FilterOp::PREDICATE) continue;
+        if (!filter_cond_passes(c, row)) return false;  // may leave PyErr set
+    }
+    return true;
+}
+
 void ModDict::rebuild_filter_membership() {
     filter_membership = FlatHashMap<uint64_t, char>();
-    if (!filter_predicate || !cached_anchor_dict) return;
+    if (!filter_active() || !cached_anchor_dict) return;
     filter_membership.reserve((size_t)PyDict_Size(cached_anchor_dict));
     PyObject *k, *v; Py_ssize_t pos = 0;
     while (PyDict_Next(cached_anchor_dict, &pos, &k, &v)) {
@@ -1885,7 +1905,7 @@ bool ModDict::update_filter_membership_one(uint64_t key_hash, PyObject* row) {
 void ModDict::rebuild_visible_index() {
     for (PyObject* k : visible_index) Py_XDECREF(k);
     visible_index.clear();
-    if (!filter_predicate || !cached_anchor_dict) return;
+    if (!filter_active() || !cached_anchor_dict) return;
     visible_index.reserve(filter_membership.size());
     for (PyObject* k : raw_order(cached_anchor_dict)) {
         if (filter_membership.find(content_hash_pyobj(k))) {
@@ -2001,7 +2021,7 @@ ModDict::IndexDiff ModDict::set_sort(const std::vector<std::string>& field, bool
     sort_reverse = reverse;
     replace_field_py_segments(sort_field_py, sort_field);
     rebuild_sort_index();
-    if (filter_predicate) rebuild_visible_index();  // order changed even though membership didn't
+    if (filter_active()) rebuild_visible_index();  // order changed even though membership didn't
 
     return diff_snapshots(before, presentation_snapshot(d));
 }
@@ -2014,9 +2034,27 @@ ModDict::IndexDiff ModDict::set_group(const std::vector<std::string>& group_by_f
     group_field = group_by_field;
     replace_field_py_segments(group_field_py, group_field);
     rebuild_sort_index();
-    if (filter_predicate) rebuild_visible_index();  // order changed even though membership didn't
+    if (filter_active()) rebuild_visible_index();  // order changed even though membership didn't
 
     return diff_snapshots(before, presentation_snapshot(d));
+}
+
+// Canonical identity of a condition's path: dotted; "?" for the row itself.
+static std::string filter_path_key(const std::vector<std::string>& path) {
+    if (path.empty()) return "?";
+    std::string key = path[0];
+    for (size_t i = 1; i < path.size(); i++) { key += '.'; key += path[i]; }
+    return key;
+}
+
+// Rebuilds membership+visible for the CURRENT filter_conds and reports
+// whether that worked (false = PyErr set by a predicate).
+bool ModDict::refresh_filter_state() {
+    filter_membership = FlatHashMap<uint64_t, char>();
+    rebuild_filter_membership();
+    if (PyErr_Occurred()) return false;
+    rebuild_visible_index();
+    return true;
 }
 
 ModDict::IndexDiff ModDict::set_filter(const std::vector<std::string>& path, FilterOp op,
@@ -2030,43 +2068,106 @@ ModDict::IndexDiff ModDict::set_filter(const std::vector<std::string>& path, Fil
     if (!has_derived_order) rebuild_sort_index();
     std::vector<uint64_t> before = presentation_snapshot(d);
 
-    clear_filter_condition();
-    filter_membership = FlatHashMap<uint64_t, char>();
-    if (operand) {
-        Py_INCREF(operand);
-        filter_predicate = operand;
-        Py_XINCREF(operand2);
-        filter_operand2 = operand2;
-        filter_op = op;
-        replace_field_py_segments(filter_path_py, path);  // empty path = "?" = the row itself
-        if (op == FilterOp::IN) {
-            // Index the operand once (it is the tuple snapshot in_() made,
-            // so element pointers stay valid as long as filter_predicate
-            // does). Duplicate values collapse onto one entry.
-            Py_ssize_t n = PySequence_Size(operand);
-            if (n < 0) { clear_filter_condition(); rebuild_visible_index(); return {}; }  // PyErr set
-            filter_in_set.reserve((size_t)n);
-            for (Py_ssize_t i = 0; i < n; i++) {
-                PyObject* item = PySequence_GetItem(operand, i);
-                if (!item) { clear_filter_condition(); rebuild_visible_index(); return {}; }
-                filter_in_set.insert(content_hash_pyobj(item), item);  // borrowed: the tuple owns it
-                Py_DECREF(item);
-            }
-        }
-        rebuild_filter_membership();
-        if (PyErr_Occurred()) {
-            // Bootstrap raised (predicate() threw): leave the cursor
-            // UNFILTERED rather than half-installed — membership would be
-            // partial and every read inconsistent otherwise.
-            clear_filter_condition();
-            filter_membership = FlatHashMap<uint64_t, char>();
-            rebuild_visible_index();
-            return {};
+    if (!operand) {
+        // set_filter(None) / clear_filter(): drop every condition.
+        clear_filter_condition();
+        filter_membership = FlatHashMap<uint64_t, char>();
+        rebuild_visible_index();
+        return diff_snapshots(before, presentation_snapshot(d));
+    }
+
+    // Build the new condition fully BEFORE touching the stack, so any
+    // failure here leaves filter_conds exactly as it was.
+    FilterCond cond;
+    cond.op = op;
+    Py_INCREF(operand);
+    cond.operand = operand;
+    Py_XINCREF(operand2);
+    cond.operand2 = operand2;
+    cond.path_key = filter_path_key(path);
+    replace_field_py_segments(cond.path_py, path);  // empty path = "?" = the row itself
+    if (op == FilterOp::IN) {
+        // Index the operand once (it is the tuple snapshot in_() made, so
+        // element pointers stay valid as long as cond.operand does).
+        // Duplicate values collapse onto one entry.
+        Py_ssize_t n = PySequence_Size(operand);
+        if (n < 0) { cond.free_members(); return {}; }  // PyErr set
+        cond.in_set.reserve((size_t)n);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject* item = PySequence_GetItem(operand, i);
+            if (!item) { cond.free_members(); return {}; }
+            cond.in_set.insert(content_hash_pyobj(item), item);  // borrowed: the tuple owns it
+            Py_DECREF(item);
         }
     }
-    rebuild_visible_index();  // clears/stays empty when filter_predicate is null
+
+    // Same path -> replace that one condition; new path -> append (AND).
+    // The displaced condition is kept aside until the rebuild succeeds.
+    // (path_key is read from `key`, not from `cond` — `cond` is moved-from
+    // right below.)
+    std::string key = cond.path_key;
+    FilterCond displaced;
+    bool replaced = false;
+    for (FilterCond& c : filter_conds) {
+        if (c.path_key == key) {
+            displaced = std::move(c);
+            c = std::move(cond);
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) filter_conds.push_back(std::move(cond));
+
+    if (!refresh_filter_state()) {
+        // Bootstrap raised (a predicate() threw): put the stack back exactly
+        // as it was before the call — never half-installed. The exception
+        // stays set; the restore rebuild runs under it and is best-effort
+        // (the previous conditions already evaluated cleanly once).
+        PyObject *etype, *eval, *etb;
+        PyErr_Fetch(&etype, &eval, &etb);
+        if (replaced) {
+            filter_conds_replace_back(key, std::move(displaced));
+        } else {
+            filter_conds.back().free_members();
+            filter_conds.pop_back();
+        }
+        (void)refresh_filter_state();
+        PyErr_Restore(etype, eval, etb);
+        return {};
+    }
+    if (replaced) displaced.free_members();
 
     return diff_snapshots(before, presentation_snapshot(d));
+}
+
+// Puts `restored` back into the slot currently holding path_key's condition
+// (the failed replacement), freeing the failed one.
+void ModDict::filter_conds_replace_back(const std::string& path_key, FilterCond&& restored) {
+    for (FilterCond& c : filter_conds) {
+        if (c.path_key == path_key) {
+            c.free_members();
+            c = std::move(restored);
+            return;
+        }
+    }
+}
+
+ModDict::IndexDiff ModDict::clear_filter(const std::vector<std::string>& path) {
+    PyObject* d = resolve_cursor_dict();
+    if (!d) return {};
+    if (!has_derived_order) rebuild_sort_index();
+    std::vector<uint64_t> before = presentation_snapshot(d);
+
+    std::string key = filter_path_key(path);
+    for (size_t i = 0; i < filter_conds.size(); i++) {
+        if (filter_conds[i].path_key == key) {
+            filter_conds[i].free_members();
+            filter_conds.erase(filter_conds.begin() + (long)i);
+            if (!refresh_filter_state()) return {};  // PyErr set (remaining predicate raised)
+            return diff_snapshots(before, presentation_snapshot(d));
+        }
+    }
+    return {};  // no condition on that path — nothing changed
 }
 
 ModDict::IndexDiff ModDict::resync_and_diff() {
@@ -2079,7 +2180,7 @@ ModDict::IndexDiff ModDict::resync_and_diff() {
     std::vector<uint64_t> before = presentation_snapshot(cached_anchor_dict);
 
     if (has_derived_order) rebuild_sort_index();
-    if (filter_predicate) {
+    if (filter_active()) {
         rebuild_filter_membership();
         if (PyErr_Occurred()) return {};
         rebuild_visible_index();
@@ -2162,7 +2263,7 @@ ModDict::IndexDiff ModDict::sibling_apply_hint(const CursorMutationHint& hint, b
     uint64_t h = content_hash_pyobj(hint.key);
     // The vector presentation positions refer to — read AFTER the index
     // maintenance below, so it reflects post-mutation positions.
-    const std::vector<PyObject*>& pres = filter_predicate ? visible_index : sort_index;
+    const std::vector<PyObject*>& pres = filter_active() ? visible_index : sort_index;
 
     // The row's values as THIS cursor sorts them, taken from the pre-mutation
     // snapshot the originator passed along — lets both lookups below bisect
@@ -2172,11 +2273,11 @@ ModDict::IndexDiff ModDict::sibling_apply_hint(const CursorMutationHint& hint, b
 
     if (hint.kind == CursorMutationHint::Kind::Remove) {
         Py_ssize_t raw_pos = find_sort_index_position(hint.key, ov);
-        bool was_visible = !filter_predicate || filter_membership.find(h);
-        Py_ssize_t vis_pos = (filter_predicate && was_visible) ? find_visible_index_position(hint.key, ov) : -1;
-        Py_ssize_t old_pos = filter_predicate ? vis_pos : raw_pos;  // presentation position, -1 if hidden
+        bool was_visible = !filter_active() || filter_membership.find(h);
+        Py_ssize_t vis_pos = (filter_active() && was_visible) ? find_visible_index_position(hint.key, ov) : -1;
+        Py_ssize_t old_pos = filter_active() ? vis_pos : raw_pos;  // presentation position, -1 if hidden
         if (raw_pos >= 0) erase_from_sort_index(raw_pos);
-        if (filter_predicate) {
+        if (filter_active()) {
             filter_membership.erase(h);
             if (vis_pos >= 0) erase_from_visible_index(vis_pos);
         }
@@ -2194,14 +2295,14 @@ ModDict::IndexDiff ModDict::sibling_apply_hint(const CursorMutationHint& hint, b
     bool existed = (hint.kind == CursorMutationHint::Kind::Update) || hint.key_existed;
     // A brand-new key's old position is trivially -1, no lookup needed.
     Py_ssize_t raw_old = existed ? find_sort_index_position(hint.key, ov) : -1;
-    bool was_visible = filter_predicate ? (existed && filter_membership.find(h) != nullptr)
+    bool was_visible = filter_active() ? (existed && filter_membership.find(h) != nullptr)
                                         : (raw_old >= 0);
-    Py_ssize_t vis_old = (filter_predicate && was_visible) ? find_visible_index_position(hint.key, ov) : -1;
-    Py_ssize_t old_pos = filter_predicate ? vis_old : raw_old;  // presentation position, -1 if it wasn't visible
+    Py_ssize_t vis_old = (filter_active() && was_visible) ? find_visible_index_position(hint.key, ov) : -1;
+    Py_ssize_t old_pos = filter_active() ? vis_old : raw_old;  // presentation position, -1 if it wasn't visible
 
     Py_ssize_t raw_new = reposition_in_sort_index(hint.key, raw_old);
     Py_ssize_t new_pos = raw_new;
-    if (filter_predicate) {
+    if (filter_active()) {
         if (!update_filter_membership_one(h, row)) return diff;  // PyErr set — caller handles
         if (filter_membership.find(h)) {
             // Raw slot unchanged and it was visible: its visible slot is
@@ -2253,7 +2354,7 @@ void ModDict::notify_live_cursors(uint64_t changed_top_hash, ModDict* originator
                     // that never set_sort/set_filter/set_group'd, never
                     // mutated, and has no "reorder" listener (connect()
                     // bootstraps the snapshot) reads the dict directly.
-                    if (!cur->has_derived_order && !cur->filter_predicate) { i++; continue; }
+                    if (!cur->has_derived_order && !cur->filter_active()) { i++; continue; }
                     bool want_diff = cur->has_listener("reorder");
                     IndexDiff diff;
                     if (hint && hint->dict == cur->cached_anchor_dict
@@ -2305,7 +2406,7 @@ Py_ssize_t ModDict::cursor_insert(PyObject* key, PyObject* row) {
     SortKeyValues old_vals = key_exists ? capture_sort_key_values(PyDict_GetItem(d, key)) : SortKeyValues();
     Py_ssize_t old_pos = key_exists ? find_sort_index_position(key, &old_vals) : -1;
     uint64_t h = content_hash_pyobj(key);
-    bool was_visible = filter_predicate && key_exists && filter_membership.find(h);
+    bool was_visible = filter_active() && key_exists && filter_membership.find(h);
     Py_ssize_t vis_old_pos = was_visible ? find_visible_index_position(key, &old_vals) : -1;
 
     // On overwrite, hold the OLD row across the notify so siblings can bisect
@@ -2328,7 +2429,7 @@ Py_ssize_t ModDict::cursor_insert(PyObject* key, PyObject* row) {
     Py_ssize_t raw_new = reposition_in_sort_index(key, old_pos);
     Py_ssize_t new_pos = raw_new;
 
-    if (filter_predicate) {
+    if (filter_active()) {
         if (!update_filter_membership_one(h, row)) return -1;
         bool now_visible = filter_membership.find(h) != nullptr;
         if (now_visible) {
@@ -2359,11 +2460,11 @@ std::pair<Py_ssize_t,Py_ssize_t> ModDict::cursor_update_row(PyObject* key, PyObj
     SortKeyValues old_vals = capture_sort_key_values(row);
     Py_ssize_t raw_old_pos = find_sort_index_position(key, &old_vals);
     uint64_t h = content_hash_pyobj(key);
-    bool was_visible = !filter_predicate || filter_membership.find(h);
-    Py_ssize_t vis_old_pos = (filter_predicate && was_visible) ? find_visible_index_position(key, &old_vals) : -1;
+    bool was_visible = !filter_active() || filter_membership.find(h);
+    Py_ssize_t vis_old_pos = (filter_active() && was_visible) ? find_visible_index_position(key, &old_vals) : -1;
     // Reported positions must agree with what len()/.at() mean under an
     // active filter (visible_index), not sort_index's raw position.
-    Py_ssize_t old_pos = filter_predicate ? (was_visible ? vis_old_pos : -1) : raw_old_pos;
+    Py_ssize_t old_pos = filter_active() ? (was_visible ? vis_old_pos : -1) : raw_old_pos;
 
     // Shallow snapshot of the row BEFORE the in-place update — the only way
     // siblings can still see its old field values (and thus its old position).
@@ -2379,7 +2480,7 @@ std::pair<Py_ssize_t,Py_ssize_t> ModDict::cursor_update_row(PyObject* key, PyObj
     // no need for a full rebuild_sort_index() (O(n log n)) of everyone.
     Py_ssize_t raw_new = reposition_in_sort_index(key, raw_old_pos);
     Py_ssize_t new_pos = raw_new;
-    if (filter_predicate) {
+    if (filter_active()) {
         if (!update_filter_membership_one(h, row)) return {old_pos, -1};
         bool now_visible = filter_membership.find(h) != nullptr;
         if (now_visible) {
@@ -2404,11 +2505,11 @@ Py_ssize_t ModDict::cursor_delete(PyObject* key) {
     SortKeyValues old_vals = capture_sort_key_values(row);
     Py_ssize_t raw_pos = find_sort_index_position(key, &old_vals);
     uint64_t h = content_hash_pyobj(key);
-    bool was_visible = !filter_predicate || filter_membership.find(h);
-    Py_ssize_t vis_pos = (filter_predicate && was_visible) ? find_visible_index_position(key, &old_vals) : -1;
+    bool was_visible = !filter_active() || filter_membership.find(h);
+    Py_ssize_t vis_pos = (filter_active() && was_visible) ? find_visible_index_position(key, &old_vals) : -1;
     // Same reasoning as cursor_update_row(): report the visible_index
     // position, not sort_index's raw one, when a filter is active.
-    Py_ssize_t old_pos = filter_predicate ? (was_visible ? vis_pos : -1) : raw_pos;
+    Py_ssize_t old_pos = filter_active() ? (was_visible ? vis_pos : -1) : raw_pos;
 
     Py_INCREF(row);  // keep the removed row alive across the sibling notify
     if (PyDict_DelItem(d, key) != 0) { Py_DECREF(row); return -1; }
@@ -2420,7 +2521,7 @@ Py_ssize_t ModDict::cursor_delete(PyObject* key) {
     // O(shift) erase is enough, no need to re-sort everyone via a full
     // rebuild_sort_index().
     if (raw_pos >= 0) erase_from_sort_index(raw_pos);
-    if (filter_predicate) {
+    if (filter_active()) {
         filter_membership.erase(h);
         if (vis_pos >= 0) erase_from_visible_index(vis_pos);
     }
@@ -2436,7 +2537,7 @@ std::vector<Py_ssize_t> ModDict::cursor_insert_batch(PyObject* rows) {
     true_root()->reindex_row_no_validate(cached_top_hash, this);
 
     if (has_derived_order) rebuild_sort_index();
-    if (filter_predicate) {
+    if (filter_active()) {
         rebuild_filter_membership();
         if (PyErr_Occurred()) return positions;
         rebuild_visible_index();
@@ -2448,7 +2549,7 @@ std::vector<Py_ssize_t> ModDict::cursor_insert_batch(PyObject* rows) {
     // visible_index (not sort_index) when a filter is active, so reported
     // positions agree with what len()/.at() mean under that filter.
     FlatHashMap<uint64_t, Py_ssize_t> pos_by_hash;
-    if (filter_predicate) {
+    if (filter_active()) {
         for (size_t i = 0; i < visible_index.size(); i++)
             pos_by_hash.insert(content_hash_pyobj(visible_index[i]), (Py_ssize_t)i);
     } else if (has_derived_order) {
@@ -2459,7 +2560,7 @@ std::vector<Py_ssize_t> ModDict::cursor_insert_batch(PyObject* rows) {
     PyObject *k, *v; Py_ssize_t pos = 0;
     while (PyDict_Next(rows, &pos, &k, &v)) {
         uint64_t h = content_hash_pyobj(k);
-        if (filter_predicate && !filter_membership.find(h)) { positions.push_back(-1); continue; }
+        if (filter_active() && !filter_membership.find(h)) { positions.push_back(-1); continue; }
         const Py_ssize_t* p = pos_by_hash.find(h);
         positions.push_back(p ? *p : -1);
     }

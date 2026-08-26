@@ -174,6 +174,8 @@ orders = mn.cursor("u1.orders")                          # anchor должен �
 orders.set_sort("amount") / orders.set_group("status")   # каждый -> list[(old_index, new_index)] сдвинувшихся строк, он же летит событием "reorder"
 orders.set_filter("status").eq("shipped")   # те же операторы, что у filter(): eq/ne/lt/lte/gt/gte/between/in_/text_search — считаются в C++ на строку
 orders.set_filter("?").predicate(lambda r: r["amount"] > 100 and r["status"] == "shipped")  # "?" = вся строка; predicate() — для того, что оператором не выразить
+orders.set_filter("amount").gte(100)     # условия СКЛАДЫВАЮТСЯ, одно на путь (AND); тот же путь — заменяет своё условие
+orders.clear_filter("amount")            # снять условие одного пути; clear_filter() — все; filters() перечисляет активные
 orders.set_sort(None) / orders.set_group(None) / orders.set_filter(None)   # единая форма сброса у всех трёх — назад к тому, что задают остальные два
 orders.insert(key, row)          # -> (int | None, dict) = (новая позиция, row)
 orders.delete(key)               # -> int | None (прежняя позиция)
@@ -516,7 +518,11 @@ mn["u1"]["orders"]["o10"] = {"amount": 7, "status": "new"}
 `set_sort`/`set_filter`/`set_group` курсора — те держат постоянное состояние
 представления.
 
-`set_filter()` полностью учитывается в чтениях: при активном фильтре
+Условия `set_filter()` складываются — одно на путь, по AND: новый путь
+добавляет условие, тот же путь заменяет своё, `clear_filter(path)` снимает
+одно (`clear_filter()`/`set_filter(None)` — все), `filters()` перечисляет
+активные — ровно форма поколоночных фильтров GUI. Составной фильтр
+полностью учитывается в чтениях: при активном фильтре
 `len()`/итерация/`.at(i)` видят только проходящие строки, плотно
 проиндексированные (`.at(0)` — первая *видимая* строка, не обязательно
 первая строка под anchor'ом) — и позиции, возвращаемые

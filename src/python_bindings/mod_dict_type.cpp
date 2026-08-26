@@ -398,7 +398,7 @@ static Py_ssize_t ModDict_len(ModDictObject* s){
     if (s->internal->root) {
         PyObject* d = s->internal->resolve_cursor_dict();
         if (!d) return -1;
-        if (s->internal->filter_predicate) return (Py_ssize_t)s->internal->visible_index.size();
+        if (s->internal->filter_active()) return (Py_ssize_t)s->internal->visible_index.size();
         return PyDict_Size(d);
     }
     return (Py_ssize_t)s->internal->len();
@@ -1174,7 +1174,7 @@ static PyObject* ModDict_iter(ModDictObject* s){
 // name itself says whether sort/filter is being honored — no method that
 // looks dict-like silently means something else depending on context.
 static PyObject* cursor_view_key_list(const ModDictObject* s, PyObject* d) {
-    if (s->internal->filter_predicate) {
+    if (s->internal->filter_active()) {
         auto& order = s->internal->visible_index;
         PyObject* list = PyList_New((Py_ssize_t)order.size());
         if (!list) return nullptr;
@@ -1433,6 +1433,66 @@ static PyObject* ModDict_set_filter(ModDictObject* s, PyObject* args) {
     if (!fb) return nullptr;
     ((FilterBuilderObject*)fb)->cursor_mode = true;
     return fb;
+}
+
+// clear_filter(path) removes ONE condition — the one installed on exactly
+// that path; clear_filter() / clear_filter(None) removes them all (the same
+// full reset as set_filter(None)). Returns the diff and fires it as
+// "reorder", like every other presentation change.
+static PyObject* ModDict_clear_filter(ModDictObject* s, PyObject* args) {
+    MOD_DICT_REQUIRE_CURSOR(s, "clear_filter()");
+    PyObject* fo = Py_None;
+    if (!PyArg_ParseTuple(args, "|O", &fo)) return nullptr;
+    ModDict::IndexDiff diff;
+    if (fo == Py_None) {
+        diff = s->internal->set_filter({}, FilterOp::EQ, nullptr, nullptr);
+    } else {
+        std::vector<std::string> path;
+        bool whole_row = false;
+        if (PyUnicode_Check(fo)) {
+            const char* raw = PyUnicode_AsUTF8(fo);
+            if (raw && strcmp(raw, "?") == 0) whole_row = true;  // the "?" condition: empty path
+        }
+        if (!whole_row && !parse_row_path(fo, "clear_filter", path)) return nullptr;
+        diff = s->internal->clear_filter(path);
+    }
+    if (PyErr_Occurred()) return nullptr;
+    return return_and_fire_reorder(s, diff);
+}
+
+static const char* filter_op_name(FilterOp op) {
+    switch (op) {
+        case FilterOp::EQ: return "eq";   case FilterOp::NE: return "ne";
+        case FilterOp::LT: return "lt";   case FilterOp::LE: return "lte";
+        case FilterOp::GT: return "gt";   case FilterOp::GE: return "gte";
+        case FilterOp::TEXT_CONTAINS:   return "contains";
+        case FilterOp::TEXT_STARTSWITH: return "startswith";
+        case FilterOp::TEXT_ENDSWITH:   return "endswith";
+        case FilterOp::IN: return "in_"; case FilterOp::BETWEEN: return "between";
+        case FilterOp::PREDICATE: return "predicate";
+    }
+    return "?";
+}
+// filters() -> [(path, op, value), ...] in installation order — what a GUI
+// needs to render its active-filter chips. `value` is the operand AS
+// INSTALLED: between -> (lo, hi), in_ -> the tuple snapshot, text_search ->
+// the casefolded needle, predicate -> the callable. Path "?" = the row.
+static PyObject* ModDict_filters(ModDictObject* s, PyObject*) {
+    MOD_DICT_REQUIRE_CURSOR(s, "filters()");
+    auto& conds = s->internal->filter_conds;
+    PyObject* out = PyList_New((Py_ssize_t)conds.size());
+    if (!out) return nullptr;
+    for (size_t i = 0; i < conds.size(); i++) {
+        auto& c = conds[i];
+        PyObject* val;
+        if (c.op == FilterOp::BETWEEN) val = PyTuple_Pack(2, c.operand, c.operand2);
+        else { Py_INCREF(c.operand); val = c.operand; }
+        if (!val) { Py_DECREF(out); return nullptr; }
+        PyObject* tup = Py_BuildValue("(ssN)", c.path_key.c_str(), filter_op_name(c.op), val);
+        if (!tup) { Py_DECREF(out); return nullptr; }
+        PyList_SET_ITEM(out, (Py_ssize_t)i, tup);
+    }
+    return out;
 }
 
 /* Cursor observability: connect() + point-mutation API */
@@ -2403,7 +2463,7 @@ static PyObject* ModDict_at(ModDictObject* s, PyObject* args){
     if (s->internal->root) {
         PyObject* d = s->internal->resolve_cursor_dict();
         if (!d) return nullptr;
-        if (s->internal->filter_predicate) {
+        if (s->internal->filter_active()) {
             auto& order = s->internal->visible_index;
             Py_ssize_t n = (Py_ssize_t)order.size();
             Py_ssize_t idx = i; if (idx < 0) idx += n;
@@ -2520,7 +2580,9 @@ static PyMethodDef ModDict_methods[]={
     {"cursor",(PyCFunction)ModDict_cursor,METH_VARARGS,"cursor(path)->ModDict — live handle anchored at an existing nested table; path must already exist"},
     {"set_sort",(PyCFunction)(PyCFunctionWithKeywords)ModDict_set_sort,METH_VARARGS|METH_KEYWORDS,"set_sort(path_or_None,reverse=False)->list[(old_index|None,new_index|None)] — cursor only; None clears; only rows that moved; also fired as 'reorder'"},
     {"set_group",(PyCFunction)ModDict_set_group,METH_VARARGS,"set_group(path_or_None)->list[(old_index|None,new_index|None)] — cursor only; None clears; only rows that moved; also fired as 'reorder'"},
-    {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(path)->FilterBuilder; then .eq/.ne/.lt/.lte/.gt/.gte/.between/.in_/.text_search/.predicate(...) -> list[(old_index|None,new_index|None)] installs the condition; path '?' = the row itself; set_filter(None) clears; cursor only"},
+    {"set_filter",(PyCFunction)ModDict_set_filter,METH_VARARGS,"set_filter(path)->FilterBuilder; then .eq/.ne/.lt/.lte/.gt/.gte/.between/.in_/.text_search/.predicate(...) -> list[(old_index|None,new_index|None)] installs ONE condition per path (same path replaces, new path ANDs); path '?' = the row itself; set_filter(None) clears all; cursor only"},
+    {"clear_filter",(PyCFunction)ModDict_clear_filter,METH_VARARGS,"clear_filter(path=None)->list[(old_index|None,new_index|None)] — removes that path's condition (None/no arg = all); also fired as 'reorder'; cursor only"},
+    {"filters",(PyCFunction)ModDict_filters,METH_NOARGS,"filters()->list[(path,op,value)] — the active set_filter conditions in installation order; cursor only"},
     {"connect",(PyCFunction)ModDict_connect,METH_VARARGS,"connect(event_type,callback)->None — cursor only; events: insert/update/delete/reorder"},
     {"disconnect",(PyCFunction)ModDict_disconnect,METH_VARARGS,"disconnect(event_type=None,callback=None)->int — (event,cb): drop that callback; (event): drop the event's listeners; (): drop everything; returns how many were removed (0 = nothing matched); cursor only"},
     {"insert",(PyCFunction)ModDict_cursor_insert,METH_VARARGS,"insert(key,row)->(int|None,dict) — (new_index, row); cursor only"},

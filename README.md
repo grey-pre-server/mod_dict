@@ -175,6 +175,8 @@ orders = mn.cursor("u1.orders")                          # anchor must already e
 orders.set_sort("amount") / orders.set_group("status")   # each -> list[(old_index, new_index)] of what moved, also fired as "reorder"
 orders.set_filter("status").eq("shipped")   # same operators as filter(): eq/ne/lt/lte/gt/gte/between/in_/text_search — evaluated in C++ per row
 orders.set_filter("?").predicate(lambda r: r["amount"] > 100 and r["status"] == "shipped")  # "?" = the whole row; predicate() for what no operator expresses
+orders.set_filter("amount").gte(100)     # conditions STACK, one per path (AND); the same path replaces its condition
+orders.clear_filter("amount")            # drop one path's condition; clear_filter() drops all; filters() lists them
 orders.set_sort(None) / orders.set_group(None) / orders.set_filter(None)   # one reset form for all three — back to what the others still impose
 orders.insert(key, row)          # -> (int | None, dict) = (new_index, row)
 orders.delete(key)               # -> int | None (old_index)
@@ -511,7 +513,11 @@ storage, which a cursor never populates — call them on the root. Those are
 one-shot queries that return data, and don't overlap with a cursor's
 `set_sort`/`set_filter`/`set_group`, which are persistent presentation state.
 
-`set_filter()` is fully composed into reads: with an active filter,
+`set_filter()` conditions stack — one per path, ANDed: a new path adds a
+condition, the same path replaces its own, `clear_filter(path)` removes one
+(`clear_filter()`/`set_filter(None)` — all), `filters()` lists what's active
+— exactly the shape of a GUI's per-column filters. The composed filter is
+fully wired into reads: with an active filter,
 `len()`/iteration/`.at(i)` only see the passing rows, densely indexed
 (`.at(0)` is the first *visible* row, not necessarily the first row under
 the anchor) — and `insert()`/`update_row()`/`delete()`'s returned

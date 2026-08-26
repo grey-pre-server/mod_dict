@@ -1369,31 +1369,43 @@ class ModDict:
     def set_filter(self, path: None) -> list[tuple[int | None, int | None]]: ...
     def set_filter(self, path):
         """
-        Choose the row-visibility condition of a cursor — same builder, same
-        operators as root ``filter()``:
+        Install one row-visibility condition of a cursor — same builder, same
+        operators as root ``filter()``. Conditions **stack, one per path**:
+        a second ``set_filter`` on a *different* path ADDs a condition (the
+        cursor shows rows passing ALL of them — AND), on the *same* path it
+        REPLACES that path's condition. ``clear_filter(path)`` removes one;
+        ``clear_filter()`` / ``set_filter(None)`` remove all:
 
             cursor.set_filter("status").eq("shipped")
-            cursor.set_filter("amount").between(10, 100)
-            cursor.set_filter("name").text_search("ali")
+            cursor.set_filter("amount").between(10, 100)   # AND — different path
+            cursor.set_filter("amount").gte(50)            # replaces the amount condition
             cursor.set_filter("meta.tags").in_(["vip", "gold"])
             cursor.set_filter("?").predicate(lambda row: row["a"] > 1 and row["b"])
-            cursor.set_filter(None)          # clear — every row visible again (same reset form as set_sort(None)/set_group(None))
+            cursor.clear_filter("amount")    # drop one condition, others stay
+            cursor.set_filter(None)          # clear ALL — every row visible again (same reset form as set_sort(None)/set_group(None))
 
         ``set_filter(path)`` returns a ``FilterBuilder``; the operator you
         call on it (``eq``/``ne``/``lt``/``lte``/``gt``/``gte``/``between``/
         ``in_``/``text_search``/``predicate``) **installs** the condition on
         the cursor and returns the visibility diff (below). Membership is
         maintained incrementally from then on: each insert/update evaluates
-        the condition on that one row only, in C++ — no Python call per row
-        for anything but ``predicate()``.
+        the conditions on that one row only, in C++, cheapest first —
+        ``predicate()`` conditions run last and only for rows every operator
+        condition already passed.
+
+        One condition per path is the whole model — a range on one field is
+        ``between``, a value set is ``in_``, anything else multi-clause on
+        the same field is a ``predicate()``. This keeps ``clear_filter(path)``
+        unambiguous, which is what a GUI's per-column filter needs.
 
         *path* is a path **into each row** of the anchored table (a field
         name or dotted path such as ``"meta.city"``); the condition applies
         to the value it reaches, and a row lacking the field is hidden.
         ``"?"`` means the row itself — that's what ``predicate()`` wants when
-        it needs several fields at once. Wildcard ``?`` segments elsewhere and
-        ``->`` hops are rejected: a cursor filter runs on one table's rows,
-        never across tables (use root ``filter()`` for that).
+        it needs several fields at once (the ``"?"`` condition stacks with
+        field conditions like any other path). Wildcard ``?`` segments
+        elsewhere and ``->`` hops are rejected: a cursor filter runs on one
+        table's rows, never across tables (use root ``filter()`` for that).
 
         ``predicate(fn)`` (cursor-only) is for conditions no operator
         expresses — ``fn`` receives the field value (or the whole row for
@@ -1421,12 +1433,54 @@ class ModDict:
             event, like ``set_sort()``.
 
         If a ``predicate()`` raises while the condition is being installed,
-        the exception propagates and the cursor is left **unfiltered** (never
-        half-installed).
+        the exception propagates and the filter stack is left **exactly as it
+        was before the call** (never half-installed).
 
         Only valid on a cursor — raises ``NotImplementedError`` on the root
         ``ModDict``. Passing a callable directly (the pre-0.8.22 form) raises
         ``TypeError`` pointing at ``set_filter("?").predicate(fn)``.
+        """
+        ...
+
+    def clear_filter(self, path: str | tuple | list | None = None) -> list[tuple[int | None, int | None]]:
+        """
+        Remove the filter condition installed on *path* — the per-column
+        "clear" half of ``set_filter(path)``; other paths' conditions stay.
+        With no argument (or ``None``) removes **all** conditions — identical
+        to ``set_filter(None)``. ``"?"`` removes the whole-row condition.
+
+        Returns the same presentation diff as ``set_filter``'s operators and
+        fires it as this cursor's ``"reorder"`` event. Clearing a path that
+        has no condition is a no-op: empty diff, no error.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
+
+        Example::
+
+            orders.set_filter("status").eq("shipped")
+            orders.set_filter("amount").gte(100)
+            orders.clear_filter("status")   # only the amount condition remains
+            orders.clear_filter()           # unfiltered
+        """
+        ...
+
+    def filters(self) -> list[tuple[str, str, Any]]:
+        """
+        The active ``set_filter`` conditions, in installation order — what a
+        GUI needs to render its filter chips / column indicators.
+
+        Each entry is ``(path, op, value)``: *path* as a dotted string
+        (``"?"`` = the row itself); *op* is the operator name (``"eq"``,
+        ``"ne"``, ``"lt"``, ``"lte"``, ``"gt"``, ``"gte"``, ``"between"``,
+        ``"in_"``, ``"contains"``/``"startswith"``/``"endswith"`` for
+        ``text_search`` modes, ``"predicate"``); *value* is the operand **as
+        installed** — ``between`` → ``(lo, hi)``, ``in_`` → the snapshot
+        tuple, ``text_search`` → the casefolded needle, ``predicate`` → the
+        callable.
+
+        Only valid on a cursor — raises ``NotImplementedError`` on the root
+        ``ModDict``.
         """
         ...
 
@@ -1457,8 +1511,8 @@ class ModDict:
           the same ``int | None`` former-position it returns.
         - ``"reorder"`` — fired on a cursor whenever its presentation
           changed by anything **other than its own point-mutation
-          methods**: its own ``set_sort()``/``set_group()``/``set_filter()``
-          (payload: the same diff they return), a *different* cursor on
+          methods**: its own ``set_sort()``/``set_group()``/``set_filter()``/
+          ``clear_filter()`` (payload: the same diff they return), a *different* cursor on
           the same anchor mutating the data, a root-side write through
           ``mn[key][...]`` (see ``cursor()``), a root bulk operation, or a
           raw ``cursor[key] = row`` / ``del cursor[key]``. The listener
