@@ -133,6 +133,7 @@ mn.filter("city").in_({"NY", "LA"})              # city среди значен�
 mn.filter("orders.?.status").eq("shipped")       # ? пропускает один уровень ключей
 mn.filter("?").eq("orders")                      # терминальный ?: строки с ключом "orders"
 mn.filter("g1.?.status").eq("shipped")           # anchor: сканирование ограничено ключом "g1"
+mn.filter("g1.r7.status").eq("shipped")          # таргет: только строка "r7" в "g1" (int-ключ — десятичной записью: "nums 42 v") — так же в select()/select_mass()/"->"
 mn.filter("region.?.?.status").eq("Active")      # один ? на уровень — для вложенности глубже цепочкой
 
 # нетерминальный wildcard возвращает PRUNED-результат: остаются только

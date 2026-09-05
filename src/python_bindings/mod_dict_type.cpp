@@ -7,6 +7,8 @@
 #include <vector>
 #include <cstring>
 #include <cstddef>
+#include <cstdlib>
+#include <cerrno>
 #ifdef _WIN32
 #  define portable_strdup _strdup
 #else
@@ -568,8 +570,10 @@ static bool parse_link_pattern(const std::string& raw, std::vector<std::string>&
         }
         std::vector<std::string> segs=split_dot_chunk(chunks[i]);
         if(i==0){
-            if(segs.size()!=3 || segs[1]!="__pass_key__"){
-                PyErr_SetString(PyExc_ValueError,"filter: '->' left side must be a wildcard path like \"table.?.field\"");
+            // [table, selector, field] — selector "?" (every row) or a
+            // literal row key (targeted: that one row).
+            if(segs.size()!=3 || segs[1].empty()){
+                PyErr_SetString(PyExc_ValueError,"filter: '->' left side must be an anchored path like \"table.?.field\" (or \"table.key.field\" for one row)");
                 return false;
             }
         } else if(i+1<chunks.size()){
@@ -677,6 +681,31 @@ static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
         default: return false;
     }
 }
+// (dict_get_segment — str key, else decimal int key — lives in core
+// mod_dict.cpp, shared with select_anchored(); declared in mod_dict.h.)
+// Targeted anchor — the "table.?.field" grammar with the row selector filled
+// in: pat = [table, key, field...] where `table` is an existing top-level
+// dict entry of `owner` and `key` is a row in it (str, or an int spelled as
+// decimal). "?" selects every row, a literal selects that ONE row; the same
+// rule for filter() (every operator, every returns mode), "->" hops and
+// select()/select_mass(). Anchoring itself is decided the way the
+// rows_here scan always decided it: the first segment names a top-level
+// row. When the table or the row doesn't exist the path is NOT targeted —
+// it falls back to the plain nested-field reading. Outputs are borrowed.
+static bool targeted_anchor(ModDictObject* owner, const std::vector<std::string>& pat,
+                            const OuterEntry** table_out, PyObject** row_out) {
+    if (pat.size() < 3 || pat[0] == "__pass_key__" || pat[1] == "__pass_key__" || pat[1] == "__follow_link__") return false;
+    PyObject* tmp = PyUnicode_FromStringAndSize(pat[0].c_str(), (Py_ssize_t)pat[0].size());
+    if (!tmp) { PyErr_Clear(); return false; }
+    uint64_t h = content_hash_pyobj(tmp); Py_DECREF(tmp);
+    const OuterEntry* e = owner->internal->outer.find(h);
+    if (!e || !e->is_row || !e->val_py || !PyDict_Check(e->val_py)) return false;
+    PyObject* row = dict_get_segment(e->val_py, pat[1], nullptr);
+    if (!row || !PyDict_Check(row)) return false;
+    if (table_out) *table_out = e;
+    if (row_out) *row_out = row;
+    return true;
+}
 // `report_row` is null until the first "__follow_link__" jump, then pinned
 // to `cur`'s value from right before that jump (the SOURCE/anchor row, e.g.
 // the order — not wherever the "->" chain eventually lands) for the rest of
@@ -717,7 +746,7 @@ static void scan_here(ModDict* self, std::string current_table, PyObject* report
             }
         }
     } else {
-        PyObject* child = PyDict_GetItemString(cur,pat[depth].c_str());
+        PyObject* child = dict_get_segment(cur,pat[depth],nullptr);  // str key, else decimal int key
         if (!child) return;
         bool jump_next = (depth+1 < pat.size() && pat[depth+1]=="__follow_link__");
         if (last) {
@@ -938,6 +967,45 @@ static ModDict* filter_link_hop_via_root(ModDictObject* owner,
 static ModDict* filter_maybe_relay(ModDictObject* owner, const std::string& simple,
                                     const std::vector<std::string>& pattern, bool wc,
                                     FilterOp op, const ModValue& fv) {
+    if (wc) {
+        // Targeted path ("table.key.field...") in rows mode: evaluate the
+        // rest of the pattern on that ONE row — scan_here handles nested
+        // fields and "->" hops alike (resolved against the topmost ancestor,
+        // the only one holding declared links) — and answer in the same
+        // {table: {key: row}} shape a "table.?.field" filter returns, just
+        // never more than one row.
+        const OuterEntry* te = nullptr; PyObject* row = nullptr;
+        if (targeted_anchor(owner, pattern, &te, &row)) {
+            ModDictObject* root = owner;
+            while (root->parent_ref) root = (ModDictObject*)root->parent_ref;
+            PyObject* hits = PyList_New(0); if (!hits) return nullptr;
+            bool err = false;
+            scan_here(root->internal, pattern[0], nullptr, row, pattern, 2, op, fv, false, nullptr, hits, nullptr, &err);
+            if (err) { Py_DECREF(hits); return nullptr; }
+            bool matched = PyList_GET_SIZE(hits) > 0;
+            Py_DECREF(hits);
+            ModDict* result = new ModDict();
+            if (matched) {
+                PyObject* key = nullptr;
+                (void)dict_get_segment(te->val_py, pattern[1], &key);
+                PyObject* inner = PyDict_New();
+                if (!key || !inner || PyDict_SetItem(inner, key, row) != 0) {
+                    Py_XDECREF(key); Py_XDECREF(inner); delete result; return nullptr;
+                }
+                Py_DECREF(key);
+                uint64_t th = content_hash_pyobj(te->key_py);
+                Py_XINCREF(te->key_py);
+                result->outer.insert(th, {te->key_py, inner, true});
+                result->order.push_back(th);
+            }
+            return result;
+        }
+        // A literal selector whose table/row doesn't exist selects nothing —
+        // never hand a hop pattern with a literal selector to the wildcard
+        // machinery, which expects "?" there.
+        if (pattern.size() >= 3 && pattern[1] != "__pass_key__" && pattern_has_link_hop(pattern))
+            return new ModDict();
+    }
     if (wc && owner->parent_ref && pattern_has_link_hop(pattern))
         return filter_link_hop_via_root(owner, pattern, op, fv);
     return wc ? owner->internal->filter(pattern, op, fv) : owner->internal->filter(simple, op, fv);
@@ -1820,33 +1888,30 @@ static PyObject* ModDict_follow(ModDictObject* s,PyObject* args,PyObject* kw){
         return nullptr;
     }
 
-    std::vector<uint64_t> key_hashes;
-    if(keys_seq){
-        if(!PySequence_Check(keys_seq)){PyErr_SetString(PyExc_TypeError,"follow: keys must be a sequence");return nullptr;}
-        Py_ssize_t n=PySequence_Size(keys_seq);
+    // keys= / values= (mutually exclusive): both handed to the core as the
+    // key/value OBJECTS themselves (owned refs, released below) — keys are
+    // looked up directly in the source table, values resolved directly
+    // against the target; neither scans the source table.
+    auto collect=[](PyObject* seq,const char* what,std::vector<PyObject*>& out)->bool{
+        if(!PySequence_Check(seq)){PyErr_Format(PyExc_TypeError,"follow: %s must be a sequence",what);return false;}
+        Py_ssize_t n=PySequence_Size(seq);
+        out.reserve((size_t)n);
         for(Py_ssize_t i=0;i<n;i++){
-            PyObject* item=PySequence_GetItem(keys_seq,i); if(!item) return nullptr;
-            key_hashes.push_back(content_hash_pyobj(item));
-            Py_DECREF(item);
+            PyObject* item=PySequence_GetItem(seq,i);
+            if(!item){ for(PyObject* p:out) Py_DECREF(p); out.clear(); return false; }
+            out.push_back(item);
         }
-    }
-
-    std::vector<PyObject*> values_vec;  // owned refs, released below
-    if(values_seq){
-        if(!PySequence_Check(values_seq)){PyErr_SetString(PyExc_TypeError,"follow: values must be a sequence");return nullptr;}
-        Py_ssize_t n=PySequence_Size(values_seq);
-        values_vec.reserve((size_t)n);
-        for(Py_ssize_t i=0;i<n;i++){
-            PyObject* item=PySequence_GetItem(values_seq,i);
-            if(!item){ for(PyObject* p:values_vec) Py_DECREF(p); return nullptr; }
-            values_vec.push_back(item);
-        }
-    }
+        return true;
+    };
+    std::vector<PyObject*> keys_vec, values_vec;
+    if(keys_seq && !collect(keys_seq,"keys",keys_vec)) return nullptr;
+    if(values_seq && !collect(values_seq,"values",values_vec)){ for(PyObject* p:keys_vec) Py_DECREF(p); return nullptr; }
 
     ModDict* result=s->internal->follow(src_pat,
-        keys_seq?&key_hashes:nullptr,
+        keys_seq?&keys_vec:nullptr,
         values_seq?&values_vec:nullptr);
 
+    for(PyObject* p:keys_vec) Py_DECREF(p);
     for(PyObject* p:values_vec) Py_DECREF(p);
 
     if(!result) return nullptr;  // PyErr already set (no such link declared, or table missing)
@@ -2147,8 +2212,22 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
             PyErr_SetString(PyExc_ValueError, "select: anchor table not found");
             return nullptr;
         }
+        // Row selector: "?" takes every row, a literal (targeted path) only
+        // the row it names.
+        const std::string* selector = (groups[0].size() >= 2 && groups[0][1] != "__pass_key__") ? &groups[0][1] : nullptr;
         ModDict* last_result = new ModDict();
-        {
+        if (selector) {
+            // Targeted: one direct lookup (str key, else decimal int key) —
+            // never a scan of the anchor table.
+            PyObject* key = nullptr;
+            PyObject* v = dict_get_segment(anchor_entry->val_py, *selector, &key);  // key: new ref on hit
+            if (v) {
+                uint64_t kh = content_hash_pyobj(key);
+                Py_INCREF(v);
+                last_result->outer.insert(kh, {key, v, true});  // takes the new key ref
+                last_result->order.push_back(kh);
+            }
+        } else {
             PyObject *k, *v; Py_ssize_t pos = 0;
             while (PyDict_Next(anchor_entry->val_py, &pos, &k, &v)) {
                 uint64_t kh = content_hash_pyobj(k);
@@ -2159,9 +2238,8 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
         }
 
         if (n_hops > 0) {
-            std::vector<uint64_t> current_keys;
-            for (uint64_t oh : last_result->order) current_keys.push_back(oh);
             std::vector<std::string> src_pat = groups[0];
+            if (selector) src_pat[1] = "__pass_key__";  // links are declared as table.?.field; the row restriction is the row set itself
             for (size_t i = 0; i < n_hops; i++) {
                 if (i > 0) src_pat = {current_table, "__pass_key__", groups[i][0]};
                 const LinkDecl* ld = root->internal->find_link(src_pat);
@@ -2170,13 +2248,23 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
                     PyErr_SetString(PyExc_ValueError, "select: no link declared for this source_path - call mn.link() first");
                     return nullptr;
                 }
-                ModDict* hop_result = root->internal->follow(src_pat, &current_keys, nullptr);
+                // Resolve by the FK VALUES of the rows currently held
+                // (follow()'s value_filter mode): O(rows held). The old
+                // key_filter mode walked the whole source table testing each
+                // pk against the key list — a full scan for a targeted path
+                // and O(n²) for a wildcard landing.
+                std::vector<PyObject*> fk_values;
+                for (uint64_t oh : last_result->order) {
+                    const OuterEntry* e = last_result->outer.find(oh);
+                    if (!e || !e->val_py || !PyDict_Check(e->val_py)) continue;
+                    PyObject* v = PyDict_GetItemString(e->val_py, src_pat[2].c_str());  // borrowed; last_result keeps the row alive
+                    if (v) fk_values.push_back(v);
+                }
+                ModDict* hop_result = root->internal->follow(src_pat, nullptr, &fk_values);
                 if (!hop_result) { delete last_result; delete combined; return nullptr; }
                 delete last_result;
                 last_result = hop_result;
                 current_table = ld->references_pattern[0];
-                current_keys.clear();
-                for (uint64_t oh : last_result->order) current_keys.push_back(oh);
             }
         }
 
@@ -2252,7 +2340,10 @@ static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret){
     for(auto& f:paths){
         bool wc=(f.find("->")!=std::string::npos);
         if(!wc && (f.find('.')!=std::string::npos || f=="?")){
-            for(auto& seg:split_dot_chunk(f)) if(seg=="__pass_key__"){ wc=true; break; }
+            std::vector<std::string> segs=split_dot_chunk(f);
+            for(auto& seg:segs) if(seg=="__pass_key__"){ wc=true; break; }
+            // Targeted anchor ("table.key.field") is anchored too — one row.
+            if(!wc && targeted_anchor(s,segs,nullptr,nullptr)) wc=true;
         }
         any_wc=any_wc||wc; all_wc=all_wc&&wc;
     }
@@ -2281,8 +2372,11 @@ static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret){
             } else {
                 pat=split_dot_chunk(f);
             }
-            if(pat.size()<2 || pat[1]!="__pass_key__") MOD_DICT_RAISE(PyExc_ValueError,
-                "select: wildcard paths must be a table-anchored path like \"table.?.field\"");
+            // Anchored = [table, selector, ...]: selector "?" (every row) or a
+            // literal row key (targeted — one row; a missing row simply
+            // selects nothing downstream).
+            if(pat.size()<2 || pat[0]=="__pass_key__" || (pat[1]!="__pass_key__" && pat.size()<3)) MOD_DICT_RAISE(PyExc_ValueError,
+                "select: anchored paths must look like \"table.?.field\" (every row) or \"table.key.field\" (one row)");
             patterns.push_back(std::move(pat));
         }
         if(table_landing){
@@ -2362,7 +2456,9 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     for(char& c:path) if(c==' '||c=='\t') c='.';  // space alias — see select_core()
     bool wc=(path.find("->")!=std::string::npos);
     if(!wc && (path.find('.')!=std::string::npos || path=="?")){
-        for(auto& seg:split_dot_chunk(path)) if(seg=="__pass_key__"){ wc=true; break; }
+        std::vector<std::string> segs=split_dot_chunk(path);
+        for(auto& seg:segs) if(seg=="__pass_key__"){ wc=true; break; }
+        if(!wc && targeted_anchor(s,segs,nullptr,nullptr)) wc=true;  // "table.key.field" — same as select_core()
     }
     bool table_landing = wc && strcmp(ret,"rows")==0;
 

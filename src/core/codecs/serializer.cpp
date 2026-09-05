@@ -902,12 +902,26 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
             Py_DECREF(tp_mod);
             PyObject* wkb;
             long srid = -1;
+            // The WKB attribute is fetched and CHECKED before anything else
+            // touches the error state: the SRID lookups below clear their own
+            // failures with PyErr_Clear(), which used to wipe a pending
+            // AttributeError from a shapely-module object that isn't a
+            // geometry at all (STRtree, a GEOSException instance, ...) — the
+            // branch then returned with nothing written and no error, i.e. a
+            // silently truncated blob that loads() read back as None.
+            wkb = PyObject_GetAttrString(obj, is_shapely ? "wkb" : "data");
+            if (!wkb) {
+                if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                    PyErr_Clear();
+                    goto fallback_none;  // not a geometry: the standard "cannot serialize type X" TypeError
+                }
+                return;  // the attribute itself raised (broken geometry) — propagate that, fail loud
+            }
             if (is_shapely) {
                 // .wkb is PLAIN WKB — shapely 2.x keeps the SRID out of it
                 // (no .srid attribute either; only shapely.get_srid()), so
                 // it was silently dropped on every round-trip. Read it via
                 // get_srid and fold it into EWKB like the geoalchemy branch.
-                wkb = PyObject_GetAttrString(obj, "wkb");
                 // get_srid comes from the same once-resolved cache the read
                 // side uses — no per-value import/attribute lookup.
                 if (!s_geo_libs.resolved) s_geo_libs.resolve();
@@ -930,7 +944,7 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
                 // representation, so PyObject_Bytes(desc) raised TypeError,
                 // which was then swallowed and the geometry written as None.
                 // A geoalchemy2 geometry serialized to None, silently.
-                wkb = PyObject_GetAttrString(obj, "data");
+                // (`.data` itself was fetched — and checked — above.)
                 PyObject* s = PyObject_GetAttrString(obj, "srid");
                 if (s) {
                     PyObject* as_long = PyNumber_Long(s);  // tolerate numpy ints here too
@@ -940,8 +954,7 @@ static void serialize_pyobj(std::vector<uint8_t>& buf, PyObject* obj) {
                 }
                 else PyErr_Clear();
             }
-            if (!wkb) return;  // PyErr set — fail loud
-            write_wkb_value(buf, wkb, srid);
+            write_wkb_value(buf, wkb, srid);  // raises (PyErr set, nothing written) if not bytes-viewable
             Py_DECREF(wkb);
             return;
         }
@@ -1105,13 +1118,26 @@ static PyObject* build_rowset_finish(PyObject* acc, const char* backend) {
    Caller receives a ModValue with obj (refcount=1), type=NONE, hash=0.
    ============================================================================ */
 
+// Malformed input — a truncated record, a fixed-size payload that's too
+// short, a container count the remaining bytes can't possibly hold, an
+// unknown type tag: a ValueError, never a silent None and never a loop over
+// a garbage count. (A fuzzed blob whose dict count read as ~1e9 while 3
+// stray bytes remained used to spin the container loop a billion times —
+// the element read couldn't advance, the count never ran out.) Returns the
+// empty ModValue every caller already treats as "stop".
+static ModValue corrupt_input(const char* what) {
+    if (!PyErr_Occurred())
+        PyErr_Format(PyExc_ValueError, "mod_dict: corrupt or truncated data (%s)", what);
+    return ModValue();
+}
+
 ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*) {
-    if (ptr + 5 > end) return ModValue();
+    if (ptr + 5 > end) return corrupt_input("record header past end of buffer");
 
     TypeId   tid    = from_byte(*ptr++);
     uint32_t length = read_u32(ptr);
 
-    if (ptr + length > end) return ModValue();
+    if (ptr + length > end) return corrupt_input("record length past end of buffer");
     const uint8_t* data_end = ptr + length;
 
     PyObject* result = nullptr;
@@ -1122,15 +1148,18 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
             break;
 
         case TypeId::BOOL:
+            if (length < 1) return corrupt_input("bool payload");
             result = (*ptr != 0) ? Py_True : Py_False;
             Py_INCREF(result);
             break;
 
         case TypeId::INT:
+            if (length < 8) return corrupt_input("int payload");
             result = PyLong_FromLongLong(read_i64(ptr));
             break;
 
         case TypeId::FLOAT: {
+            if (length < 8) return corrupt_input("float payload");
             uint64_t bits = read_u64(ptr);
             double v; memcpy(&v, &bits, 8);
             result = PyFloat_FromDouble(v);
@@ -1147,6 +1176,7 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
             break;
 
         case TypeId::DATETIME: {
+            if (length < 8) return corrupt_input("datetime payload");
             int64_t us = read_i64(ptr);
             ensure_std_ctors();
             // epoch + timedelta(microseconds=us) — pure integer path, exact
@@ -1174,6 +1204,7 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         }
 
         case TypeId::TIMEDELTA: {
+            if (length < 8) return corrupt_input("timedelta payload");
             int64_t us = read_i64(ptr);
             ensure_std_ctors();
             result = s_std.timedelta_cls
@@ -1183,6 +1214,7 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         }
 
         case TypeId::DATE: {
+            if (length < 4) return corrupt_input("date payload");
             int32_t days = read_i32(ptr);
             ensure_std_ctors();
             PyObject* ord = PyLong_FromLong(days + 719163);
@@ -1193,6 +1225,7 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         }
 
         case TypeId::TIME: {
+            if (length < 8) return corrupt_input("time payload");
             uint64_t us_total = read_u64(ptr);
             int h  = (int)(us_total / 3600000000ULL); us_total %= 3600000000ULL;
             int m  = (int)(us_total /   60000000ULL); us_total %=   60000000ULL;
@@ -1262,18 +1295,25 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         case TypeId::LIST:
         case TypeId::SET:
         case TypeId::FROZENSET: {
-            if (length < 4) break;
+            if (length < 4) return corrupt_input("container header");
             uint32_t count = read_u32(ptr);
             const uint8_t* col_end = data_end;
+            // Every element is at least a 5-byte record: a count the payload
+            // can't hold is garbage, not a loop to attempt.
+            if (count > (uint32_t)((col_end - ptr) / 5)) return corrupt_input("impossible element count");
             result = (tid == TypeId::LIST) ? PyList_New(0) : PySet_New(nullptr);
-            if (!result) { PyErr_Clear(); break; }
-            for (uint32_t i = 0; i < count && ptr < col_end; i++) {
+            if (!result) return ModValue();  // MemoryError set
+            for (uint32_t i = 0; i < count; i++) {
                 ModValue mv = deserialize_value(ptr, col_end, nullptr);
-                PyObject* item = mv.obj ? mv.obj : Py_None;
-                if (tid == TypeId::LIST)
-                    PyList_Append(result, item);
-                else
-                    PySet_Add(result, item);
+                if (!mv.obj) { Py_DECREF(result); return ModValue(); }  // error set by the element
+                int rc = (tid == TypeId::LIST) ? PyList_Append(result, mv.obj) : PySet_Add(result, mv.obj);
+                if (rc != 0) {
+                    Py_DECREF(result);
+                    // An unhashable set element only arises from a corrupted
+                    // tag — same ValueError as every other kind of damage.
+                    if (PyErr_ExceptionMatches(PyExc_TypeError)) { PyErr_Clear(); return corrupt_input("unhashable set element"); }
+                    return ModValue();  // MemoryError etc. — leave as is
+                }
             }
             if (tid == TypeId::FROZENSET) {
                 PyObject* fs = PyFrozenSet_New(result);
@@ -1285,32 +1325,41 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         }
 
         case TypeId::TUPLE: {
-            if (length < 4) break;
+            if (length < 4) return corrupt_input("container header");
             uint32_t count = read_u32(ptr);
             const uint8_t* col_end = data_end;
+            if (count > (uint32_t)((col_end - ptr) / 5)) return corrupt_input("impossible element count");
             result = PyTuple_New((Py_ssize_t)count);
-            if (!result) { PyErr_Clear(); break; }
-            for (uint32_t i = 0; i < count && ptr < col_end; i++) {
+            if (!result) return ModValue();  // MemoryError set
+            for (uint32_t i = 0; i < count; i++) {
                 ModValue mv = deserialize_value(ptr, col_end, nullptr);
-                PyObject* item = mv.obj ? mv.obj : Py_None;
-                Py_INCREF(item);
-                PyTuple_SET_ITEM(result, i, item);
+                if (!mv.obj) { Py_DECREF(result); return ModValue(); }  // error set by the element
+                Py_INCREF(mv.obj);
+                PyTuple_SET_ITEM(result, i, mv.obj);
             }
             break;
         }
 
         case TypeId::MODDICT: {
-            if (length < 4) break;
+            if (length < 4) return corrupt_input("container header");
             uint32_t count = read_u32(ptr);
             const uint8_t* col_end = data_end;
+            if (count > (uint32_t)((col_end - ptr) / 10)) return corrupt_input("impossible entry count");  // key + value records
             result = PyDict_New();
-            if (!result) { PyErr_Clear(); break; }
-            for (uint32_t i = 0; i < count && ptr < col_end; i++) {
+            if (!result) return ModValue();  // MemoryError set
+            for (uint32_t i = 0; i < count; i++) {
                 ModValue mk = deserialize_value(ptr, col_end, nullptr);
+                if (!mk.obj) { Py_DECREF(result); return ModValue(); }
                 ModValue mv = deserialize_value(ptr, col_end, nullptr);
-                PyObject* k = mk.obj ? mk.obj : Py_None;
-                PyObject* v = mv.obj ? mv.obj : Py_None;
-                PyDict_SetItem(result, k, v);
+                if (!mv.obj) { Py_DECREF(result); return ModValue(); }
+                if (PyDict_SetItem(result, mk.obj, mv.obj) != 0) {
+                    // An unhashable key can only come from a corrupted tag —
+                    // report it as the same ValueError every other kind of
+                    // damage gets, not a TypeError about dict keys.
+                    Py_DECREF(result);
+                    if (PyErr_ExceptionMatches(PyExc_TypeError)) PyErr_Clear();
+                    return corrupt_input("unhashable dict key");
+                }
             }
             break;
         }
@@ -1319,29 +1368,34 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         case TypeId::ROWSET: {
             // Shared header: names, pk column indexes. Then ROW: one value
             // per column; ROWSET: nrows × values.
-            if (length < 8) break;
+            if (length < 8) return corrupt_input("row header");
             const uint8_t* col_end = data_end;
             uint32_t ncols = read_u32(ptr);
+            if (ncols > (uint32_t)((col_end - ptr) / 5)) return corrupt_input("impossible column count");
             PyObject* names = PyList_New((Py_ssize_t)ncols);
-            if (!names) { PyErr_Clear(); break; }
-            for (uint32_t i = 0; i < ncols && ptr < col_end; i++) {
+            if (!names) return ModValue();
+            for (uint32_t i = 0; i < ncols; i++) {
                 ModValue mn = deserialize_value(ptr, col_end, nullptr);
-                PyObject* n = mn.obj ? mn.obj : Py_None; Py_INCREF(n);
-                PyList_SET_ITEM(names, i, n);
+                if (!mn.obj) { Py_DECREF(names); return ModValue(); }
+                Py_INCREF(mn.obj);
+                PyList_SET_ITEM(names, i, mn.obj);
             }
+            if (ptr + 4 > col_end) { Py_DECREF(names); return corrupt_input("row pk header"); }
             uint32_t npk = read_u32(ptr);
+            if (npk > (uint32_t)((col_end - ptr) / 4)) { Py_DECREF(names); return corrupt_input("impossible pk count"); }
             std::vector<uint32_t> pk_idx;
-            for (uint32_t i = 0; i < npk && ptr + 4 <= col_end; i++) pk_idx.push_back(read_u32(ptr));
+            for (uint32_t i = 0; i < npk; i++) pk_idx.push_back(read_u32(ptr));
 
-            // Reads one row's values into a fresh list.
+            // Reads one row's values into a fresh list; nullptr (error set)
+            // on a malformed value.
             auto read_values = [&]() -> PyObject* {
                 PyObject* vals = PyList_New((Py_ssize_t)ncols);
                 if (!vals) return nullptr;
                 for (uint32_t i = 0; i < ncols; i++) {
-                    if (ptr >= col_end) { Py_INCREF(Py_None); PyList_SET_ITEM(vals, i, Py_None); continue; }
                     ModValue mv = deserialize_value(ptr, col_end, nullptr);
-                    PyObject* v = mv.obj ? mv.obj : Py_None; Py_INCREF(v);
-                    PyList_SET_ITEM(vals, i, v);
+                    if (!mv.obj) { Py_DECREF(vals); return nullptr; }
+                    Py_INCREF(mv.obj);
+                    PyList_SET_ITEM(vals, i, mv.obj);
                 }
                 return vals;
             };
@@ -1351,7 +1405,14 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
                 result = vals ? build_row(get_row_backend(), names, vals) : nullptr;
                 Py_XDECREF(vals);
             } else {
+                if (ptr + 4 > col_end) { Py_DECREF(names); return corrupt_input("rowset header"); }
                 uint32_t nrows = read_u32(ptr);
+                // Each row is ncols records of >= 5 bytes; a zero-column
+                // rowset can only be empty (its rows would consume nothing
+                // and the loop would never advance).
+                if (ncols == 0 ? nrows != 0 : nrows > (uint32_t)((col_end - ptr) / (5 * (size_t)ncols))) {
+                    Py_DECREF(names); return corrupt_input("impossible row count");
+                }
                 result = build_rowset_begin(get_rowset_backend(), pk_idx.empty() ? false : true);
                 for (uint32_t r = 0; result && r < nrows && ptr < col_end; r++) {
                     PyObject* vals = read_values();
@@ -1369,8 +1430,7 @@ ModValue deserialize_value(const uint8_t*& ptr, const uint8_t* end, ElasticPool*
         }
 
         default:
-            result = Py_None; Py_INCREF(result);
-            break;
+            return corrupt_input("unknown type tag");
     }
 
     ptr = data_end;

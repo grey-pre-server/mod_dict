@@ -62,6 +62,16 @@ class FilterBuilder:
 
         mn.filter("meta.score").gte(8.0)          # dot-notation
         mn.filter("orders.?.status").eq("shipped") # ? = any one key level
+        mn.filter("orders.o1.status").eq("shipped") # targeted: that ONE row of the anchored table
+
+    **Targeted anchor.** In an anchored path ``table.<selector>.field`` the
+    selector is ``?`` (every row of the table) or a literal row key (only
+    that row) — the same grammar everywhere a path is accepted: every
+    ``filter()`` operator in every ``returns`` mode, ``->`` hops,
+    ``select()``/``select_mass()``. A str key is written as is; an int key
+    as its decimal spelling (``"nums 42 v"`` → key ``42``). If the table or
+    the row doesn't exist the path is read as a plain nested-field path (and
+    matches nothing), never an error.
     """
 
     def eq(
@@ -699,11 +709,18 @@ class ModDict:
             # terminal ?: check if that key EXISTS at the inner level
             mn.filter("?").eq("r1")   # outer rows whose inner dict has key "r1"
 
-        Anchor path (first segment is a known outer key)::
+        Anchor path (first segment is a known outer key; the next segment is
+        the row selector — ``?`` for every row, a literal key for that ONE
+        row; an int key is spelled as decimal)::
 
             # only scan rows inside the "g1" outer key
             mn.filter("g1.?.user_id").eq(1)
             mn.filter("g1.?.user_id").eq(1, returns="rows_here")
+
+            # targeted: just row "r7" of "g1" — {"g1": {"r7": row}} if it matches, else {}
+            mn.filter("g1.r7.user_id").eq(1)
+            mn.filter("nums 42 v").gt(0)                  # int key 42
+            mn.filter("g1.r7.customer_id->name").eq("Ann")  # hops work from a targeted row too
 
         **Performance**
 
@@ -926,9 +943,10 @@ class ModDict:
 
         Args:
             source_path: the exact path passed to a prior ``link()`` call.
-            keys: restrict the scan to source rows whose own key is in this
-                sequence (default: scan every row of the source table).
-                Mutually exclusive with ``values``.
+            keys: resolve only the source rows with these keys — each looked
+                up directly in the source table, O(len(keys)), never a scan
+                of it; a key with no row is skipped (default: every row of
+                the source table). Mutually exclusive with ``values``.
             values: skip scanning the source table entirely and resolve
                 these values directly against the target — for values that
                 didn't come from a source-table scan (e.g. an external list
@@ -1003,7 +1021,9 @@ class ModDict:
 
         Args:
             path:    A single dot-notation field path (same path grammar as
-                     ``select_mass()`` — plain, wildcard, or ``->``-hop).
+                     ``select_mass()`` — plain, wildcard ``"table.?.field"``,
+                     targeted ``"table.key.field"`` (one row of the anchored
+                     table; int keys spelled as decimal), or ``->``-hop).
             returns: ``"rows"`` *(default)* — ``{key: value}`` for a plain
                      path. For a table-anchored wildcard path, same
                      table-landing behavior as ``select_mass()`` (returns a
@@ -1076,10 +1096,11 @@ class ModDict:
 
         **Wildcard fields and link hops ("->"), with ``returns="rows_here"``/``"values"``**
 
-        A field can also be a table-anchored wildcard path, ``"table.?..."``
-        — the first time ``select_mass()`` looks past a single flat collection —
-        optionally with a ``->`` hop across a declared ``link()``, same
-        syntax and semantics as ``filter()``'s. Every field must be
+        A field can also be a table-anchored path, ``"table.?..."`` (every
+        row) or targeted ``"table.key..."`` (that one row; an int key spelled
+        as decimal) — the first time ``select_mass()`` looks past a single
+        flat collection — optionally with a ``->`` hop across a declared
+        ``link()``, same syntax and semantics as ``filter()``'s. Every field must be
         wildcard-shaped if any is (mixing plain and wildcard fields in one
         call raises ``ValueError``), and all wildcard fields must share the
         same anchor table. The result is flat, keyed by each matched anchor
@@ -2006,6 +2027,11 @@ class ModDict:
         Args:
             data: Bytes produced by ``ModDict.serialize()``.
 
+        Raises ``ValueError`` on input that isn't a valid container blob:
+        wrong magic/version, truncated buffer, or any corrupt record inside
+        (see ``loads()`` for the record-level rules). Geometry-library
+        errors on invalid WKB propagate as they are.
+
         Example::
 
             mn2 = ModDict().deserialize(open("cache.bin", "rb").read())
@@ -2221,7 +2247,12 @@ def dumps(obj: Any) -> bytes:
     serialized.
 
     An unsupported type (no registered converter, not one of the above)
-    raises ``TypeError`` rather than silently losing data.
+    raises ``TypeError`` rather than silently losing data. That includes
+    objects that merely *come from* a geometry library but aren't
+    geometries — a shapely ``STRtree``, a ``GEOSException`` instance, a
+    geoalchemy2 object without ``.data``: they have no WKB to write, so
+    ``TypeError``, never a blob with the value silently missing. If a
+    geometry's own ``.wkb`` / ``.data`` raises, that exception propagates.
 
     Example::
 
@@ -2240,5 +2271,13 @@ def loads(data: bytes) -> Any:
 
     Returns a ``ModDict`` if the bytes were produced from one, otherwise
     the plain Python value that was serialized.
+
+    Raises ``ValueError`` on corrupt or truncated input — a record running
+    past the end of the buffer, a fixed-size payload that's too short, a
+    container count the bytes can't hold, an unknown type tag — never a
+    silent ``None`` and never a loop over a garbage count. Errors from a
+    geometry library while rebuilding a WKB value (e.g. shapely's
+    ``GEOSException`` on invalid WKB) propagate as they are; decoding stops
+    at the first failing value.
     """
     ...

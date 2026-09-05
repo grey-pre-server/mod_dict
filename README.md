@@ -133,6 +133,7 @@ mn.filter("city").in_({"NY", "LA"})              # city in any iterable of value
 mn.filter("orders.?.status").eq("shipped")       # ? skips one key, checks value
 mn.filter("?").eq("orders")                      # terminal ?: outer rows that HAVE key "orders"
 mn.filter("g1.?.status").eq("shipped")           # anchor: first segment scopes scan to key "g1"
+mn.filter("g1.r7.status").eq("shipped")          # targeted: only row "r7" of "g1" (int keys as decimal: "nums 42 v") — same in select()/select_mass()/"->"
 mn.filter("region.?.?.status").eq("Active")      # one ? per level — chain for deeper nesting
 
 # non-terminal wildcard results are PRUNED: only matching inner keys survive,

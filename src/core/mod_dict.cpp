@@ -6,6 +6,8 @@
 #include "codecs/codec_base.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <cerrno>
 #include <algorithm>
 #include <sstream>
 #include <unordered_map>
@@ -860,6 +862,44 @@ static PyObject* get_nested_via_links(const ModDict* self, PyObject* cur,
 // (which projects every outer entry of `this`), this scans ONE specific
 // anchor table's rows and projects each into a flat result keyed by that
 // row's own key — select()'s first-ever wildcard/anchor support.
+bool pk_matches_selector(PyObject* pk, const std::string& sel) {
+    if (!pk) return false;
+    if (PyUnicode_Check(pk)) {
+        Py_ssize_t len = 0;
+        const char* s = PyUnicode_AsUTF8AndSize(pk, &len);
+        if (!s) { PyErr_Clear(); return false; }
+        return (size_t)len == sel.size() && memcmp(s, sel.c_str(), (size_t)len) == 0;
+    }
+    if (PyLong_Check(pk) && !PyBool_Check(pk)) {
+        // Only a clean decimal spelling counts ("42", "-7"); anything else
+        // isn't an int selector at all.
+        if (sel.empty()) return false;
+        char* end = nullptr;
+        errno = 0;
+        long long v = strtoll(sel.c_str(), &end, 10);
+        if (errno != 0 || end == sel.c_str() || *end != '\0') return false;
+        int overflow = 0;
+        long long pv = PyLong_AsLongLongAndOverflow(pk, &overflow);
+        if (overflow != 0 || (pv == -1 && PyErr_Occurred())) { PyErr_Clear(); return false; }
+        return pv == v;
+    }
+    return false;
+}
+
+PyObject* dict_get_segment(PyObject* dict, const std::string& seg, PyObject** key_out) {
+    PyObject* v = PyDict_GetItemString(dict, seg.c_str());  // borrowed
+    if (v) { if (key_out) *key_out = PyUnicode_FromStringAndSize(seg.c_str(), (Py_ssize_t)seg.size()); return v; }
+    if (seg.empty()) return nullptr;
+    char* end = nullptr; errno = 0;
+    long long n = strtoll(seg.c_str(), &end, 10);
+    if (errno != 0 || end == seg.c_str() || *end != '\0') return nullptr;
+    PyObject* key = PyLong_FromLongLong(n);
+    if (!key) { PyErr_Clear(); return nullptr; }
+    v = PyDict_GetItem(dict, key);  // borrowed
+    if (v && key_out) *key_out = key; else Py_DECREF(key);
+    return v;
+}
+
 ModDict* ModDict::select_anchored(const std::vector<std::vector<std::string>>& patterns,
                                    const std::vector<std::string>& field_labels) const
 {
@@ -879,15 +919,41 @@ ModDict* ModDict::select_anchored(const std::vector<std::vector<std::string>>& p
     const OuterEntry* anchor_entry = resolve_table(this, anchor_table, anchor_hash);
     if (!anchor_entry || !PyDict_Check(anchor_entry->val_py)) return result;
 
-    PyObject *pk, *row; Py_ssize_t pos = 0;
-    while (PyDict_Next(anchor_entry->val_py, &pos, &pk, &row)) {
+    // Which rows to visit: every row if any pattern selects with "?";
+    // otherwise only the rows the literal selectors name, by DIRECT lookup
+    // — a targeted "table.key.field" select must stay O(1) in the table
+    // size (scanning 50k rows to read one cell is exactly what it exists
+    // to avoid). Keys in `visit` are owned (INCREF'd) for uniform handling.
+    struct Visit { PyObject* pk; PyObject* row; };
+    std::vector<Visit> visit;
+    bool any_wildcard = false;
+    for (auto& p : patterns) if (p.size() < 2 || p[1] == "__pass_key__") { any_wildcard = true; break; }
+    if (any_wildcard) {
+        PyObject *pk, *row; Py_ssize_t pos = 0;
+        while (PyDict_Next(anchor_entry->val_py, &pos, &pk, &row)) { Py_INCREF(pk); visit.push_back({pk, row}); }
+    } else {
+        for (auto& p : patterns) {
+            PyObject* key = nullptr;
+            PyObject* row = dict_get_segment(anchor_entry->val_py, p[1], &key);  // key: new ref on hit
+            if (!row) continue;
+            bool dup = false;
+            for (auto& v : visit) { int eq = PyObject_RichCompareBool(v.pk, key, Py_EQ); if (eq < 0) PyErr_Clear(); if (eq == 1) { dup = true; break; } }
+            if (dup) Py_DECREF(key); else visit.push_back({key, row});
+        }
+    }
+
+    for (auto& v : visit) {
+        PyObject* pk = v.pk; PyObject* row = v.row;
         if (!PyDict_Check(row)) continue;
         PyObject* new_row = PyDict_New();
-        if (!new_row) { delete result; return nullptr; }
+        if (!new_row) { for (auto& w : visit) Py_DECREF(w.pk); delete result; return nullptr; }
         bool has_any = false;
         for (size_t i = 0; i < patterns.size(); i++) {
+            // Row selector at [1]: "?" = every row; a literal = only that row
+            // (targeted path "table.key.field") — other rows skip this field.
+            if (patterns[i][1] != "__pass_key__" && !pk_matches_selector(pk, patterns[i][1])) continue;
             PyObject* fv = get_nested_via_links(this, row, patterns[i], 2, anchor_table);
-            if (PyErr_Occurred()) { Py_DECREF(new_row); delete result; return nullptr; }
+            if (PyErr_Occurred()) { Py_DECREF(new_row); for (auto& w : visit) Py_DECREF(w.pk); delete result; return nullptr; }
             if (fv) { PyDict_SetItemString(new_row, field_labels[i].c_str(), fv); has_any = true; }
         }
         if (has_any) {
@@ -899,6 +965,7 @@ ModDict* ModDict::select_anchored(const std::vector<std::vector<std::string>>& p
             Py_DECREF(new_row);
         }
     }
+    for (auto& w : visit) Py_DECREF(w.pk);
     return result;
 }
 
@@ -2658,7 +2725,7 @@ PyObject* ModDict::resolve_hop(std::string& current_table, const std::string& fi
 }
 
 ModDict* ModDict::follow(const std::vector<std::string>& source_pattern,
-                          const std::vector<uint64_t>* key_filter,
+                          const std::vector<PyObject*>* key_filter,
                           const std::vector<PyObject*>* value_filter) const
 {
     const LinkDecl* ld = find_link(source_pattern);
@@ -2721,13 +2788,24 @@ ModDict* ModDict::follow(const std::vector<std::string>& source_pattern,
         return nullptr;
     }
 
+    if (key_filter) {
+        // Named source rows: direct lookups, O(k) — a key with no row (or a
+        // non-dict value) simply contributes nothing.
+        for (PyObject* key : *key_filter) {
+            // GetItemWithError, not GetItem: the latter "suppresses" an
+            // unhashable key by routing it to sys.unraisablehook — a
+            // traceback on stderr with no exception. We clear it ourselves.
+            PyObject* row = PyDict_GetItemWithError(source_anchor->val_py, key);  // borrowed
+            if (!row) { if (PyErr_Occurred()) PyErr_Clear(); continue; }  // missing or unhashable key -> skip, not an error
+            if (!PyDict_Check(row)) continue;
+            resolve_value(PyDict_GetItemString(row, source_pattern[2].c_str()));
+        }
+        return result;
+    }
+
     PyObject *pk, *row; Py_ssize_t pos = 0;
     while (PyDict_Next(source_anchor->val_py, &pos, &pk, &row)) {
         if (!PyDict_Check(row)) continue;
-        if (key_filter) {
-            uint64_t kh = content_hash_pyobj(pk);
-            if (std::find(key_filter->begin(), key_filter->end(), kh) == key_filter->end()) continue;
-        }
         resolve_value(PyDict_GetItemString(row, source_pattern[2].c_str()));
     }
     return result;
@@ -3012,15 +3090,19 @@ void ModDict::deserialize(const uint8_t* data, size_t len) {
         return;
     }
 
-    constexpr uint32_t MAX_ENTRIES = 100'000'000u;
-#define CHECK_LIMIT(n, lim, msg) if ((n) > (lim)) { \
-    PyErr_SetString(PyExc_ValueError, "ModDict.deserialize: " msg); return; }
-
     order.clear();
     if (!check(4)) goto truncated;
     {
         uint32_t n_outer = read_u32(ptr);
-        CHECK_LIMIT(n_outer, MAX_ENTRIES, "too many entries");
+        // Every entry is at least 9 header bytes + a 5-byte key record + a
+        // 5-byte value record: a count the remaining bytes can't hold is
+        // corrupt. Bounding by the buffer (not a fixed 1e8 cap) also stops
+        // the reserve() below from trying to allocate gigabytes for a
+        // 4-byte mutation — that was a 0.5 s stall per corrupt blob.
+        if (n_outer > (uint32_t)((end - ptr) / 19)) {
+            PyErr_SetString(PyExc_ValueError, "ModDict.deserialize: corrupt entry count");
+            return;
+        }
         order.reserve(n_outer);
         outer.reserve(n_outer);
 

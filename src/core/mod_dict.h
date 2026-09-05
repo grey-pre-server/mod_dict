@@ -23,6 +23,17 @@ inline bool is_text_op(FilterOp op) { return op == FilterOp::TEXT_CONTAINS || op
 // The text-op predicate (defined in mod_dict.cpp): `needle` must already be
 // casefolded by the caller; a non-str `field` never matches.
 bool text_match(PyObject* field, FilterOp op, PyObject* needle);
+// Does row key `pk` match the literal row selector `sel` of an anchored
+// select path ("table.<sel>.field")? A str key must equal `sel`; an int key
+// matches when `sel` is that integer's decimal spelling (path strings can't
+// carry an int, so "users 42 name" is how an int pk is written). Anything
+// else (tuple keys, ...) never matches — use the "?" form there.
+bool pk_matches_selector(PyObject* pk, const std::string& sel);
+// Path-walking segment lookup (borrowed value): `seg` as a str key first;
+// if that misses and `seg` is a decimal integer, the int key. If `key_out`
+// is given it receives a NEW reference to the key that hit (needed to
+// rebuild {table: {key: row}} results without scanning for the key object).
+PyObject* dict_get_segment(PyObject* dict, const std::string& seg, PyObject** key_out);
 enum class LinkOnDelete  { RESTRICT, CASCADE, SET_NULL };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -581,16 +592,17 @@ public:
     // ValueError if none). Returns a new ModDict of the resolved target rows
     // for every current match of source_pattern (outer keys = target keys).
     //
-    // key_filter (optional): only scan source rows whose own key hashes into
-    // one of these — lets a caller chain hops by passing the previous hop's
-    // result keys, e.g. org.follow(path, &prev_result_key_hashes).
+    // key_filter (optional): resolve only the source rows with these keys —
+    // each looked up directly in the source table (O(k), never a scan of it;
+    // the earlier hash-list form walked every source row and searched the
+    // list per row, O(n·k)). Keys are borrowed; a key with no row is skipped.
     //
-    // value_filter (optional, mutually exclusive with key_filter): skip
-    // scanning the source table entirely and resolve these values directly
-    // against the target — for values obtained from somewhere other than a
-    // source-table scan (e.g. an external list of ids).
+    // value_filter (optional, mutually exclusive with key_filter): skip the
+    // source table entirely and resolve these FK values directly against the
+    // target — for values obtained elsewhere (an external list of ids, or
+    // the rows a select() landing already holds).
     ModDict* follow(const std::vector<std::string>& source_pattern,
-                     const std::vector<uint64_t>* key_filter = nullptr,
+                     const std::vector<PyObject*>* key_filter = nullptr,
                      const std::vector<PyObject*>* value_filter = nullptr) const;
 
     const LinkDecl* find_link(const std::vector<std::string>& source_pattern) const;
