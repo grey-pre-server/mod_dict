@@ -2239,6 +2239,11 @@ static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret){
     } else {
         MOD_DICT_RAISE(PyExc_TypeError,"select: fields must be a list of paths or a {label: path} dict");
     }
+    // Space/tab is a literal alias for '.' in every path string (same as
+    // filter()/sort_by()/...). Normalize up front: the wildcard detection
+    // below keys off '.', so "users ? col_name" used to slip through as a
+    // plain nested-field path and select nothing.
+    for(auto& f:paths) for(char& c:f) if(c==' '||c=='\t') c='.';
 
     // Detect wildcard/anchored paths ("orders.?.customer_id", optionally with
     // a "->" hop). If any path is wildcard-shaped, all must be — they're
@@ -2354,6 +2359,7 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
         MOD_DICT_RAISE(PyExc_ValueError,"select: returns must be 'rows', 'rows_here', or 'values'");
 
     std::string path(PyUnicode_AsUTF8(path_obj));
+    for(char& c:path) if(c==' '||c=='\t') c='.';  // space alias — see select_core()
     bool wc=(path.find("->")!=std::string::npos);
     if(!wc && (path.find('.')!=std::string::npos || path=="?")){
         for(auto& seg:split_dot_chunk(path)) if(seg=="__pass_key__"){ wc=true; break; }
