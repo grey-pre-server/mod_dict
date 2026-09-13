@@ -109,17 +109,22 @@ plus custom types via `md.register_converter(MyType, encoder)`
 Per-type cost is normalized against a small-int baseline in
 `tests/bench_serialize_types.py`; after the per-value stdlib/geo import
 probes were removed (v0.8.12+) the remaining per-type multiples are the
-Python constructors themselves. A SQL rowset writes column names once per
-set: 0.31µs/row and 36 bytes/row for a 3-column table vs 0.97µs and 71
-bytes for the same rows as a plain list of dicts.
+Python constructors themselves. Since v0.8.31 `datetime`/`date`/`time`/
+`timedelta` bypass even those: they are written and read through the
+datetime C-API (0.04–0.06µs per value either way; an aware `datetime`
+0.33µs on write for its `utcoffset()` call), and no value pays a failed
+attribute probe on its way to its type branch any more (that was ~1µs on
+every dict, Decimal, UUID, Path and geometry). A SQL rowset writes column
+names once per set: 0.31µs/row and 36 bytes/row for a 3-column table vs
+0.97µs and 71 bytes for the same rows as a plain list of dicts.
 
 | format | serialize | deserialize | size |
 |--------|-----------|-------------|------|
-| **ModDict binary** | 260ms | 410ms | 32.5 MB |
-| json | 252ms | 341ms | 23.7 MB |
-| pickle | 756ms | 488ms | 25.4 MB |
+| **ModDict binary** | 267ms | 288ms | 32.5 MB |
+| json | 260ms | 433ms | 23.7 MB |
+| pickle | 924ms | 558ms | 25.4 MB |
 
-ModDict binary supports the full Python type set (date, bytes, Decimal, Path, …) without a custom encoder — unlike json. Compared to pickle: **2.9× faster serialize, 1.2× faster deserialize**.
+ModDict binary supports the full Python type set (date, bytes, Decimal, Path, …) without a custom encoder — unlike json. Compared to pickle: **3.5× faster serialize, 1.9× faster deserialize**; compared to json: on par on serialize, **1.5× faster** deserialize.
 
 ---
 
@@ -182,12 +187,12 @@ back to a full scan on every call.
 
 | Operation | Notes | Time |
 |-----------|-------|------|
-| `mn.to_dict()` | plain dict, bypasses RowProxy | 23ms |
-| `dict(mn)` | keys()+getitem, may return RowProxy if any index exists | 24ms (1.06× slower) |
-| `md.dumps(plain_dict)` | generic single-value format | 169ms |
-| `md.dumps(mn)` | ModDict's native container format (same as `mn.serialize()`) | 271ms |
-| `md.loads(dumps(dict))` | → `dict` | 488ms |
-| `md.loads(dumps(mn))` | → `ModDict` | 576ms |
+| `mn.to_dict()` | plain dict, bypasses RowProxy | 33ms |
+| `dict(mn)` | keys()+getitem, may return RowProxy if any index exists | 33ms (≈ equal) |
+| `md.dumps(plain_dict)` | generic single-value format | 130ms |
+| `md.dumps(mn)` | ModDict's native container format (same as `mn.serialize()`) | 264ms |
+| `md.loads(dumps(dict))` | → `dict` | 449ms |
+| `md.loads(dumps(mn))` | → `ModDict` | 551ms |
 
 `md.dumps()`/`md.loads()` are module-level functions for serializing **any**
 supported object, not just a whole `ModDict`. A `ModDict` round-trips back as

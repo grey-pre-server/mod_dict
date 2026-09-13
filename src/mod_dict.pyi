@@ -1917,7 +1917,10 @@ class ModDict:
         is representable at microsecond precision, and ``time`` keeps its
         ``tzinfo``. Non-value objects from the ``datetime`` module
         (``timezone``, ``tzinfo``) are not serializable and raise
-        ``TypeError``.
+        ``TypeError``. A ``timedelta`` beyond ±106751991 days doesn't fit
+        the int64-microsecond record and raises ``OverflowError``; a
+        ``tzinfo`` whose ``utcoffset()`` raises, or returns something other
+        than ``None``/``timedelta``, propagates that error.
 
         Any other type (arbitrary Python objects with no registered converter)
         is **not** serializable and raises ``TypeError`` — register a
@@ -2253,6 +2256,8 @@ def dumps(obj: Any) -> bytes:
     geoalchemy2 object without ``.data``: they have no WKB to write, so
     ``TypeError``, never a blob with the value silently missing. If a
     geometry's own ``.wkb`` / ``.data`` raises, that exception propagates.
+    Temporal rules (``timedelta`` limit, ``tzinfo`` errors) are those of
+    ``ModDict.serialize()``.
 
     Example::
 
@@ -2274,8 +2279,10 @@ def loads(data: bytes) -> Any:
 
     Raises ``ValueError`` on corrupt or truncated input — a record running
     past the end of the buffer, a fixed-size payload that's too short, a
-    container count the bytes can't hold, an unknown type tag — never a
-    silent ``None`` and never a loop over a garbage count. Errors from a
+    container count the bytes can't hold, an unknown type tag, a temporal
+    payload the type can't hold (a date/datetime outside year 1..9999, a
+    time of 24h or more, a UTC offset of ±24h or more) — never a silent
+    ``None`` and never a loop over a garbage count. Errors from a
     geometry library while rebuilding a WKB value (e.g. shapely's
     ``GEOSException`` on invalid WKB) propagate as they are; decoding stops
     at the first failing value.
