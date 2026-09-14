@@ -34,6 +34,31 @@ bool pk_matches_selector(PyObject* pk, const std::string& sel);
 // is given it receives a NEW reference to the key that hit (needed to
 // rebuild {table: {key: row}} results without scanning for the key object).
 PyObject* dict_get_segment(PyObject* dict, const std::string& seg, PyObject** key_out);
+// Resolved anchor of an anchored path (see resolve_anchored_pattern in
+// mod_dict.cpp): the top-level entry it starts at, the dict whose entries the
+// row selector addresses, the owned key objects of the literal prefix walked
+// below the top entry (pattern[1..sel-1]), and the selector's index.
+struct OuterEntry;
+class ModDict;
+struct AnchorPath {
+    const OuterEntry* top = nullptr;       // borrowed
+    PyObject* table = nullptr;             // borrowed: the dict the selector addresses
+    std::vector<PyObject*> prefix_keys;    // owned: keys of pattern[1..sel-1]
+    size_t sel = 0;                        // index of the selector segment ("?" or a literal row key)
+    AnchorPath() = default;
+    AnchorPath(const AnchorPath&) = delete;
+    AnchorPath& operator=(const AnchorPath&) = delete;
+    ~AnchorPath() { for (PyObject* k : prefix_keys) Py_XDECREF(k); }
+};
+// A non-empty dict whose values are dicts (sampled: first 8) — a table of rows.
+bool looks_like_table(PyObject* d);
+// Fills *out for an anchored pattern [prefix..., selector, field...]; false
+// when the pattern isn't anchored at all (then it's a plain nested path).
+bool resolve_anchored_pattern(const ModDict* root, const std::vector<std::string>& pat, AnchorPath* out);
+// Puts `inner` (a fresh {row_key: row} dict, reference consumed) into
+// `result` nested under the anchor's prefix — {top: {k1: {...: inner}}} —
+// unioning row keys into whatever an earlier call already placed there.
+bool add_under_anchor(ModDict* result, const AnchorPath& ap, PyObject* inner);
 enum class LinkOnDelete  { RESTRICT, CASCADE, SET_NULL };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -551,6 +576,12 @@ public:
     // skipped, same as plain select().
     ModDict* select_anchored(const std::vector<std::vector<std::string>>& patterns,
                               const std::vector<std::string>& field_labels) const;
+    // The same scan for returns="values": fills `cols` (a list of
+    // len(patterns) empty lists) column by column, no intermediate ModDict;
+    // `keys_out` (a list), if given, receives the row key of every emitted
+    // row in the same order. Returns `cols`, or nullptr with PyErr set.
+    PyObject* select_anchored_values(const std::vector<std::vector<std::string>>& patterns, PyObject* cols,
+                                     PyObject* keys_out = nullptr) const;
 
     using GroupResult = std::vector<std::pair<ModValue, ModDict*>>;
     GroupResult group_by(const std::string& field) const;

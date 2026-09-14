@@ -95,6 +95,43 @@ PyTypeObject GeoAlchemyWKB_Type = {
 };
 
 /* ============================================================================
+   ModList — the list a select() or filter() hands back for returns="values"
+   (select_mass: the column list and each column) and for filter's
+   returns="rows_here", with .first(default=None)/.last(default=None) so a
+   chain can end in one value / one row. Otherwise a plain list: isinstance,
+   ==, slicing, json, pickle, md.dumps — all unchanged (dumps writes a LIST
+   record; loads returns a plain list). A static subtype of list: everything
+   but the two methods is inherited by PyType_Ready.
+   ============================================================================ */
+
+static PyObject* seq_first_last(PyObject* self, PyObject* args, PyObject* kw, bool last) {
+    PyObject* dflt = Py_None;
+    static const char* kwl[] = {"default", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|O", (char**)kwl, &dflt)) return nullptr;
+    Py_ssize_t n = PyList_GET_SIZE(self);
+    PyObject* r = n ? PyList_GET_ITEM(self, last ? n - 1 : 0) : dflt;
+    Py_INCREF(r);
+    return r;
+}
+static PyObject* ModList_first(PyObject* s, PyObject* a, PyObject* kw) { return seq_first_last(s, a, kw, false); }
+static PyObject* ModList_last (PyObject* s, PyObject* a, PyObject* kw) { return seq_first_last(s, a, kw, true); }
+static PyMethodDef ModList_methods[] = {
+    {"first", (PyCFunction)(void(*)(void))ModList_first, METH_VARARGS | METH_KEYWORDS, "first(default=None) -> the first element, or default when empty"},
+    {"last",  (PyCFunction)(void(*)(void))ModList_last,  METH_VARARGS | METH_KEYWORDS, "last(default=None) -> the last element, or default when empty"},
+    {nullptr}
+};
+PyTypeObject ModList_Type = {
+    .ob_base      = PyVarObject_HEAD_INIT(nullptr, 0)
+    .tp_name      = "mod_dict.ModList",
+    .tp_basicsize = sizeof(PyListObject),
+    .tp_flags     = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_doc       = "A list with first(default=None) / last(default=None) — what select()/filter() return for\n"
+                    "returns='values' and filter()'s returns='rows_here'. A plain list in every other respect.",
+    .tp_methods   = ModList_methods,
+    .tp_base      = &PyList_Type,
+};
+
+/* ============================================================================
    register_converter
    ============================================================================ */
 
@@ -266,6 +303,7 @@ PyMODINIT_FUNC PyInit_mod_dict(void) {
     if (PyType_Ready(&FilterBuilder_Type) < 0) return nullptr;
     if (PyType_Ready(&ShapelyWKB_Type) < 0) return nullptr;
     if (PyType_Ready(&GeoAlchemyWKB_Type) < 0) return nullptr;
+    if (PyType_Ready(&ModList_Type) < 0) return nullptr;
 
     converter_registry_init();
 
@@ -275,6 +313,7 @@ PyMODINIT_FUNC PyInit_mod_dict(void) {
     Py_INCREF(&ModDict_Type);      PyModule_AddObject(m, "ModDict",       (PyObject*)&ModDict_Type);
     Py_INCREF(&ShapelyWKB_Type);   PyModule_AddObject(m, "ShapelyWKB",    (PyObject*)&ShapelyWKB_Type);
     Py_INCREF(&GeoAlchemyWKB_Type);PyModule_AddObject(m, "GeoAlchemyWKB", (PyObject*)&GeoAlchemyWKB_Type);
+    Py_INCREF(&ModList_Type);      PyModule_AddObject(m, "ModList",       (PyObject*)&ModList_Type);
 
     return m;
 }

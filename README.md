@@ -134,6 +134,7 @@ mn.filter("orders.?.status").eq("shipped")       # ? skips one key, checks value
 mn.filter("?").eq("orders")                      # terminal ?: outer rows that HAVE key "orders"
 mn.filter("g1.?.status").eq("shipped")           # anchor: first segment scopes scan to key "g1"
 mn.filter("g1.r7.status").eq("shipped")          # targeted: only row "r7" of "g1" (int keys as decimal: "nums 42 v") — same in select()/select_mass()/"->"
+mn.filter("db.g1.?.status").eq("shipped")        # the table may sit any number of literal levels down — result keeps the nesting {"db": {"g1": {...}}}
 mn.filter("region.?.?.status").eq("Active")      # one ? per level — chain for deeper nesting
 
 # non-terminal wildcard results are PRUNED: only matching inner keys survive,
@@ -199,6 +200,7 @@ mn.copy()                                        # → new ModDict, rows deep-co
 # Index access by insertion order (O(1), supports negative indices)
 mn.at(0)                                         # first inserted key's value
 mn.at(-1)                                        # last inserted key's value
+mn.select("users ? name", returns="values").first()      # values / filter's rows_here come back as ModList — a list with first(default=None) / last(default=None)
 
 # Build from a list of dicts
 md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}

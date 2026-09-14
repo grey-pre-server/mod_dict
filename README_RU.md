@@ -134,6 +134,7 @@ mn.filter("orders.?.status").eq("shipped")       # ? пропускает оди
 mn.filter("?").eq("orders")                      # терминальный ?: строки с ключом "orders"
 mn.filter("g1.?.status").eq("shipped")           # anchor: сканирование ограничено ключом "g1"
 mn.filter("g1.r7.status").eq("shipped")          # таргет: только строка "r7" в "g1" (int-ключ — десятичной записью: "nums 42 v") — так же в select()/select_mass()/"->"
+mn.filter("db.g1.?.status").eq("shipped")        # таблица может лежать на любой глубине литеральных ступеней — результат сохраняет вложенность {"db": {"g1": {...}}}
 mn.filter("region.?.?.status").eq("Active")      # один ? на уровень — для вложенности глубже цепочкой
 
 # нетерминальный wildcard возвращает PRUNED-результат: остаются только
@@ -198,6 +199,7 @@ mn.copy()                                        # → новый ModDict, ст�
 # Доступ по индексу в порядке вставки (O(1), поддержка отрицательных индексов)
 mn.at(0)                                         # значение первого вставленного ключа
 mn.at(-1)                                        # значение последнего вставленного ключа
+mn.select("users ? name", returns="values").first()      # values / rows_here у filter приходят как ModList — list с first(default=None) / last(default=None)
 
 # Построение из списка словарей
 md.ModDict.from_rows(rows, key="id")             # {r["id"]: r for r in rows}

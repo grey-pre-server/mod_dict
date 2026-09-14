@@ -701,7 +701,6 @@ ModDict* ModDict::filter(const std::vector<std::string>& pattern, FilterOp op, c
         if (!anchor_entry || !anchor_entry->val_py || !anchor_entry->is_row)
             anchored = false;
     }
-
     // Helper: run prune_match and add result to result ModDict
     auto add_pruned = [&](uint64_t oh, PyObject* val_py, size_t start_depth) {
         // self/current_table only matter if `pattern` contains "__follow_link__",
@@ -900,61 +899,186 @@ PyObject* dict_get_segment(PyObject* dict, const std::string& seg, PyObject** ke
     return v;
 }
 
-ModDict* ModDict::select_anchored(const std::vector<std::vector<std::string>>& patterns,
-                                   const std::vector<std::string>& field_labels) const
-{
-    ModDict* result = new ModDict();
-    if (patterns.empty()) return result;
+// A dict that holds ROWS (every value a dict) as opposed to a row that holds
+// fields. Sampled: the first 8 values decide, so a 50k-row table costs the
+// same as a 3-row one and a row is recognized by its first scalar field. A
+// row whose first eight fields are all dicts is taken for a table — the "?"
+// form is the unambiguous spelling when data looks like that.
+bool looks_like_table(PyObject* d) {
+    if (!d || !PyDict_Check(d) || PyDict_Size(d) == 0) return false;
+    PyObject *k, *v; Py_ssize_t pos = 0; int seen = 0;
+    while (PyDict_Next(d, &pos, &k, &v)) {
+        if (!PyDict_Check(v)) return false;
+        if (++seen >= 8) break;
+    }
+    return true;
+}
 
-    const std::string& anchor_table = patterns[0][0];
-    for (auto& p : patterns) {
-        if (p[0] != anchor_table) {
-            PyErr_SetString(PyExc_ValueError,
-                "select: all wildcard fields must share the same anchor table");
-            delete result; return nullptr;
+// Anchored-path grammar, any depth: [literal prefix..., selector, field...].
+// The prefix walks down from a top-level entry through nested dicts to the
+// dict whose entries the selector addresses; the selector is "?" (every
+// row) or a literal key (that one row); the rest is the field path read off
+// the row. Where the prefix ends:
+//   * a pattern with "?": right before the first "?" — unambiguous;
+//   * an all-literal pattern: descend while the next segment names a table
+//     (looks_like_table) and a selector plus a field still remain after it,
+//     so "db.users.alice.name" is table db.users, row alice, field name,
+//     while "users.alice.address.city" stops at row alice (a row has scalar
+//     fields) and reads the nested field address.city.
+// A "->" hop must come after the selector (links are declared on top-level
+// tables as "table.?.field"). Returns false when the path isn't anchored:
+// the first segment isn't a top-level dict, a prefix segment is missing or
+// not a dict, a literal selector doesn't name a row, or no field follows the
+// selector — callers then treat the path as a plain nested-field path.
+bool resolve_anchored_pattern(const ModDict* root, const std::vector<std::string>& pat, AnchorPath* out) {
+    if (pat.size() < 3 || pat[0] == "__pass_key__" || pat[0] == "__follow_link__") return false;
+    uint64_t h = 0;
+    const OuterEntry* top = resolve_table(root, pat[0], h);
+    if (!top || !top->val_py || !PyDict_Check(top->val_py)) return false;
+    size_t first_q = pat.size(), first_hop = pat.size();
+    for (size_t i = 1; i < pat.size(); i++) {
+        if (first_q == pat.size() && pat[i] == "__pass_key__") first_q = i;
+        if (first_hop == pat.size() && pat[i] == "__follow_link__") first_hop = i;
+    }
+    PyObject* cur = top->val_py;
+    size_t sel = 0;
+    if (first_q < pat.size()) {
+        if (first_q + 1 >= pat.size() || first_hop < first_q) return false;
+        sel = first_q;
+        for (size_t i = 1; i < sel; i++) {
+            PyObject* key = nullptr;
+            PyObject* nxt = dict_get_segment(cur, pat[i], &key);
+            if (!nxt || !key || !PyDict_Check(nxt)) { Py_XDECREF(key); PyErr_Clear(); return false; }
+            out->prefix_keys.push_back(key);  // owned
+            cur = nxt;
+        }
+    } else {
+        size_t i = 0;
+        while (i + 3 < pat.size() && i + 2 < first_hop) {
+            PyObject* key = nullptr;
+            PyObject* nxt = dict_get_segment(cur, pat[i + 1], &key);
+            if (!nxt || !key || !looks_like_table(nxt)) { Py_XDECREF(key); PyErr_Clear(); break; }
+            out->prefix_keys.push_back(key);  // owned
+            cur = nxt; i++;
+        }
+        sel = i + 1;
+        if (sel + 1 >= pat.size() || sel >= first_hop) return false;
+        PyObject* row = dict_get_segment(cur, pat[sel], nullptr);
+        if (!row || !PyDict_Check(row)) return false;
+    }
+    out->top = top; out->table = cur; out->sel = sel;
+    return true;
+}
+
+// Unions `src` into `dst` down to `levels` nested dict levels; at level 0 the
+// keys are row keys and an existing row is kept as is (rows are the caller's
+// objects — never merged into). Both dicts above level 0 are result-owned.
+static bool union_levels(PyObject* dst, PyObject* src, size_t levels) {
+    PyObject *k, *v; Py_ssize_t pos = 0;
+    while (PyDict_Next(src, &pos, &k, &v)) {
+        PyObject* have = PyDict_GetItemWithError(dst, k);  // borrowed
+        if (!have) {
+            if (PyErr_Occurred()) return false;
+            if (PyDict_SetItem(dst, k, v) != 0) return false;
+        } else if (levels > 0 && PyDict_Check(have) && PyDict_Check(v)) {
+            if (!union_levels(have, v, levels - 1)) return false;
         }
     }
+    return true;
+}
 
-    uint64_t anchor_hash = 0;
-    const OuterEntry* anchor_entry = resolve_table(this, anchor_table, anchor_hash);
-    if (!anchor_entry || !PyDict_Check(anchor_entry->val_py)) return result;
+bool add_under_anchor(ModDict* result, const AnchorPath& ap, PyObject* inner) {
+    PyObject* payload = inner;
+    for (size_t i = ap.prefix_keys.size(); i-- > 0; ) {
+        PyObject* d = PyDict_New();
+        if (!d || PyDict_SetItem(d, ap.prefix_keys[i], payload) != 0) { Py_XDECREF(d); Py_DECREF(payload); return false; }
+        Py_DECREF(payload);
+        payload = d;
+    }
+    uint64_t th = content_hash_pyobj(ap.top->key_py);
+    OuterEntry* existing = result->outer.find(th);
+    if (!existing || !existing->val_py || !PyDict_Check(existing->val_py)) {
+        Py_INCREF(ap.top->key_py);
+        result->outer.insert(th, {ap.top->key_py, payload, true});  // takes the payload reference
+        result->order.push_back(th);
+        return true;
+    }
+    bool ok = union_levels(existing->val_py, payload, ap.prefix_keys.size());
+    Py_DECREF(payload);
+    return ok;
+}
 
-    // Which rows to visit: every row if any pattern selects with "?";
-    // otherwise only the rows the literal selectors name, by DIRECT lookup
-    // — a targeted "table.key.field" select must stay O(1) in the table
-    // size (scanning 50k rows to read one cell is exactly what it exists
-    // to avoid). Keys in `visit` are owned (INCREF'd) for uniform handling.
-    struct Visit { PyObject* pk; PyObject* row; };
-    std::vector<Visit> visit;
+// The rows an anchored select visits, resolved once for a pattern set: the
+// anchor (the prefix every pattern must share — they're scanned together off
+// one table) and, per row, its key (owned) and dict. Every row when any
+// pattern's selector is "?", otherwise only the rows the literal selectors
+// name, by DIRECT lookup — a targeted "table.key.field" select stays O(1)
+// in the table size. An unresolvable prefix visits nothing. False (PyErr
+// set) only for mismatched prefixes.
+struct AnchoredVisit { PyObject* pk; PyObject* row; };
+static bool collect_anchored_rows(const ModDict* self, const std::vector<std::vector<std::string>>& patterns,
+                                  AnchorPath& ap, std::vector<AnchoredVisit>& visit)
+{
+    if (!resolve_anchored_pattern(self, patterns[0], &ap)) return true;
+    for (auto& p : patterns) {
+        bool same = p.size() > ap.sel + 1;
+        for (size_t i = 0; same && i < ap.sel; i++) same = (p[i] == patterns[0][i]);
+        if (!same) {
+            PyErr_SetString(PyExc_ValueError,
+                "select: all anchored fields must share the same anchor table (the same path down to the row selector)");
+            return false;
+        }
+    }
     bool any_wildcard = false;
-    for (auto& p : patterns) if (p.size() < 2 || p[1] == "__pass_key__") { any_wildcard = true; break; }
+    for (auto& p : patterns) if (p[ap.sel] == "__pass_key__") { any_wildcard = true; break; }
     if (any_wildcard) {
         PyObject *pk, *row; Py_ssize_t pos = 0;
-        while (PyDict_Next(anchor_entry->val_py, &pos, &pk, &row)) { Py_INCREF(pk); visit.push_back({pk, row}); }
+        while (PyDict_Next(ap.table, &pos, &pk, &row)) { Py_INCREF(pk); visit.push_back({pk, row}); }
     } else {
         for (auto& p : patterns) {
             PyObject* key = nullptr;
-            PyObject* row = dict_get_segment(anchor_entry->val_py, p[1], &key);  // key: new ref on hit
+            PyObject* row = dict_get_segment(ap.table, p[ap.sel], &key);  // key: new ref on hit
             if (!row) continue;
             bool dup = false;
             for (auto& v : visit) { int eq = PyObject_RichCompareBool(v.pk, key, Py_EQ); if (eq < 0) PyErr_Clear(); if (eq == 1) { dup = true; break; } }
             if (dup) Py_DECREF(key); else visit.push_back({key, row});
         }
     }
+    return true;
+}
+static void release_visit(std::vector<AnchoredVisit>& visit) { for (auto& w : visit) Py_DECREF(w.pk); }
+
+ModDict* ModDict::select_anchored(const std::vector<std::vector<std::string>>& patterns,
+                                   const std::vector<std::string>& field_labels) const
+{
+    ModDict* result = new ModDict();
+    if (patterns.empty()) return result;
+    AnchorPath ap; std::vector<AnchoredVisit> visit;
+    if (!collect_anchored_rows(this, patterns, ap, visit)) { delete result; return nullptr; }
+    const std::string& anchor_table = patterns[0][0];  // link hops resolve against the top-level table name
+
+    // Label objects once — not a fresh str per row per field.
+    std::vector<PyObject*> labels;
+    for (auto& l : field_labels) {
+        PyObject* u = PyUnicode_FromStringAndSize(l.c_str(), (Py_ssize_t)l.size());
+        if (!u) { for (auto* x : labels) Py_DECREF(x); release_visit(visit); delete result; return nullptr; }
+        labels.push_back(u);
+    }
+    auto cleanup = [&]() { for (auto* x : labels) Py_DECREF(x); release_visit(visit); };
 
     for (auto& v : visit) {
         PyObject* pk = v.pk; PyObject* row = v.row;
         if (!PyDict_Check(row)) continue;
         PyObject* new_row = PyDict_New();
-        if (!new_row) { for (auto& w : visit) Py_DECREF(w.pk); delete result; return nullptr; }
+        if (!new_row) { cleanup(); delete result; return nullptr; }
         bool has_any = false;
         for (size_t i = 0; i < patterns.size(); i++) {
-            // Row selector at [1]: "?" = every row; a literal = only that row
-            // (targeted path "table.key.field") — other rows skip this field.
-            if (patterns[i][1] != "__pass_key__" && !pk_matches_selector(pk, patterns[i][1])) continue;
-            PyObject* fv = get_nested_via_links(this, row, patterns[i], 2, anchor_table);
-            if (PyErr_Occurred()) { Py_DECREF(new_row); for (auto& w : visit) Py_DECREF(w.pk); delete result; return nullptr; }
-            if (fv) { PyDict_SetItemString(new_row, field_labels[i].c_str(), fv); has_any = true; }
+            // Row selector: "?" = every row; a literal = only that row
+            // (targeted path) — other rows skip this field.
+            if (patterns[i][ap.sel] != "__pass_key__" && !pk_matches_selector(pk, patterns[i][ap.sel])) continue;
+            PyObject* fv = get_nested_via_links(this, row, patterns[i], ap.sel + 1, anchor_table);
+            if (PyErr_Occurred()) { Py_DECREF(new_row); cleanup(); delete result; return nullptr; }
+            if (fv) { PyDict_SetItem(new_row, labels[i], fv); has_any = true; }
         }
         if (has_any) {
             Py_INCREF(pk);
@@ -965,8 +1089,42 @@ ModDict* ModDict::select_anchored(const std::vector<std::vector<std::string>>& p
             Py_DECREF(new_row);
         }
     }
-    for (auto& w : visit) Py_DECREF(w.pk);
+    cleanup();
     return result;
+}
+
+// returns="values" straight into the caller's column lists: one list per
+// pattern, values in row order, None where a row lacks that field; a row
+// lacking every field is skipped (as select_anchored skips it). No
+// intermediate {pk: {label: value}} ModDict — that made select(..., values)
+// on 100k rows cost 180ms against a 13ms list comprehension. `cols` is a
+// list of len(patterns) empty lists; returned back, or nullptr with PyErr.
+PyObject* ModDict::select_anchored_values(const std::vector<std::vector<std::string>>& patterns, PyObject* cols,
+                                          PyObject* keys_out) const
+{
+    if (patterns.empty()) return cols;
+    AnchorPath ap; std::vector<AnchoredVisit> visit;
+    if (!collect_anchored_rows(this, patterns, ap, visit)) return nullptr;
+    const std::string& anchor_table = patterns[0][0];
+    size_t n = patterns.size();
+    std::vector<PyObject*> vals(n);
+    for (auto& v : visit) {
+        if (!PyDict_Check(v.row)) continue;
+        bool has_any = false;
+        for (size_t i = 0; i < n; i++) {
+            vals[i] = nullptr;
+            if (patterns[i][ap.sel] != "__pass_key__" && !pk_matches_selector(v.pk, patterns[i][ap.sel])) continue;
+            vals[i] = get_nested_via_links(this, v.row, patterns[i], ap.sel + 1, anchor_table);  // borrowed
+            if (PyErr_Occurred()) { release_visit(visit); return nullptr; }
+            if (vals[i]) has_any = true;
+        }
+        if (!has_any) continue;
+        for (size_t i = 0; i < n; i++)
+            if (PyList_Append(PyList_GET_ITEM(cols, (Py_ssize_t)i), vals[i] ? vals[i] : Py_None) != 0) { release_visit(visit); return nullptr; }
+        if (keys_out && PyList_Append(keys_out, v.pk) != 0) { release_visit(visit); return nullptr; }
+    }
+    release_visit(visit);
+    return cols;
 }
 
 // ── sort_by ──────────────────────────────────────────────────────────────────
@@ -3000,13 +3158,16 @@ bool ModDict::delete_with_link_semantics(const std::string& table, PyObject* key
 PyObject* ModDict::to_python_dict() const {
     PyObject* d = PyDict_New();
     if (!d) return nullptr;
-    for (auto& e : outer.occupied()) {
-        if (!e.value.key_py) continue;
-        PyObject* py_val = e.value.is_row
-            ? get_row(e.key)
-            : (e.value.val_py ? (Py_INCREF(e.value.val_py), e.value.val_py) : (Py_INCREF(Py_None), Py_None));
+    // Insertion order, like keys()/values()/items() and at() — this used to
+    // walk the hash table, so to_dict() and keys() disagreed on order.
+    for (uint64_t oh : order) {
+        const OuterEntry* e = outer.find(oh);
+        if (!e || !e->key_py) continue;
+        PyObject* py_val = e->is_row
+            ? get_row(oh)
+            : (e->val_py ? (Py_INCREF(e->val_py), e->val_py) : (Py_INCREF(Py_None), Py_None));
         if (!py_val) { Py_DECREF(d); return nullptr; }
-        PyDict_SetItem(d, e.value.key_py, py_val);
+        PyDict_SetItem(d, e->key_py, py_val);
         Py_DECREF(py_val);
     }
     return d;

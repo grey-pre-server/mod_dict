@@ -72,6 +72,15 @@ class FilterBuilder:
     as its decimal spelling (``"nums 42 v"`` → key ``42``). If the table or
     the row doesn't exist the path is read as a plain nested-field path (and
     matches nothing), never an error.
+
+    The table may sit any number of literal levels down: ``db.users.?.name``
+    or ``db.users.alice.name`` walks ``db`` → ``users`` (a dict of rows) and
+    addresses ``users``' rows; results keep that nesting, ``{"db": {"users":
+    {...}}}``. With ``?`` the prefix ends right before it. In an all-literal
+    path the prefix descends while the next segment names a table (a dict
+    whose values are dicts — judged by its first eight values) and a selector
+    plus a field still follow, so ``users.alice.address.city`` stops at row
+    ``alice`` (it has scalar fields) and reads its nested ``address.city``.
     """
 
     def eq(
@@ -711,7 +720,8 @@ class ModDict:
 
         Anchor path (first segment is a known outer key; the next segment is
         the row selector — ``?`` for every row, a literal key for that ONE
-        row; an int key is spelled as decimal)::
+        row; an int key is spelled as decimal; the table may also sit further
+        down, ``"db.users.?.name"`` — see the ``FilterBuilder`` notes)::
 
             # only scan rows inside the "g1" outer key
             mn.filter("g1.?.user_id").eq(1)
@@ -1023,7 +1033,9 @@ class ModDict:
             path:    A single dot-notation field path (same path grammar as
                      ``select_mass()`` — plain, wildcard ``"table.?.field"``,
                      targeted ``"table.key.field"`` (one row of the anchored
-                     table; int keys spelled as decimal), or ``->``-hop).
+                     table; int keys spelled as decimal), either with the
+                     table any number of literal levels down
+                     (``"db.users.?.name"``), or ``->``-hop).
             returns: ``"rows"`` *(default)* — ``{key: value}`` for a plain
                      path. For a table-anchored wildcard path, same
                      table-landing behavior as ``select_mass()`` (returns a
@@ -2093,6 +2105,28 @@ class GeoAlchemyWKB:
         mn["row"] = {"geom": md.GeoAlchemyWKB(wkb_bytes)}
     """
     def __init__(self, data: bytes) -> None: ...
+
+
+class ModList(list):
+    """
+    A ``list`` with ``first()``/``last()`` — what ``select()``/``select_mass()``
+    return for ``returns="values"`` (the column list and each column) and what
+    ``filter()`` returns for ``returns="rows_here"``/``"values"``, so a query
+    chain can end in one value or one row::
+
+        mn.select("users.?.name", returns="values").first()             # "Alice"
+        mn.filter("users.?.age").gte(40, returns="rows_here").last()    # the last matching row dict
+        mn.select("users.?.nope", returns="values").first(default=0)    # 0 — nothing matched
+
+    A plain list in every other respect: ``isinstance(x, list)``, ``==``,
+    slicing, ``json``, ``pickle``; ``md.dumps()`` writes it as a list.
+    """
+    def first(self, default: Any = None) -> Any:
+        """The first element, or *default* when empty."""
+        ...
+    def last(self, default: Any = None) -> Any:
+        """The last element, or *default* when empty."""
+        ...
 
 
 def set_geo_backend(name: Literal["shapely", "geoalchemy2", "wkb_bytes"] | None) -> None:

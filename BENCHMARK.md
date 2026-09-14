@@ -202,6 +202,35 @@ want serialized.
 
 ---
 
+## select — anchored / targeted / deep paths (100 000 rows)
+
+The 100k rows under a table name (`{"users": rows}`) and one level deeper
+(`{"db": {"users": rows}}`); each `select()` against the dict comprehension
+doing the same job. `values` is a flat list, `rows_here` is `{pk: value}`,
+`rows` lands on the table itself. The list-shaped results come back as
+`ModList` (a list with `first()`/`last()`), `rows_here` as a plain dict —
+both built straight off the rows, no intermediate `{pk: {label: value}}`
+table (that made `values` cost 180ms before v0.8.32).
+
+| Operation | dict equivalent | dict | ModDict | ratio |
+|-----------|-----------------|------|---------|-------|
+| `select("users.?.age", returns="values")` | `[r["age"] for r in d.values()]` | 16ms | 24ms | 0.67× |
+| `select("users.?.age", returns="rows_here")` | `{k: r["age"] for k, r in d.items()}` | 60ms | 61ms | ~equal |
+| nested field: `select("users.?.meta.level", returns="values")` | `[r["meta"]["level"] for r in d.values()]` | 29ms | 50ms | 0.58× |
+| `select_mass(["users.?.age", "users.?.name"], returns="values")` | two comprehensions | 36ms | 42ms | 0.85× |
+| deep prefix: `select("db.users.?.age", returns="values")` | `[r["age"] for r in d["db"]["users"].values()]` | 14ms | 27ms | 0.51× |
+| `select("users.?.age")` — `rows`, lands on the table | — | — | 109ms | builds a `{pk: row}` view of all 100k rows |
+| targeted: `select("users.<key>.age", returns="values")` | `d[key]["age"]` | 0.12µs | 2.83µs | one direct lookup, table-size independent |
+| deep targeted: `select("db.users.<key>.age", returns="values")` | `d["db"]["users"][key]["age"]` | 0.12µs | 4.04µs | — |
+| the same + `.first()` | — | — | 3.57µs | — |
+
+A comprehension stays ahead on a flat projection — one tight interpreter
+loop over a native dict — and `select()` stays within 1.5–2× of it while
+resolving the path grammar (anchor, `?`, nested fields, `->` hops, targeted
+rows) in C; `rows_here` is on par.
+
+---
+
 ## Links: link() / follow() / "->" filter (100 000 orders × 10 000 customers)
 
 Two-table `ModDict`: `orders: {pk: {customer_id}}`, `customers: {pk: {name}}`,
@@ -295,6 +324,7 @@ GUI table model does without a cursor. Setup calls (`set_sort`/`set_filter`/
 | Filter (boolean fields) | **ModDict** — **1.6×** faster |
 | Filter (numeric range, dense) | ~equal; ModDict wins at high selectivity |
 | Select (field projection) | **ModDict** — **2.1×** faster |
+| `select("table.?.field")` values / rows_here | comprehension 1.5–2× faster on a flat projection; `rows_here` on par; a targeted row ~3µs regardless of table size |
 | Update / merge by key | **ModDict** — **1.3–2.3×** faster |
 | Deep copy | **ModDict** — **7.8×** faster than `deepcopy` |
 | Index access `at(i)` | **ModDict** — O(1) via insertion-order vector |

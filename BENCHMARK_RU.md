@@ -198,6 +198,35 @@ plain dict.
 
 ---
 
+## select — анкорные / таргетные / глубокие пути (100 000 строк)
+
+Те же 100k строк под именем таблицы (`{"users": rows}`) и на уровень глубже
+(`{"db": {"users": rows}}`); каждый `select()` против dict comprehension,
+делающего ту же работу. `values` — плоский список, `rows_here` — `{pk: value}`,
+`rows` приземляется на саму таблицу. Списочные результаты приходят как
+`ModList` (list с `first()`/`last()`), `rows_here` — обычный dict; оба
+собираются прямо со строк, без промежуточной таблицы `{pk: {label: value}}`
+(из-за неё `values` до v0.8.32 стоил 180ms).
+
+| Операция | Эквивалент на dict | dict | ModDict | Отношение |
+|----------|--------------------|------|---------|-----------|
+| `select("users.?.age", returns="values")` | `[r["age"] for r in d.values()]` | 16ms | 24ms | 0.67× |
+| `select("users.?.age", returns="rows_here")` | `{k: r["age"] for k, r in d.items()}` | 60ms | 61ms | ~равно |
+| вложенное поле: `select("users.?.meta.level", returns="values")` | `[r["meta"]["level"] for r in d.values()]` | 29ms | 50ms | 0.58× |
+| `select_mass(["users.?.age", "users.?.name"], returns="values")` | два comprehension | 36ms | 42ms | 0.85× |
+| глубокий префикс: `select("db.users.?.age", returns="values")` | `[r["age"] for r in d["db"]["users"].values()]` | 14ms | 27ms | 0.51× |
+| `select("users.?.age")` — `rows`, приземление на таблицу | — | — | 109ms | строит представление `{pk: row}` всех 100k строк |
+| таргет: `select("users.<key>.age", returns="values")` | `d[key]["age"]` | 0.12мкс | 2.83мкс | один прямой lookup, не зависит от размера таблицы |
+| глубокий таргет: `select("db.users.<key>.age", returns="values")` | `d["db"]["users"][key]["age"]` | 0.12мкс | 4.04мкс | — |
+| то же + `.first()` | — | — | 3.57мкс | — |
+
+Comprehension впереди на плоской проекции — один плотный цикл интерпретатора
+по нативному dict — а `select()` держится в 1.5–2× от него, разбирая при
+этом грамматику пути (якорь, `?`, вложенные поля, `->`-хопы, таргетные
+строки) в C; `rows_here` — вровень.
+
+---
+
 ## Связи: link() / follow() / '->'-фильтр (100 000 заказов × 10 000 клиентов)
 
 Двухтабличный `ModDict`: `orders: {pk: {customer_id}}`, `customers: {pk: {name}}`,
@@ -295,6 +324,7 @@ join — выигрыш здесь обычная разница в overhead н�
 | Фильтрация (булевые поля) | **ModDict** — **1.6×** быстрее |
 | Фильтрация (числовой диапазон, плотный) | ~равно; ModDict выигрывает при высокой селективности |
 | Проекция полей (select) | **ModDict** — **2.1×** быстрее |
+| `select("table.?.field")` values / rows_here | comprehension в 1.5–2× быстрее на плоской проекции; `rows_here` вровень; таргетная строка ~3мкс независимо от размера таблицы |
 | Обновление / merge по ключу | **ModDict** — **1.3–2.3×** быстрее |
 | Глубокое копирование | **ModDict** — **7.8×** быстрее `deepcopy` |
 | Доступ по индексу `at(i)` | **ModDict** — O(1) через вектор порядка вставки |

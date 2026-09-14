@@ -693,16 +693,15 @@ static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
 // row. When the table or the row doesn't exist the path is NOT targeted —
 // it falls back to the plain nested-field reading. Outputs are borrowed.
 static bool targeted_anchor(ModDictObject* owner, const std::vector<std::string>& pat,
-                            const OuterEntry** table_out, PyObject** row_out) {
-    if (pat.size() < 3 || pat[0] == "__pass_key__" || pat[1] == "__pass_key__" || pat[1] == "__follow_link__") return false;
-    PyObject* tmp = PyUnicode_FromStringAndSize(pat[0].c_str(), (Py_ssize_t)pat[0].size());
-    if (!tmp) { PyErr_Clear(); return false; }
-    uint64_t h = content_hash_pyobj(tmp); Py_DECREF(tmp);
-    const OuterEntry* e = owner->internal->outer.find(h);
-    if (!e || !e->is_row || !e->val_py || !PyDict_Check(e->val_py)) return false;
-    PyObject* row = dict_get_segment(e->val_py, pat[1], nullptr);
+                            AnchorPath* ap_out, PyObject** row_out) {
+    AnchorPath local;
+    AnchorPath& ap = ap_out ? *ap_out : local;
+    // Any depth of literal prefix (resolve_anchored_pattern, core); a "?"
+    // selector is the wildcard machinery's job, not a targeted path.
+    if (!resolve_anchored_pattern(owner->internal, pat, &ap)) return false;
+    if (pat[ap.sel] == "__pass_key__") return false;
+    PyObject* row = dict_get_segment(ap.table, pat[ap.sel], nullptr);
     if (!row || !PyDict_Check(row)) return false;
-    if (table_out) *table_out = e;
     if (row_out) *row_out = row;
     return true;
 }
@@ -774,12 +773,17 @@ static void scan_here(ModDict* self, std::string current_table, PyObject* report
         }
     }
 }
+// The list handed back for returns="values" / filter's "rows_here" — a
+// plain list subtype carrying .first()/.last() (defined in module.cpp).
+extern PyTypeObject ModList_Type;
+static PyObject* new_modlist() { return PyObject_CallNoArgs((PyObject*)&ModList_Type); }
+
 static PyObject* apply_filter_here(ModDictObject* owner,
                                     const std::string& simple,
                                     const std::vector<std::string>& pattern,
                                     bool wc, FilterOp op, const ModValue& fval,
                                     bool want_values, PyObject* vf_key, PyObject* cmp_out = nullptr) {
-    PyObject* result = PyList_New(0); if (!result) return nullptr;
+    PyObject* result = new_modlist(); if (!result) return nullptr;
     std::vector<std::string> pat = wc ? pattern : std::vector<std::string>{simple};
     bool anchored = (!pat.empty() && pat[0] != "__pass_key__");
     const OuterEntry* anchor_e = nullptr;
@@ -929,6 +933,51 @@ static void union_anchored_into(ModDict* dst, ModDict* src) {
         }
     }
 }
+// dst[k] = src[k] for keys dst lacks; where both sides hold DIFFERENT dicts
+// under one key, dst's is replaced by a shallow copy and the two are merged
+// recursively. Nothing is ever written into a dict this function didn't
+// just create, so the caller's rows and tables (which pruned results hold
+// by reference) are never touched; a key held by both sides — the same row
+// object — is left as it is.
+static bool merge_missing(PyObject* dst, PyObject* src) {
+    PyObject *k, *v; Py_ssize_t pos = 0;
+    while (PyDict_Next(src, &pos, &k, &v)) {
+        PyObject* have = PyDict_GetItemWithError(dst, k);  // borrowed
+        if (!have) {
+            if (PyErr_Occurred()) return false;
+            if (PyDict_SetItem(dst, k, v) != 0) return false;
+        } else if (have != v && PyDict_Check(have) && PyDict_Check(v)) {
+            PyObject* own = PyDict_Copy(have);
+            if (!own) return false;
+            bool ok = merge_missing(own, v) && PyDict_SetItem(dst, k, own) == 0;
+            Py_DECREF(own);
+            if (!ok) return false;
+        }
+    }
+    return true;
+}
+// Unions one in_() part into the merged result for a "?" pattern: a new
+// outer key is taken as is (refs copied); an outer key already present gets
+// its nested rows merged through merge_missing on a copy of what is there.
+static bool union_pruned_into(ModDict* dst, ModDict* src) {
+    for (auto& e : src->outer.occupied()) {
+        if (!e.value.val_py) continue;
+        OuterEntry* existing = dst->outer.find(e.key);
+        if (!existing) {
+            Py_XINCREF(e.value.key_py); Py_INCREF(e.value.val_py);
+            dst->outer.insert(e.key, {e.value.key_py, e.value.val_py, e.value.is_row});
+            dst->order.push_back(e.key);
+        } else if (existing->val_py != e.value.val_py && existing->val_py
+                   && PyDict_Check(existing->val_py) && PyDict_Check(e.value.val_py)) {
+            PyObject* own = PyDict_Copy(existing->val_py);
+            if (!own) return false;
+            if (!merge_missing(own, e.value.val_py)) { Py_DECREF(own); return false; }
+            Py_DECREF(existing->val_py);
+            existing->val_py = own;
+        }
+    }
+    return true;
+}
 // A filter()/select() result is a fresh ModDict holding only ONE table's
 // worth of pruned rows, with an empty `links` -- calling a "->" pattern on
 // it has nothing to resolve against (the OTHER table and the declared link
@@ -974,29 +1023,28 @@ static ModDict* filter_maybe_relay(ModDictObject* owner, const std::string& simp
         // the only one holding declared links) — and answer in the same
         // {table: {key: row}} shape a "table.?.field" filter returns, just
         // never more than one row.
-        const OuterEntry* te = nullptr; PyObject* row = nullptr;
-        if (targeted_anchor(owner, pattern, &te, &row)) {
+        AnchorPath ap; PyObject* row = nullptr;
+        if (targeted_anchor(owner, pattern, &ap, &row)) {
             ModDictObject* root = owner;
             while (root->parent_ref) root = (ModDictObject*)root->parent_ref;
             PyObject* hits = PyList_New(0); if (!hits) return nullptr;
             bool err = false;
-            scan_here(root->internal, pattern[0], nullptr, row, pattern, 2, op, fv, false, nullptr, hits, nullptr, &err);
+            scan_here(root->internal, pattern[0], nullptr, row, pattern, ap.sel + 1, op, fv, false, nullptr, hits, nullptr, &err);
             if (err) { Py_DECREF(hits); return nullptr; }
             bool matched = PyList_GET_SIZE(hits) > 0;
             Py_DECREF(hits);
             ModDict* result = new ModDict();
             if (matched) {
+                // {top: {prefix...: {key: row}}} — the same nesting a filter on
+                // the "?" form of this path prunes down to.
                 PyObject* key = nullptr;
-                (void)dict_get_segment(te->val_py, pattern[1], &key);
+                (void)dict_get_segment(ap.table, pattern[ap.sel], &key);
                 PyObject* inner = PyDict_New();
                 if (!key || !inner || PyDict_SetItem(inner, key, row) != 0) {
                     Py_XDECREF(key); Py_XDECREF(inner); delete result; return nullptr;
                 }
                 Py_DECREF(key);
-                uint64_t th = content_hash_pyobj(te->key_py);
-                Py_XINCREF(te->key_py);
-                result->outer.insert(th, {te->key_py, inner, true});
-                result->order.push_back(th);
+                if (!add_under_anchor(result, ap, inner)) { delete result; return nullptr; }
             }
             return result;
         }
@@ -1033,7 +1081,7 @@ static PyObject* FB_between(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         PyObject* cmp_list=PyList_New(0); if(!cmp_list) return nullptr;
         PyObject* ge=apply_filter_here(s->owner,simple,pat,wc,FilterOp::GE,lo_val,false,nullptr,cmp_list);
         if (!ge) { Py_DECREF(cmp_list); return nullptr; }
-        PyObject* result=PyList_New(0); if(!result){Py_DECREF(ge);Py_DECREF(cmp_list);return nullptr;}
+        PyObject* result=new_modlist(); if(!result){Py_DECREF(ge);Py_DECREF(cmp_list);return nullptr;}
         Py_ssize_t n=PyList_GET_SIZE(ge);
         for (Py_ssize_t i=0;i<n;i++) {
             PyObject* row=PyList_GET_ITEM(ge,i);
@@ -1105,7 +1153,7 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
     if (strcmp(ret,"rows")!=0) {
         bool want_values=(strcmp(ret,"values")==0);
         if (want_values && !vf_obj){ Py_DECREF(seq); MOD_DICT_RAISE(PyExc_ValueError,"returns='values' requires value_field"); }
-        PyObject* result=PyList_New(0); if(!result){Py_DECREF(seq);return nullptr;}
+        PyObject* result=new_modlist(); if(!result){Py_DECREF(seq);return nullptr;}
         Py_ssize_t n=PyTuple_GET_SIZE(seq);
         for(Py_ssize_t i=0;i<n;i++){
             ModValue mv=ModValue::from_pyobject(PyTuple_GET_ITEM(seq,i));
@@ -1119,6 +1167,11 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
         return result;
     }
     ModDict* merged=new ModDict();
+    // A "?" pattern's parts are keyed by the same anchor/group keys
+    // ({users: {...}} for every value), so they must be unioned inside —
+    // the outer-key de-dup below kept only the first value's rows (found
+    // 2026-09-14: in_(["Cara","Bob"]) over "users.?.name" returned Cara alone).
+    bool nested_parts = wc && std::find(pat.begin(),pat.end(),"__pass_key__")!=pat.end();
     Py_ssize_t n=PyTuple_GET_SIZE(seq);
     for(Py_ssize_t i=0;i<n;i++){
         ModValue mv=ModValue::from_pyobject(PyTuple_GET_ITEM(seq,i));
@@ -1130,6 +1183,8 @@ static PyObject* FB_in_(FilterBuilderObject* s,PyObject* args,PyObject* kw){
             // instead of the plain de-dup below, which would silently keep
             // only the first value's matches.
             union_anchored_into(merged, part);
+        } else if(nested_parts){
+            if(!union_pruned_into(merged, part)){ delete part; delete merged; Py_DECREF(seq); return nullptr; }
         } else {
             for(auto& e:part->outer.occupied()) if(!merged->outer.find(e.key)){Py_XINCREF(e.value.key_py);Py_XINCREF(e.value.val_py);merged->outer.insert(e.key,{e.value.key_py,e.value.val_py,e.value.is_row});merged->order.push_back(e.key);}
         }
@@ -2199,14 +2254,12 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
         // current rows for the anchor table if it's a derived child (same
         // restriction convention as filter_link_hop_via_root/
         // select_link_hop_via_root), else every row of the anchor table.
-        PyObject* tmp = PyUnicode_FromStringAndSize(current_table.c_str(), current_table.size());
-        if (!tmp) { delete combined; return nullptr; }
-        uint64_t anchor_hash = content_hash_pyobj(tmp);
-        Py_DECREF(tmp);
-        const OuterEntry* anchor_entry = owner->parent_ref
-            ? owner->internal->outer.find(anchor_hash)
-            : root->internal->outer.find(anchor_hash);
-        if (!anchor_entry || !anchor_entry->val_py || !PyDict_Check(anchor_entry->val_py)) {
+        // The anchor is the first chunk resolved to any depth of literal
+        // prefix (resolve_anchored_pattern): "db.users.?.name" lands its
+        // rows under {db: {users: {...}}}.
+        AnchorPath ap;
+        const ModDict* scope = owner->parent_ref ? owner->internal : root->internal;
+        if (!resolve_anchored_pattern(scope, groups[0], &ap)) {
             if (owner->parent_ref) continue;  // child doesn't restrict this table -> this path contributes nothing
             delete combined;
             PyErr_SetString(PyExc_ValueError, "select: anchor table not found");
@@ -2214,13 +2267,13 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
         }
         // Row selector: "?" takes every row, a literal (targeted path) only
         // the row it names.
-        const std::string* selector = (groups[0].size() >= 2 && groups[0][1] != "__pass_key__") ? &groups[0][1] : nullptr;
+        const std::string* selector = (groups[0][ap.sel] != "__pass_key__") ? &groups[0][ap.sel] : nullptr;
         ModDict* last_result = new ModDict();
         if (selector) {
             // Targeted: one direct lookup (str key, else decimal int key) —
             // never a scan of the anchor table.
             PyObject* key = nullptr;
-            PyObject* v = dict_get_segment(anchor_entry->val_py, *selector, &key);  // key: new ref on hit
+            PyObject* v = dict_get_segment(ap.table, *selector, &key);  // key: new ref on hit
             if (v) {
                 uint64_t kh = content_hash_pyobj(key);
                 Py_INCREF(v);
@@ -2229,7 +2282,7 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
             }
         } else {
             PyObject *k, *v; Py_ssize_t pos = 0;
-            while (PyDict_Next(anchor_entry->val_py, &pos, &k, &v)) {
+            while (PyDict_Next(ap.table, &pos, &k, &v)) {
                 uint64_t kh = content_hash_pyobj(k);
                 Py_INCREF(k); Py_INCREF(v);
                 last_result->outer.insert(kh, {k, v, true});
@@ -2237,9 +2290,20 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
             }
         }
 
-        if (n_hops > 0) {
+        if (n_hops == 0) {
+            // No hop: the rows land where they live — nested under the
+            // prefix, unioned with what earlier paths put there.
+            PyObject* inner = last_result->to_python_dict();
+            delete last_result;
+            if (!inner) { delete combined; return nullptr; }
+            if (PyDict_Size(inner) == 0) { Py_DECREF(inner); continue; }
+            if (!add_under_anchor(combined, ap, inner)) { delete combined; return nullptr; }
+            continue;
+        }
+
+        {
             std::vector<std::string> src_pat = groups[0];
-            if (selector) src_pat[1] = "__pass_key__";  // links are declared as table.?.field; the row restriction is the row set itself
+            if (selector) src_pat[ap.sel] = "__pass_key__";  // links are declared as table.?.field; the row restriction is the row set itself
             for (size_t i = 0; i < n_hops; i++) {
                 if (i > 0) src_pat = {current_table, "__pass_key__", groups[i][0]};
                 const LinkDecl* ld = root->internal->find_link(src_pat);
@@ -2299,7 +2363,10 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
 // Shared by select() (single path) and select_mass() (list/dict of paths) —
 // `fo` is always a list-of-paths or {label:path} dict by the time this runs;
 // select() wraps its single string into a 1-element list before calling in.
-static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret){
+// `flat_single`: the caller is select() with ONE path — an anchored
+// rows_here answer may come back as a plain {pk: value} dict directly
+// (select_mass() keeps the {pk: {label: value}} ModDict).
+static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret, bool flat_single=false){
     // fields is either a list of paths (result keyed by each path's default
     // last-segment label — collision raises) or a {label: path} dict (result
     // keyed by the given labels, collision-free by construction).
@@ -2372,23 +2439,52 @@ static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret){
             } else {
                 pat=split_dot_chunk(f);
             }
-            // Anchored = [table, selector, ...]: selector "?" (every row) or a
-            // literal row key (targeted — one row; a missing row simply
-            // selects nothing downstream).
-            if(pat.size()<2 || pat[0]=="__pass_key__" || (pat[1]!="__pass_key__" && pat.size()<3)) MOD_DICT_RAISE(PyExc_ValueError,
-                "select: anchored paths must look like \"table.?.field\" (every row) or \"table.key.field\" (one row)");
+            // Anchored = [prefix..., selector, field...]: selector "?" (every
+            // row) or a literal row key (targeted — one row; a missing row
+            // simply selects nothing downstream). The "?" needs a field after
+            // it; the prefix may be any depth ("db.users.?.name").
+            size_t first_q=pat.size();
+            for(size_t i=0;i<pat.size();i++) if(pat[i]=="__pass_key__"){ first_q=i; break; }
+            bool bad = pat.size()<3 || pat[0]=="__pass_key__" || (first_q<pat.size() && first_q+1>=pat.size());
+            if(bad) MOD_DICT_RAISE(PyExc_ValueError,
+                "select: anchored paths must look like \"table.?.field\" (every row) or \"table.key.field\" (one row), with any depth of literal segments before the row selector");
             patterns.push_back(std::move(pat));
         }
+        bool has_hop=false;
+        for(auto& p:patterns) if(pattern_has_link_hop(p)){ has_hop=true; break; }
         if(table_landing){
             result=select_rows_mode(s,patterns);
-        } else {
-            bool has_hop=false;
-            for(auto& p:patterns) if(pattern_has_link_hop(p)){ has_hop=true; break; }
-            if(has_hop && s->parent_ref){
-                result=select_link_hop_via_root(s,patterns,labels);
-            } else {
-                result=s->internal->select_anchored(patterns,labels);
+        } else if(has_hop && s->parent_ref){
+            result=select_link_hop_via_root(s,patterns,labels);
+        } else if(strcmp(ret,"values")==0 || (flat_single && strcmp(ret,"rows_here")==0)){
+            // Straight off the rows — no {pk: {label: value}} ModDict built
+            // only to be taken apart again: values -> the column lists;
+            // select(path, rows_here) -> {pk: value} zipped from the one
+            // column and the emitted row keys.
+            PyObject* cols=new_modlist();
+            if(!cols) return nullptr;
+            for(size_t i=0;i<patterns.size();i++){
+                PyObject* col=new_modlist();
+                if(!col || PyList_Append(cols,col)!=0){ Py_XDECREF(col); Py_DECREF(cols); return nullptr; }
+                Py_DECREF(col);
             }
+            if(strcmp(ret,"values")==0){
+                if(!s->internal->select_anchored_values(patterns,cols)){ Py_DECREF(cols); return nullptr; }
+                return cols;
+            }
+            PyObject* keys=PyList_New(0);
+            if(!keys){ Py_DECREF(cols); return nullptr; }
+            PyObject* flat=(s->internal->select_anchored_values(patterns,cols,keys)) ? PyDict_New() : nullptr;
+            if(flat){
+                PyObject* col=PyList_GET_ITEM(cols,0);
+                Py_ssize_t n=PyList_GET_SIZE(keys);
+                for(Py_ssize_t i=0;i<n;i++)
+                    if(PyDict_SetItem(flat,PyList_GET_ITEM(keys,i),PyList_GET_ITEM(col,i))!=0){ Py_DECREF(flat); flat=nullptr; break; }
+            }
+            Py_DECREF(keys); Py_DECREF(cols);
+            return flat;
+        } else {
+            result=s->internal->select_anchored(patterns,labels);
         }
     } else {
         result=s->internal->select(paths,labels);
@@ -2401,12 +2497,12 @@ static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret){
         // Columnar: one flat list per requested field, values in row order.
         // N fields -> a list of N lists (not a list of projected dicts).
         Py_ssize_t n_fields=(Py_ssize_t)labels.size();
-        PyObject* cols=PyList_New(n_fields);
+        PyObject* cols=new_modlist();
         if(!cols){ delete result; return nullptr; }
         for(Py_ssize_t i=0;i<n_fields;i++){
-            PyObject* col=PyList_New(0);
-            if(!col){ Py_DECREF(cols); delete result; return nullptr; }
-            PyList_SET_ITEM(cols,i,col);
+            PyObject* col=new_modlist();
+            if(!col || PyList_Append(cols,col)!=0){ Py_XDECREF(col); Py_DECREF(cols); delete result; return nullptr; }
+            Py_DECREF(col);  // cols holds it
         }
         for(uint64_t oh : result->order){
             const OuterEntry* e=result->outer.find(oh);
@@ -2466,9 +2562,10 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     if(!fo) return nullptr;
     Py_INCREF(path_obj);
     PyList_SET_ITEM(fo,0,path_obj);
-    PyObject* result=select_core(s,fo,ret);
+    PyObject* result=select_core(s,fo,ret,true);
     Py_DECREF(fo);
     if(!result) return nullptr;
+    if(PyDict_CheckExact(result)) return result;  // anchored rows_here answered as {pk: value} already
 
     if(strcmp(ret,"values")==0){
         // result is [col] — a single inner list for the one requested field
@@ -2486,13 +2583,17 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     PyObject* flat=PyDict_New();
     if(!flat){ Py_DECREF(result); return nullptr; }
     std::string label=default_select_label(path);
+    PyObject* label_obj=PyUnicode_FromStringAndSize(label.c_str(),(Py_ssize_t)label.size());  // once, not per row
+    if(!label_obj){ Py_DECREF(flat); Py_DECREF(result); return nullptr; }
     for(uint64_t oh : rw->internal->order){
         const OuterEntry* e=rw->internal->outer.find(oh);
         if(!e || !e->val_py) continue;
-        PyObject* v=PyDict_GetItemString(e->val_py,label.c_str());
+        PyObject* v=PyDict_GetItem(e->val_py,label_obj);
+        if(!v) continue;
         PyObject* k=e->key_py?e->key_py:Py_None;
-        if(PyDict_SetItem(flat,k,v)!=0){ Py_DECREF(flat); Py_DECREF(result); return nullptr; }
+        if(PyDict_SetItem(flat,k,v)!=0){ Py_DECREF(label_obj); Py_DECREF(flat); Py_DECREF(result); return nullptr; }
     }
+    Py_DECREF(label_obj);
     Py_DECREF(result);
     return flat;
 }
@@ -2603,7 +2704,6 @@ static PyObject* ModDict_at(ModDictObject* s, PyObject* args){
     if(e->is_row) return s->internal->get_row(oh);
     PyObject* v=e->val_py?e->val_py:Py_None; Py_INCREF(v); return v;
 }
-
 static PyObject* ModDict_copy(ModDictObject* s, PyObject*){
     if (s->internal->root) {
         // A cursor owns no storage, so "copy" means the anchored table:
