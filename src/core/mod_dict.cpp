@@ -1116,7 +1116,9 @@ ModDict* ModDict::select_anchored(const std::vector<std::vector<std::string>>& p
 
     for (auto& v : visit) {
         PyObject* pk = v.pk; PyObject* row = v.row;
-        if (!PyDict_Check(row)) continue;
+        // No dict check on `row`: a path that stops at the selector reads the
+        // entry itself, scalar or not ("cfg.debug" -> True); a field path on a
+        // scalar simply finds nothing (get_nested_via_links).
         PyObject* new_row = PyDict_New();
         if (!new_row) { cleanup(); delete result; return nullptr; }
         bool has_any = false;
@@ -1157,8 +1159,7 @@ PyObject* ModDict::select_anchored_values(const std::vector<std::vector<std::str
     size_t n = patterns.size();
     std::vector<PyObject*> vals(n);
     for (auto& v : visit) {
-        if (!PyDict_Check(v.row)) continue;
-        bool has_any = false;
+        bool has_any = false;  // no dict check on the entry — see select_anchored()
         for (size_t i = 0; i < n; i++) {
             vals[i] = nullptr;
             if (patterns[i][ap.sel] != "__pass_key__" && !pk_matches_selector(v.pk, patterns[i][ap.sel])) continue;
