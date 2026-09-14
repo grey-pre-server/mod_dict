@@ -930,39 +930,65 @@ bool looks_like_table(PyObject* d) {
 // the first segment isn't a top-level dict, a prefix segment is missing or
 // not a dict, a literal selector doesn't name a row, or no field follows the
 // selector — callers then treat the path as a plain nested-field path.
-bool resolve_anchored_pattern(const ModDict* root, const std::vector<std::string>& pat, AnchorPath* out) {
-    if (pat.size() < 3 || pat[0] == "__pass_key__" || pat[0] == "__follow_link__") return false;
-    uint64_t h = 0;
-    const OuterEntry* top = resolve_table(root, pat[0], h);
-    if (!top || !top->val_py || !PyDict_Check(top->val_py)) return false;
+bool resolve_anchored_pattern(const ModDict* root, const std::vector<std::string>& pat, AnchorPath* out,
+                              bool for_select) {
+    if (pat.empty() || pat[0] == "__follow_link__") return false;
     size_t first_q = pat.size(), first_hop = pat.size();
-    for (size_t i = 1; i < pat.size(); i++) {
+    for (size_t i = 0; i < pat.size(); i++) {
         if (first_q == pat.size() && pat[i] == "__pass_key__") first_q = i;
         if (first_hop == pat.size() && pat[i] == "__follow_link__") first_hop = i;
     }
-    PyObject* cur = top->val_py;
-    size_t sel = 0;
     if (first_q < pat.size()) {
-        if (first_q + 1 >= pat.size() || first_hop < first_q) return false;
-        sel = first_q;
-        for (size_t i = 1; i < sel; i++) {
+        // "?" form: the prefix is everything before the first "?". A field
+        // must follow for filter; select may stop at the "?" (the rows).
+        if (first_hop < first_q) return false;
+        if (first_q + 1 >= pat.size() && !for_select) return false;
+        if (first_q == 0) {                        // "?" at the root: every top-level entry (select only)
+            if (!for_select) return false;
+            out->at_root = true; out->sel = 0;
+            return true;
+        }
+        uint64_t h = 0;
+        const OuterEntry* top = resolve_table(root, pat[0], h);
+        if (!top || !top->val_py || !PyDict_Check(top->val_py)) return false;
+        PyObject* cur = top->val_py;
+        for (size_t i = 1; i < first_q; i++) {
             PyObject* key = nullptr;
             PyObject* nxt = dict_get_segment(cur, pat[i], &key);
             if (!nxt || !key || !PyDict_Check(nxt)) { Py_XDECREF(key); PyErr_Clear(); return false; }
             out->prefix_keys.push_back(key);  // owned
             cur = nxt;
         }
-    } else {
-        size_t i = 0;
-        while (i + 3 < pat.size() && i + 2 < first_hop) {
-            PyObject* key = nullptr;
-            PyObject* nxt = dict_get_segment(cur, pat[i + 1], &key);
-            if (!nxt || !key || !looks_like_table(nxt)) { Py_XDECREF(key); PyErr_Clear(); break; }
-            out->prefix_keys.push_back(key);  // owned
-            cur = nxt; i++;
-        }
-        sel = i + 1;
-        if (sel + 1 >= pat.size() || sel >= first_hop) return false;
+        out->top = top; out->table = cur; out->sel = first_q;
+        return true;
+    }
+    // All-literal form: pat[0] must name a top-level dict, otherwise the path
+    // is a plain nested-field path (flat select / filter semantics).
+    uint64_t h = 0;
+    const OuterEntry* top = resolve_table(root, pat[0], h);
+    if (!top || !top->val_py || !PyDict_Check(top->val_py)) return false;
+    if (pat.size() == 1) {                          // one key: that top-level entry itself (select only)
+        if (!for_select) return false;
+        out->at_root = true; out->top = top; out->sel = 0;
+        return true;
+    }
+    if (!for_select && pat.size() < 3) return false;
+    // Descend while the next segment names a table (a dict of rows) and a
+    // selector — plus a field, for filter — still follows it.
+    PyObject* cur = top->val_py;
+    size_t i = 0;
+    const size_t need = for_select ? 2 : 3;
+    while (i + need < pat.size() && i + 2 < first_hop) {
+        PyObject* key = nullptr;
+        PyObject* nxt = dict_get_segment(cur, pat[i + 1], &key);
+        if (!nxt || !key || !looks_like_table(nxt)) { Py_XDECREF(key); PyErr_Clear(); break; }
+        out->prefix_keys.push_back(key);  // owned
+        cur = nxt; i++;
+    }
+    size_t sel = i + 1;
+    if (sel >= first_hop) return false;
+    if (sel + 1 >= pat.size() && !for_select) return false;
+    if (!for_select) {                              // filter scans the row: it has to be there
         PyObject* row = dict_get_segment(cur, pat[sel], nullptr);
         if (!row || !PyDict_Check(row)) return false;
     }
@@ -988,6 +1014,7 @@ static bool union_levels(PyObject* dst, PyObject* src, size_t levels) {
 }
 
 bool add_under_anchor(ModDict* result, const AnchorPath& ap, PyObject* inner) {
+    if (!ap.top) { Py_DECREF(inner); PyErr_SetString(PyExc_RuntimeError, "add_under_anchor: no anchor entry"); return false; }
     PyObject* payload = inner;
     for (size_t i = ap.prefix_keys.size(); i-- > 0; ) {
         PyObject* d = PyDict_New();
@@ -1019,9 +1046,9 @@ struct AnchoredVisit { PyObject* pk; PyObject* row; };
 static bool collect_anchored_rows(const ModDict* self, const std::vector<std::vector<std::string>>& patterns,
                                   AnchorPath& ap, std::vector<AnchoredVisit>& visit)
 {
-    if (!resolve_anchored_pattern(self, patterns[0], &ap)) return true;
+    if (!resolve_anchored_pattern(self, patterns[0], &ap, true)) return true;
     for (auto& p : patterns) {
-        bool same = p.size() > ap.sel + 1;
+        bool same = p.size() > ap.sel;
         for (size_t i = 0; same && i < ap.sel; i++) same = (p[i] == patterns[0][i]);
         if (!same) {
             PyErr_SetString(PyExc_ValueError,
@@ -1031,6 +1058,27 @@ static bool collect_anchored_rows(const ModDict* self, const std::vector<std::ve
     }
     bool any_wildcard = false;
     for (auto& p : patterns) if (p[ap.sel] == "__pass_key__") { any_wildcard = true; break; }
+    if (ap.at_root) {
+        // The selector addresses the ModDict's own entries: "?" — every
+        // dict-valued top-level entry, a key — that one entry.
+        if (any_wildcard) {
+            for (uint64_t oh : self->order) {
+                const OuterEntry* e = self->outer.find(oh);
+                if (!e || !e->is_row || !e->val_py || !e->key_py) continue;
+                Py_INCREF(e->key_py); visit.push_back({e->key_py, e->val_py});
+            }
+        } else {
+            for (auto& p : patterns) {
+                uint64_t h = 0;
+                const OuterEntry* e = resolve_table(self, p[0], h);
+                if (!e || !e->key_py || !e->val_py) continue;
+                bool dup = false;
+                for (auto& v : visit) if (v.pk == e->key_py) { dup = true; break; }
+                if (!dup) { Py_INCREF(e->key_py); visit.push_back({e->key_py, e->val_py}); }
+            }
+        }
+        return true;
+    }
     if (any_wildcard) {
         PyObject *pk, *row; Py_ssize_t pos = 0;
         while (PyDict_Next(ap.table, &pos, &pk, &row)) { Py_INCREF(pk); visit.push_back({pk, row}); }

@@ -41,10 +41,11 @@ PyObject* dict_get_segment(PyObject* dict, const std::string& seg, PyObject** ke
 struct OuterEntry;
 class ModDict;
 struct AnchorPath {
-    const OuterEntry* top = nullptr;       // borrowed
-    PyObject* table = nullptr;             // borrowed: the dict the selector addresses
+    const OuterEntry* top = nullptr;       // borrowed (the one entry when at_root and literal; null for "?" at the root)
+    PyObject* table = nullptr;             // borrowed: the dict the selector addresses (null when at_root)
     std::vector<PyObject*> prefix_keys;    // owned: keys of pattern[1..sel-1]
     size_t sel = 0;                        // index of the selector segment ("?" or a literal row key)
+    bool at_root = false;                  // the selector addresses the ModDict's own top-level entries ("users", "?")
     AnchorPath() = default;
     AnchorPath(const AnchorPath&) = delete;
     AnchorPath& operator=(const AnchorPath&) = delete;
@@ -54,7 +55,11 @@ struct AnchorPath {
 bool looks_like_table(PyObject* d);
 // Fills *out for an anchored pattern [prefix..., selector, field...]; false
 // when the pattern isn't anchored at all (then it's a plain nested path).
-bool resolve_anchored_pattern(const ModDict* root, const std::vector<std::string>& pat, AnchorPath* out);
+// for_select relaxes the shape to what select() accepts: the field may be
+// absent (the row itself), a literal row may be missing (selects nothing),
+// and a single segment / "?" alone addresses the top-level entries.
+bool resolve_anchored_pattern(const ModDict* root, const std::vector<std::string>& pat, AnchorPath* out,
+                              bool for_select = false);
 // Puts `inner` (a fresh {row_key: row} dict, reference consumed) into
 // `result` nested under the anchor's prefix — {top: {k1: {...: inner}}} —
 // unioning row keys into whatever an earlier call already placed there.

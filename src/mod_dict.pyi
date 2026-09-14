@@ -1035,7 +1035,12 @@ class ModDict:
                      targeted ``"table.key.field"`` (one row of the anchored
                      table; int keys spelled as decimal), either with the
                      table any number of literal levels down
-                     (``"db.users.?.name"``), or ``->``-hop).
+                     (``"db.users.?.name"``), or ``->``-hop). The field part
+                     may be omitted: ``"users.alice"`` is the row itself,
+                     ``"users.?"`` every row, ``"users"`` the top-level
+                     entry, ``"?"`` every top-level entry. A first segment
+                     that names a top-level dict always anchors there; a
+                     missing row selects nothing.
             returns: ``"rows"`` *(default)* — ``{key: value}`` for a plain
                      path. For a table-anchored wildcard path, same
                      table-landing behavior as ``select_mass()`` (returns a

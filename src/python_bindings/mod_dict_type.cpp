@@ -693,16 +693,22 @@ static bool fh_compare(PyObject* pyobj, FilterOp op, const ModValue& fval) {
 // row. When the table or the row doesn't exist the path is NOT targeted —
 // it falls back to the plain nested-field reading. Outputs are borrowed.
 static bool targeted_anchor(ModDictObject* owner, const std::vector<std::string>& pat,
-                            AnchorPath* ap_out, PyObject** row_out) {
+                            AnchorPath* ap_out, PyObject** row_out, bool for_select = false) {
     AnchorPath local;
     AnchorPath& ap = ap_out ? *ap_out : local;
     // Any depth of literal prefix (resolve_anchored_pattern, core); a "?"
-    // selector is the wildcard machinery's job, not a targeted path.
-    if (!resolve_anchored_pattern(owner->internal, pat, &ap)) return false;
+    // selector is the wildcard machinery's job, not a targeted path. For
+    // select() the path may stop at the selector and the row may be
+    // missing (it then selects nothing rather than falling back to the
+    // plain-path reading, which would answer from OTHER top-level entries).
+    if (!resolve_anchored_pattern(owner->internal, pat, &ap, for_select)) return false;
+    if (ap.at_root) return for_select;
     if (pat[ap.sel] == "__pass_key__") return false;
-    PyObject* row = dict_get_segment(ap.table, pat[ap.sel], nullptr);
-    if (!row || !PyDict_Check(row)) return false;
-    if (row_out) *row_out = row;
+    if (row_out) {
+        PyObject* row = dict_get_segment(ap.table, pat[ap.sel], nullptr);
+        if (!row || !PyDict_Check(row)) return false;
+        *row_out = row;
+    }
     return true;
 }
 // `report_row` is null until the first "__follow_link__" jump, then pinned
@@ -2180,7 +2186,11 @@ static std::string default_select_label(const std::string& raw){
         char c=raw[i];
         if(c=='.'||c==' '||c=='\t'){ dot=i; break; }
     }
-    return dot==std::string::npos ? raw.substr(start) : raw.substr(dot+1);
+    std::string label = dot==std::string::npos ? raw.substr(start) : raw.substr(dot+1);
+    // A path ending at "?" labels by the segment before it ("users.?" -> "users").
+    if(label=="?" && dot!=std::string::npos && dot>start)
+        return default_select_label(raw.substr(start, dot-start));
+    return label;
 }
 // Mirrors filter_link_hop_via_root for select(): relay the whole
 // select_anchored() call to the topmost ancestor (unrestricted), then keep
@@ -2259,11 +2269,30 @@ static ModDict* select_rows_mode(ModDictObject* owner, const std::vector<std::ve
         // rows under {db: {users: {...}}}.
         AnchorPath ap;
         const ModDict* scope = owner->parent_ref ? owner->internal : root->internal;
-        if (!resolve_anchored_pattern(scope, groups[0], &ap)) {
-            if (owner->parent_ref) continue;  // child doesn't restrict this table -> this path contributes nothing
-            delete combined;
-            PyErr_SetString(PyExc_ValueError, "select: anchor table not found");
-            return nullptr;
+        // Unresolvable prefix (missing table): this path lands nothing —
+        // the same answer values/rows_here give, and what a child ModDict
+        // that doesn't hold the table always gave.
+        if (!resolve_anchored_pattern(scope, groups[0], &ap, true)) continue;
+        if (ap.at_root) {
+            // "users" / "?": the landing IS the top-level entry (entries) —
+            // nothing to nest, just carry the entries over.
+            std::vector<const OuterEntry*> picked;
+            if (groups[0][0] == "__pass_key__") {
+                for (uint64_t oh : scope->order) {
+                    const OuterEntry* e = scope->outer.find(oh);
+                    if (e && e->is_row && e->val_py && e->key_py) picked.push_back(e);
+                }
+            } else if (ap.top && ap.top->key_py && ap.top->val_py) {
+                picked.push_back(ap.top);
+            }
+            for (const OuterEntry* e : picked) {
+                uint64_t h = content_hash_pyobj(e->key_py);
+                if (combined->outer.find(h)) continue;
+                Py_INCREF(e->key_py); Py_INCREF(e->val_py);
+                combined->outer.insert(h, {e->key_py, e->val_py, true});
+                combined->order.push_back(h);
+            }
+            continue;
         }
         // Row selector: "?" takes every row, a literal (targeted path) only
         // the row it names.
@@ -2406,11 +2435,13 @@ static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret, bo
     bool any_wc=false, all_wc=true;
     for(auto& f:paths){
         bool wc=(f.find("->")!=std::string::npos);
-        if(!wc && (f.find('.')!=std::string::npos || f=="?")){
+        if(!wc){
             std::vector<std::string> segs=split_dot_chunk(f);
             for(auto& seg:segs) if(seg=="__pass_key__"){ wc=true; break; }
-            // Targeted anchor ("table.key.field") is anchored too — one row.
-            if(!wc && targeted_anchor(s,segs,nullptr,nullptr)) wc=true;
+            // Anchored without a "?" as well: a literal row ("table.key.field"),
+            // the row itself ("table.key"), a top-level entry ("table") —
+            // whenever the first segment names a top-level dict.
+            if(!wc && targeted_anchor(s,segs,nullptr,nullptr,true)) wc=true;
         }
         any_wc=any_wc||wc; all_wc=all_wc&&wc;
     }
@@ -2443,11 +2474,12 @@ static PyObject* select_core(ModDictObject* s, PyObject* fo, const char* ret, bo
             // row) or a literal row key (targeted — one row; a missing row
             // simply selects nothing downstream). The "?" needs a field after
             // it; the prefix may be any depth ("db.users.?.name").
-            size_t first_q=pat.size();
-            for(size_t i=0;i<pat.size();i++) if(pat[i]=="__pass_key__"){ first_q=i; break; }
-            bool bad = pat.size()<3 || pat[0]=="__pass_key__" || (first_q<pat.size() && first_q+1>=pat.size());
-            if(bad) MOD_DICT_RAISE(PyExc_ValueError,
-                "select: anchored paths must look like \"table.?.field\" (every row) or \"table.key.field\" (one row), with any depth of literal segments before the row selector");
+            // Anchored = [prefix..., selector, field...]: selector "?" (every
+            // row) or a literal row key; the prefix may be any depth
+            // ("db.users.?.name"), the field may be absent ("users.alice" =
+            // the row, "users.?" = the rows, "users" / "?" = top-level entries).
+            if(pat.empty() || pat[0]=="__follow_link__") MOD_DICT_RAISE(PyExc_ValueError,
+                "select: anchored paths must look like \"table.?.field\" (every row) or \"table.key.field\" (one row); the field part may be omitted");
             patterns.push_back(std::move(pat));
         }
         bool has_hop=false;
@@ -2551,10 +2583,10 @@ static PyObject* ModDict_select(ModDictObject* s,PyObject* args,PyObject* kw){
     std::string path(PyUnicode_AsUTF8(path_obj));
     for(char& c:path) if(c==' '||c=='\t') c='.';  // space alias — see select_core()
     bool wc=(path.find("->")!=std::string::npos);
-    if(!wc && (path.find('.')!=std::string::npos || path=="?")){
+    if(!wc){
         std::vector<std::string> segs=split_dot_chunk(path);
         for(auto& seg:segs) if(seg=="__pass_key__"){ wc=true; break; }
-        if(!wc && targeted_anchor(s,segs,nullptr,nullptr)) wc=true;  // "table.key.field" — same as select_core()
+        if(!wc && targeted_anchor(s,segs,nullptr,nullptr,true)) wc=true;  // anchored without "?" — same rule as select_core()
     }
     bool table_landing = wc && strcmp(ret,"rows")==0;
 
